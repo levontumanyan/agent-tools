@@ -1,0 +1,1934 @@
+#!/usr/bin/env swift
+import Foundation
+import SQLite3
+import AppKit
+import Speech
+
+// MARK: - Constants & Helpers
+
+let dbPath = ("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite" as NSString).expandingTildeInPath
+
+func getDB() -> OpaquePointer? {
+	var db: OpaquePointer?
+	if sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
+		let errMsg = db != nil ? String(cString: sqlite3_errmsg(db)) : "Unknown error"
+		fputs("Error opening WhatsApp database: \(errMsg)\n", stderr)
+		fputs("Path: \(dbPath)\n", stderr)
+		return nil
+	}
+	return db
+}
+
+func formatDate(_ referenceSeconds: Double) -> String {
+	let date = Date(timeIntervalSinceReferenceDate: referenceSeconds)
+	let formatter = DateFormatter()
+	formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+	return formatter.string(from: date)
+}
+
+let messageDir = ("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Message" as NSString).expandingTildeInPath
+
+func formatDuration(_ seconds: Int) -> String {
+	let mins = seconds / 60
+	let secs = seconds % 60
+	return String(format: "%d:%02d", mins, secs)
+}
+
+func formatFileSize(_ bytes: Int64) -> String {
+	if bytes >= 1024 * 1024 * 1024 {
+		return String(format: "%.1f GB", Double(bytes) / (1024.0 * 1024.0 * 1024.0))
+	} else if bytes >= 1024 * 1024 {
+		return String(format: "%.1f MB", Double(bytes) / (1024.0 * 1024.0))
+	} else if bytes >= 1024 {
+		return String(format: "%.1f KB", Double(bytes) / 1024.0)
+	} else if bytes > 0 {
+		return "\(bytes) B"
+	} else {
+		return "--"
+	}
+}
+
+func resolveMediaPath(_ localPath: String?) -> String? {
+	guard let path = localPath, !path.isEmpty else { return nil }
+	return (messageDir as NSString).appendingPathComponent(path)
+}
+
+func parseVCard(vcardName: String?, vcardString: String?) -> (name: String?, phone: String?) {
+	var name: String? = vcardName?.trimmingCharacters(in: .whitespacesAndNewlines)
+	if name?.isEmpty == true { name = nil }
+	var phone: String? = nil
+
+	if let vcard = vcardString, !vcard.isEmpty {
+		let lines = vcard.components(separatedBy: .newlines)
+		for rawLine in lines {
+			let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+			if name == nil && line.hasPrefix("FN:") {
+				let fn = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+				if !fn.isEmpty { name = fn }
+			}
+			if phone == nil && (line.hasPrefix("TEL;") || line.hasPrefix("TEL:")) {
+				let parts = line.components(separatedBy: ":")
+				if parts.count >= 2 {
+					let tel = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+					if !tel.isEmpty { phone = tel }
+				}
+			}
+		}
+	}
+	return (name, phone)
+}
+
+func extractEventName(from text: String?) -> String? {
+	guard let text = text, text.contains("event_name") else { return nil }
+	if let data = text.data(using: .utf8),
+	   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+	   let eventName = json["event_name"] as? String {
+		return eventName
+	}
+	return nil
+}
+
+// MARK: - Transcript Cache
+
+let cacheDir = (("~/.local/share/whatsapp" as NSString).expandingTildeInPath)
+let transcriptDBPath = (cacheDir as NSString).appendingPathComponent("transcripts.sqlite")
+
+func getTranscriptDB() -> OpaquePointer? {
+	try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+	var db: OpaquePointer?
+	if sqlite3_open(transcriptDBPath, &db) != SQLITE_OK {
+		return nil
+	}
+	let createSQL = """
+	CREATE TABLE IF NOT EXISTS transcripts (
+		message_id TEXT PRIMARY KEY,
+		media_path TEXT,
+		chat_partner TEXT,
+		sender TEXT,
+		date_str TEXT,
+		duration INTEGER,
+		transcript TEXT,
+		created_at TEXT
+	);
+	CREATE INDEX IF NOT EXISTS idx_transcripts_partner ON transcripts(chat_partner);
+	"""
+	sqlite3_exec(db, createSQL, nil, nil, nil)
+	return db
+}
+
+func getCachedTranscript(messageId: String) -> String? {
+	guard let db = getTranscriptDB() else { return nil }
+	defer { sqlite3_close(db) }
+
+	let query = "SELECT transcript FROM transcripts WHERE message_id = ? LIMIT 1;"
+	var stmt: OpaquePointer?
+	guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else { return nil }
+	defer { sqlite3_finalize(stmt) }
+
+	sqlite3_bind_text(stmt, 1, (messageId as NSString).utf8String, -1, nil)
+	if sqlite3_step(stmt) == SQLITE_ROW {
+		if let text = sqlite3_column_text(stmt, 0).flatMap({ String(cString: $0) }), !text.isEmpty {
+			return text
+		}
+	}
+	return nil
+}
+
+func saveCachedTranscript(messageId: String, mediaPath: String, chatPartner: String, sender: String, dateStr: String, duration: Int, transcript: String) {
+	guard let db = getTranscriptDB() else { return }
+	defer { sqlite3_close(db) }
+
+	let insertSQL = """
+	INSERT OR REPLACE INTO transcripts (message_id, media_path, chat_partner, sender, date_str, duration, transcript, created_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'));
+	"""
+	var stmt: OpaquePointer?
+	guard sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nil) == SQLITE_OK else { return }
+	defer { sqlite3_finalize(stmt) }
+
+	sqlite3_bind_text(stmt, 1, (messageId as NSString).utf8String, -1, nil)
+	sqlite3_bind_text(stmt, 2, (mediaPath as NSString).utf8String, -1, nil)
+	sqlite3_bind_text(stmt, 3, (chatPartner as NSString).utf8String, -1, nil)
+	sqlite3_bind_text(stmt, 4, (sender as NSString).utf8String, -1, nil)
+	sqlite3_bind_text(stmt, 5, (dateStr as NSString).utf8String, -1, nil)
+	sqlite3_bind_int(stmt, 6, Int32(duration))
+	sqlite3_bind_text(stmt, 7, (transcript as NSString).utf8String, -1, nil)
+	sqlite3_step(stmt)
+}
+
+func transcribeAudioFile(filePath: String, timeoutSeconds: Double = 15.0) -> String? {
+	guard FileManager.default.fileExists(atPath: filePath) else { return nil }
+	let fileURL = URL(fileURLWithPath: filePath)
+	guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")), recognizer.isAvailable else {
+		return nil
+	}
+
+	let request = SFSpeechURLRecognitionRequest(url: fileURL)
+	var finalTranscription: String? = nil
+	var isDone = false
+
+	let task = recognizer.recognitionTask(with: request) { result, error in
+		if let result = result {
+			if result.isFinal {
+				finalTranscription = result.bestTranscription.formattedString
+				isDone = true
+			} else {
+				finalTranscription = result.bestTranscription.formattedString
+			}
+		}
+		if error != nil {
+			isDone = true
+		}
+	}
+
+	let deadline = Date().addingTimeInterval(timeoutSeconds)
+	while !isDone && Date() < deadline {
+		RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+	}
+
+	if !isDone {
+		task.cancel()
+	}
+
+	return finalTranscription
+}
+
+func cleanUnicode(_ text: String) -> String {
+	return String(text.unicodeScalars.filter { scalar in
+		let val = scalar.value
+		if (val >= 0x200B && val <= 0x200F) || (val >= 0x202A && val <= 0x202E) || (val >= 0x2060 && val <= 0x2069) || val == 0xFEFF {
+			return false
+		}
+		return true
+	})
+}
+
+func normalizeForMatching(_ text: String) -> String {
+	var cleaned = cleanUnicode(text)
+	cleaned = cleaned.replacingOccurrences(of: "\u{00A0}", with: " ")
+		.replacingOccurrences(of: "\u{202F}", with: " ")
+		.replacingOccurrences(of: "\u{2011}", with: "-")
+	return cleaned.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+}
+
+func extractDigits(_ text: String) -> String {
+	return text.filter { $0.isNumber }
+}
+
+func formatJIDToPhone(_ jid: String) -> String? {
+	if jid.hasSuffix("@s.whatsapp.net") || jid.hasSuffix("@c.us") {
+		let num = jid.components(separatedBy: "@")[0]
+		if !num.isEmpty && num.allSatisfy({ $0.isNumber || $0 == "+" }) {
+			return num.hasPrefix("+") ? num : "+\(num)"
+		}
+	}
+	return nil
+}
+
+func resolveSenderDisplayName(senderName: String?, memberJid: String?, isGroup: Bool, partnerName: String) -> String {
+	if !isGroup {
+		return partnerName
+	}
+	if let sn = senderName {
+		let cleaned = cleanUnicode(sn).replacingOccurrences(of: "\u{00A0}", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+		if !cleaned.isEmpty && !cleaned.hasPrefix("IAB") && !cleaned.hasPrefix("CN") && !cleaned.hasPrefix("CL") && !cleaned.hasPrefix("CP") {
+			return cleaned
+		}
+	}
+	if let jid = memberJid, let phone = formatJIDToPhone(jid) {
+		return phone
+	}
+	return "Member"
+}
+
+func resolveJIDName(db: OpaquePointer?, jid: String) -> String? {
+	guard let db = db else { return formatJIDToPhone(jid) }
+	let sql = """
+	SELECT COALESCE(
+		NULLIF(cs.ZPARTNERNAME, ''),
+		NULLIF(ppn.ZPUSHNAME, '')
+	)
+	FROM (SELECT ? AS target_jid) t
+	LEFT JOIN ZWACHATSESSION cs ON cs.ZCONTACTJID = t.target_jid
+	LEFT JOIN ZWAPROFILEPUSHNAME ppn ON ppn.ZJID = t.target_jid
+	LIMIT 1;
+	"""
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+		defer { sqlite3_finalize(stmt) }
+		sqlite3_bind_text(stmt, 1, (jid as NSString).utf8String, -1, nil)
+		if sqlite3_step(stmt) == SQLITE_ROW {
+			if let name = sqlite3_column_text(stmt, 0).flatMap({ String(cString: $0) }) {
+				let cleaned = cleanUnicode(name).replacingOccurrences(of: "\u{00A0}", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+				if !cleaned.isEmpty {
+					return cleaned
+				}
+			}
+		}
+	}
+	return formatJIDToPhone(jid)
+}
+
+struct SessionInfo {
+	let pk: Int32
+	let partnerName: String
+	let contactJID: String
+	let contactIdentifier: String?
+}
+
+func getAllSessions(db: OpaquePointer) -> [SessionInfo] {
+	var sessions: [SessionInfo] = []
+	let query = """
+	SELECT Z_PK, ZPARTNERNAME, ZCONTACTJID, ZCONTACTIDENTIFIER
+	FROM ZWACHATSESSION
+	WHERE ZCONTACTJID NOT LIKE '%@status'
+	ORDER BY ZLASTMESSAGEDATE DESC;
+	"""
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK {
+		while sqlite3_step(stmt) == SQLITE_ROW {
+			let pk = sqlite3_column_int(stmt, 0)
+			let partner = sqlite3_column_text(stmt, 1).flatMap { String(cString: $0) } ?? ""
+			let jid = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) } ?? ""
+			let ident = sqlite3_column_text(stmt, 3).flatMap { String(cString: $0) }
+			sessions.append(SessionInfo(pk: pk, partnerName: partner, contactJID: jid, contactIdentifier: ident))
+		}
+		sqlite3_finalize(stmt)
+	}
+	return sessions
+}
+
+func matchesTarget(session: SessionInfo, target: String) -> Bool {
+	let normTarget = normalizeForMatching(target)
+	let targetDigits = extractDigits(target)
+
+	let normPartner = normalizeForMatching(session.partnerName)
+	let normJID = session.contactJID.lowercased()
+	let normIdent = (session.contactIdentifier ?? "").lowercased()
+
+	if !normTarget.isEmpty {
+		if normPartner == normTarget || normJID == normTarget || normIdent == normTarget {
+			return true
+		}
+		if normPartner.contains(normTarget) || normJID.contains(normTarget) || normIdent.contains(normTarget) {
+			return true
+		}
+	}
+
+	if targetDigits.count >= 4 {
+		let partnerDigits = extractDigits(session.partnerName)
+		let identDigits = extractDigits(session.contactIdentifier ?? "")
+		let jidDigits = session.contactJID.hasSuffix("@lid") ? "" : extractDigits(session.contactJID)
+
+		for candidate in [identDigits, partnerDigits, jidDigits] where !candidate.isEmpty {
+			if candidate.contains(targetDigits) || (targetDigits.count >= 7 && targetDigits.contains(candidate)) {
+				return true
+			}
+			if targetDigits.count >= 7 && candidate.count >= 7 {
+				let minLen = min(7, min(targetDigits.count, candidate.count))
+				if targetDigits.suffix(minLen) == candidate.suffix(minLen) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func findMatchingSessions(db: OpaquePointer, target: String) -> [SessionInfo] {
+	let all = getAllSessions(db: db)
+	let normTarget = normalizeForMatching(target)
+	let targetDigits = extractDigits(target)
+
+	var exactMatches: [SessionInfo] = []
+	var partialMatches: [SessionInfo] = []
+
+	for s in all {
+		let normPartner = normalizeForMatching(s.partnerName)
+		let identDigits = extractDigits(s.contactIdentifier ?? "")
+		let partnerDigits = extractDigits(s.partnerName)
+
+		if !normTarget.isEmpty && normPartner == normTarget {
+			exactMatches.append(s)
+		} else if targetDigits.count >= 7 && (identDigits == targetDigits || partnerDigits == targetDigits) {
+			exactMatches.append(s)
+		} else if matchesTarget(session: s, target: target) {
+			partialMatches.append(s)
+		}
+	}
+
+	return exactMatches.isEmpty ? partialMatches : exactMatches
+}
+
+func resolveContactPhone(db: OpaquePointer, contact: String) -> String? {
+	let digitsOnly = extractDigits(contact)
+	let letters = contact.filter { $0.isLetter }
+
+	if digitsOnly.count >= 7 && letters.isEmpty {
+		return digitsOnly
+	}
+
+	let matches = findMatchingSessions(db: db, target: contact)
+	for session in matches {
+		if session.contactJID.hasSuffix("@g.us") {
+			continue
+		}
+		if let ident = session.contactIdentifier {
+			let identDigits = extractDigits(ident)
+			if identDigits.count >= 7 {
+				return identDigits
+			}
+		}
+		if !session.contactJID.hasSuffix("@lid") {
+			let jidNum = session.contactJID.components(separatedBy: "@").first ?? ""
+			let jidDigits = extractDigits(jidNum)
+			if jidDigits.count >= 7 {
+				return jidDigits
+			}
+		}
+		let partnerDigits = extractDigits(session.partnerName)
+		if partnerDigits.count >= 7 {
+			return partnerDigits
+		}
+	}
+	return nil
+}
+
+// MARK: - Subcommand: Chats
+
+func listChats(limit: Int, unreadOnly: Bool, search: String?) {
+	guard let db = getDB() else { return }
+	defer { sqlite3_close(db) }
+
+	var conditions = ["s.ZCONTACTJID NOT LIKE '%@status'"]
+	if unreadOnly {
+		conditions.append("s.ZUNREADCOUNT > 0")
+	}
+
+	let whereClause = conditions.joined(separator: " AND ")
+	let query = """
+	SELECT s.Z_PK, s.ZPARTNERNAME, s.ZCONTACTJID, s.ZUNREADCOUNT,
+	       s.ZLASTMESSAGEDATE, m.ZMESSAGEDATE, m.ZTEXT, m.ZMESSAGETYPE, m.ZISFROMME,
+	       s.ZCONTACTIDENTIFIER, mi.ZMOVIEDURATION
+	FROM ZWACHATSESSION s
+	LEFT JOIN ZWAMESSAGE m ON m.Z_PK = s.ZLASTMESSAGE
+	LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	WHERE \(whereClause)
+	ORDER BY s.ZLASTMESSAGEDATE DESC;
+	"""
+
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, query, -1, &stmt, nil) != SQLITE_OK {
+		fputs("Error preparing query: \(String(cString: sqlite3_errmsg(db)))\n", stderr)
+		return
+	}
+
+	let col1 = "TIMESTAMP".padding(toLength: 22, withPad: " ", startingAt: 0)
+	let col2 = "CHAT / CONTACT".padding(toLength: 30, withPad: " ", startingAt: 0)
+	let col3 = "UNREAD".padding(toLength: 10, withPad: " ", startingAt: 0)
+	let col4 = "LAST MESSAGE"
+	print("\(col1)\(col2)\(col3)\(col4)")
+	print(String(repeating: "-", count: 95))
+
+	var count = 0
+	while sqlite3_step(stmt) == SQLITE_ROW {
+		let pk = sqlite3_column_int(stmt, 0)
+		let rawPartner = sqlite3_column_text(stmt, 1).flatMap { String(cString: $0) } ?? "Unknown"
+		let contactJID = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) } ?? ""
+		let unread = sqlite3_column_int(stmt, 3)
+		let sessionDateSec = sqlite3_column_double(stmt, 4)
+		let msgDateSec = sqlite3_column_double(stmt, 5)
+		let rawText = sqlite3_column_text(stmt, 6).flatMap { String(cString: $0) }
+		let msgType = sqlite3_column_int(stmt, 7)
+		let isFromMe = sqlite3_column_int(stmt, 8) == 1
+		let contactIdent = sqlite3_column_text(stmt, 9).flatMap { String(cString: $0) }
+
+		if let searchTerm = search, !searchTerm.isEmpty {
+			let sInfo = SessionInfo(pk: pk, partnerName: rawPartner, contactJID: contactJID, contactIdentifier: contactIdent)
+			if !matchesTarget(session: sInfo, target: searchTerm) {
+				continue
+			}
+		}
+
+		let cleanPartner = cleanUnicode(rawPartner).replacingOccurrences(of: "\u{00A0}", with: " ")
+		let partner = cleanPartner.isEmpty ? "Unknown" : cleanPartner
+
+		let dateSec: Double
+		if sessionDateSec > 2000000000.0 {
+			dateSec = msgDateSec > 0 ? msgDateSec : sessionDateSec
+		} else {
+			dateSec = sessionDateSec > 0 ? sessionDateSec : msgDateSec
+		}
+
+		let dateStr = dateSec > 0 ? formatDate(dateSec) : "Never"
+
+		let content: String
+		if let text = rawText, !text.isEmpty {
+			content = text.replacingOccurrences(of: "\n", with: " ")
+		} else {
+			switch msgType {
+			case 1: content = "[Image]"
+			case 2:
+				let dur = Int(sqlite3_column_int(stmt, 10))
+				let durStr = dur > 0 ? " (\(formatDuration(dur)))" : ""
+				content = "[Video\(durStr)]"
+			case 3:
+				let dur = Int(sqlite3_column_int(stmt, 10))
+				let durStr = dur > 0 ? " (\(formatDuration(dur)))" : ""
+				content = "[Voice Note\(durStr)]"
+			case 4, 14: content = "[Contact]"
+			case 5: content = "[Location]"
+			case 6: content = "[Group Event]"
+			case 8: content = "[Document]"
+			case 10: content = "[System Notice]"
+			case 11: content = "[View Once]"
+			case 15: content = "[Sticker]"
+			case 19: content = "[Poll]"
+			case 59: content = "[Reaction]"
+			default: content = "[Media]"
+			}
+		}
+
+		let prefix: String
+		if msgType == 6 || msgType == 10 {
+			prefix = ""
+		} else {
+			prefix = isFromMe ? "You: " : ""
+		}
+		let preview = "\(prefix)\(content)"
+		let truncatedPreview = preview.count > 45 ? "\(preview.prefix(42))..." : preview
+		let unreadDisplay = unread > 0 ? "*\(unread)*" : "0"
+
+		let displayPartner = partner.count > 28 ? "\(partner.prefix(25))..." : partner
+		let padDate = dateStr.padding(toLength: 22, withPad: " ", startingAt: 0)
+		let padPartner = displayPartner.padding(toLength: 30, withPad: " ", startingAt: 0)
+		let padUnread = unreadDisplay.padding(toLength: 10, withPad: " ", startingAt: 0)
+
+		print("\(padDate)\(padPartner)\(padUnread)\(truncatedPreview)")
+		count += 1
+		if count >= limit {
+			break
+		}
+	}
+	sqlite3_finalize(stmt)
+
+	if count == 0 {
+		print("No matching chats found.")
+	}
+}
+
+// MARK: - Protobuf ContextInfo Parser (Quoted Replies)
+
+func parseContextInfo(data: Data) -> (stanzaId: String?, participant: String?, quotedText: String?) {
+	var stanzaId: String? = nil
+	var participant: String? = nil
+	var quotedText: String? = nil
+
+	var idx = 0
+	let count = data.count
+
+	func readVarint() -> UInt64? {
+		var result: UInt64 = 0
+		var shift: UInt64 = 0
+		while idx < count {
+			let b = UInt64(data[idx])
+			idx += 1
+			result |= (b & 0x7F) << shift
+			if (b & 0x80) == 0 { return result }
+			shift += 7
+			if shift >= 64 { return nil }
+		}
+		return nil
+	}
+
+	while idx < count {
+		guard let key = readVarint() else { break }
+		let wireType = key & 7
+		let fieldNum = key >> 3
+
+		if wireType == 0 {
+			guard let _ = readVarint() else { break }
+		} else if wireType == 2 {
+			guard let len64 = readVarint() else { break }
+			let len = Int(len64)
+			guard idx + len <= count else { break }
+			let subData = data.subdata(in: idx..<idx+len)
+			idx += len
+
+			if fieldNum == 5 {
+				stanzaId = String(data: subData, encoding: .utf8)
+			} else if fieldNum == 6 {
+				participant = String(data: subData, encoding: .utf8)
+			} else if fieldNum == 19 {
+				var qIdx = 0
+				let qCount = subData.count
+				func qReadVarint() -> UInt64? {
+					var res: UInt64 = 0
+					var s: UInt64 = 0
+					while qIdx < qCount {
+						let b = UInt64(subData[qIdx])
+						qIdx += 1
+						res |= (b & 0x7F) << s
+						if (b & 0x80) == 0 { return res }
+						s += 7
+						if s >= 64 { return nil }
+					}
+					return nil
+				}
+				while qIdx < qCount {
+					guard let qKey = qReadVarint() else { break }
+					let qWire = qKey & 7
+					let qField = qKey >> 3
+					if qWire == 0 {
+						guard let _ = qReadVarint() else { break }
+					} else if qWire == 2 {
+						guard let qLen64 = qReadVarint() else { break }
+						let qLen = Int(qLen64)
+						guard qIdx + qLen <= qCount else { break }
+						let fieldData = subData.subdata(in: qIdx..<qIdx+qLen)
+						qIdx += qLen
+						if qField == 1 {
+							quotedText = String(data: fieldData, encoding: .utf8)
+						} else if qField == 6 {
+							var eIdx = 0
+							let eCount = fieldData.count
+							while eIdx < eCount {
+								var eKey: UInt64 = 0; var eShift: UInt64 = 0
+								while eIdx < eCount {
+									let eb = UInt64(fieldData[eIdx]); eIdx += 1
+									eKey |= (eb & 0x7F) << eShift
+									if (eb & 0x80) == 0 { break }
+									eShift += 7
+								}
+								let eWire = eKey & 7; let eField = eKey >> 3
+								if eWire == 2 {
+									var elen: UInt64 = 0; var es: UInt64 = 0
+									while eIdx < eCount {
+										let eb = UInt64(fieldData[eIdx]); eIdx += 1
+										elen |= (eb & 0x7F) << es
+										if (eb & 0x80) == 0 { break }
+										es += 7
+									}
+									let el = Int(elen)
+									if eIdx + el <= eCount {
+										let ed = fieldData.subdata(in: eIdx..<eIdx+el)
+										eIdx += el
+										if eField == 1 && quotedText == nil {
+											quotedText = String(data: ed, encoding: .utf8)
+										}
+									}
+								} else if eWire == 0 {
+									while eIdx < eCount { if (fieldData[eIdx] & 0x80) == 0 { eIdx += 1; break }; eIdx += 1 }
+								} else if eWire == 1 { eIdx += 8 }
+								else if eWire == 5 { eIdx += 4 }
+								else { break }
+							}
+						} else if qField == 3 {
+							quotedText = quotedText ?? "[Image]"
+						} else if qField == 8 {
+							quotedText = quotedText ?? "[Voice Note]"
+						} else if qField == 9 {
+							quotedText = quotedText ?? "[Video]"
+						} else if qField == 5 {
+							quotedText = quotedText ?? "[Location]"
+						} else if qField == 7 {
+							quotedText = quotedText ?? "[Document]"
+						} else if qField == 15 || qField == 26 {
+							quotedText = quotedText ?? "[Sticker]"
+						}
+					} else if qWire == 1 { qIdx += 8 }
+					else if qWire == 5 { qIdx += 4 }
+					else { break }
+				}
+			}
+		} else if wireType == 1 { idx += 8 }
+		else if wireType == 5 { idx += 4 }
+		else { break }
+	}
+	return (stanzaId, participant, quotedText)
+}
+
+// MARK: - Subcommand: Read
+
+func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false) {
+	guard let db = getDB() else { return }
+	defer { sqlite3_close(db) }
+
+	let matches = findMatchingSessions(db: db, target: target)
+	guard let session = matches.first else {
+		print("Chat not found matching: '\(target)'")
+		return
+	}
+
+	let sessionId = session.pk
+	let rawPartnerName = session.partnerName
+	let partnerName = cleanUnicode(rawPartnerName).replacingOccurrences(of: "\u{00A0}", with: " ")
+	let contactJID = session.contactJID
+
+	let isGroup = contactJID.hasSuffix("@g.us")
+	print("Conversation: \(partnerName) [\(contactJID)] (showing up to \(limit) messages)")
+	print(String(repeating: "-", count: 80))
+
+	let lookupSQL = """
+	SELECT m.ZISFROMME,
+	       COALESCE(
+	           NULLIF(gm.ZCONTACTNAME, ''),
+	           NULLIF(cs_member.ZPARTNERNAME, ''),
+	           NULLIF(ppn.ZPUSHNAME, ''),
+	           NULLIF(gm.ZFIRSTNAME, '')
+	       ) AS SENDERNAME,
+	       m.ZTEXT, m.ZMESSAGETYPE, mi.ZTITLE, mi.ZVCARDNAME, mi.ZVCARDSTRING,
+	       gm.ZMEMBERJID
+	FROM ZWAMESSAGE m
+	LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+	LEFT JOIN ZWAPROFILEPUSHNAME ppn ON gm.ZMEMBERJID = ppn.ZJID
+	LEFT JOIN ZWACHATSESSION cs_member ON gm.ZMEMBERJID = cs_member.ZCONTACTJID
+	LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	WHERE m.ZSTANZAID = ?
+	LIMIT 1;
+	"""
+	var lookupStmt: OpaquePointer?
+	sqlite3_prepare_v2(db, lookupSQL, -1, &lookupStmt, nil)
+	defer { sqlite3_finalize(lookupStmt) }
+
+	let msgQuery = """
+	SELECT m.ZMESSAGEDATE, m.ZISFROMME, m.ZTEXT, m.ZMESSAGETYPE,
+	       COALESCE(
+	           NULLIF(gm.ZCONTACTNAME, ''),
+	           NULLIF(cs_member.ZPARTNERNAME, ''),
+	           NULLIF(ppn.ZPUSHNAME, ''),
+	           NULLIF(gm.ZFIRSTNAME, '')
+	       ) AS SENDERNAME,
+	       mi.ZMEDIALOCALPATH, mi.ZMOVIEDURATION, mi.ZTITLE,
+	       m.ZSTANZAID, m.Z_PK, mi.ZMETADATA,
+	       mi.ZVCARDNAME, mi.ZVCARDSTRING, mi.ZLATITUDE, mi.ZLONGITUDE,
+	       m.ZGROUPEVENTTYPE,
+	       gm.ZMEMBERJID
+	FROM ZWAMESSAGE m
+	LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+	LEFT JOIN ZWAPROFILEPUSHNAME ppn ON gm.ZMEMBERJID = ppn.ZJID
+	LEFT JOIN ZWACHATSESSION cs_member ON gm.ZMEMBERJID = cs_member.ZCONTACTJID
+	LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	WHERE m.ZCHATSESSION = ?
+	ORDER BY m.ZMESSAGEDATE DESC
+	LIMIT ?;
+	"""
+
+	var msgStmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, msgQuery, -1, &msgStmt, nil) != SQLITE_OK {
+		fputs("Error querying messages: \(String(cString: sqlite3_errmsg(db)))\n", stderr)
+		return
+	}
+
+	sqlite3_bind_int(msgStmt, 1, sessionId)
+	sqlite3_bind_int(msgStmt, 2, Int32(limit))
+
+	struct MsgRow {
+		let date: String
+		let sender: String
+		let replySnippet: String?
+		let text: String
+	}
+
+	var rows: [MsgRow] = []
+
+	while sqlite3_step(msgStmt) == SQLITE_ROW {
+		let dateSec = sqlite3_column_double(msgStmt, 0)
+		let dateStr = formatDate(dateSec)
+		let isFromMe = sqlite3_column_int(msgStmt, 1) == 1
+		let rawText = sqlite3_column_text(msgStmt, 2).flatMap { String(cString: $0) }
+		let msgType = sqlite3_column_int(msgStmt, 3)
+		let senderName = sqlite3_column_text(msgStmt, 4).flatMap { String(cString: $0) }
+		let mediaPath = sqlite3_column_text(msgStmt, 5).flatMap { String(cString: $0) }
+		let movieDur = Int(sqlite3_column_int(msgStmt, 6))
+		let mediaTitle = sqlite3_column_text(msgStmt, 7).flatMap { String(cString: $0) }
+		let stanzaId = sqlite3_column_text(msgStmt, 8).flatMap { String(cString: $0) }
+		let msgPk = sqlite3_column_int(msgStmt, 9)
+		let messageId = (stanzaId != nil && !stanzaId!.isEmpty) ? stanzaId! : "msg_\(msgPk)"
+		let vcardName = sqlite3_column_text(msgStmt, 11).flatMap { String(cString: $0) }
+		let vcardString = sqlite3_column_text(msgStmt, 12).flatMap { String(cString: $0) }
+		let lat = sqlite3_column_double(msgStmt, 13)
+		let lon = sqlite3_column_double(msgStmt, 14)
+		let groupEventType = sqlite3_column_int(msgStmt, 15)
+		let memberJid = sqlite3_column_text(msgStmt, 16).flatMap { String(cString: $0) }
+
+		// Filter out reactions, album containers, and internal protocol handshakes
+		if msgType == 59 || msgType == 66 {
+			continue
+		}
+		if msgType == 10 {
+			if groupEventType == 2 || groupEventType == 56 || groupEventType == 58 || groupEventType == 63 || groupEventType == 92 {
+				continue
+			}
+			if (rawText == nil || rawText!.isEmpty) && mediaPath == nil {
+				continue
+			}
+		}
+
+		let sender: String
+		if msgType == 6 || msgType == 10 {
+			sender = "System"
+		} else if isFromMe {
+			sender = "You"
+		} else {
+			sender = resolveSenderDisplayName(senderName: senderName, memberJid: memberJid, isGroup: isGroup, partnerName: partnerName)
+		}
+
+		let caption = (rawText != nil && !rawText!.isEmpty) ? rawText! : nil
+		let body: String
+		switch msgType {
+		case 0:
+			body = caption ?? ""
+		case 1:
+			let imgTag: String
+			if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
+				imgTag = "[Image • \(full)]"
+			} else {
+				imgTag = "[Image]"
+			}
+			body = caption != nil ? "\(imgTag) \(caption!)" : imgTag
+		case 2:
+			let dur = movieDur > 0 ? " (\(formatDuration(movieDur)))" : ""
+			let vidTag: String
+			if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
+				vidTag = "[Video\(dur) • \(full)]"
+			} else {
+				vidTag = "[Video\(dur)]"
+			}
+			body = caption != nil ? "\(vidTag) \(caption!)" : vidTag
+		case 3:
+			let dur = movieDur > 0 ? " (\(formatDuration(movieDur)))" : ""
+			if let cached = getCachedTranscript(messageId: messageId) {
+				body = "[Voice Note\(dur)] \"\(cached)\""
+			} else if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
+				if transcribe {
+					if let t = transcribeAudioFile(filePath: full) {
+						saveCachedTranscript(messageId: messageId, mediaPath: p, chatPartner: partnerName, sender: sender, dateStr: dateStr, duration: movieDur, transcript: t)
+						body = "[Voice Note\(dur)] \"\(t)\""
+					} else {
+						body = "[Voice Note\(dur) • \(full)]"
+					}
+				} else {
+					body = "[Voice Note\(dur) • \(full)]"
+				}
+			} else {
+				body = "[Voice Note\(dur)]"
+			}
+		case 4, 14:
+			let (cName, cPhone) = parseVCard(vcardName: vcardName, vcardString: vcardString)
+			if let cn = cName, let cp = cPhone {
+				body = "[Contact: \(cn) • \(cp)]"
+			} else if let cn = cName {
+				body = "[Contact: \(cn)]"
+			} else {
+				body = "[Contact]"
+			}
+		case 5:
+			if lat != 0.0 || lon != 0.0 {
+				let coord = String(format: "%.4f, %.4f", lat, lon)
+				if let t = mediaTitle, !t.isEmpty {
+					body = "[Location: \(t) (\(coord))]"
+				} else {
+					body = "[Location: \(coord)]"
+				}
+			} else if let t = mediaTitle, !t.isEmpty {
+				body = "[Location: \(t)]"
+			} else {
+				body = "[Location]"
+			}
+		case 6:
+			if let cap = caption, !cap.isEmpty {
+				body = "[Group Event: \(cap)]"
+			} else {
+				body = "[Group Event]"
+			}
+		case 7:
+			if let cap = caption, !cap.isEmpty {
+				body = cap
+			} else if let t = mediaTitle, !t.isEmpty {
+				body = "[Link: \(t)]"
+			} else {
+				body = "[Call / Link]"
+			}
+		case 8:
+			let title = mediaTitle ?? "Document"
+			let docTag: String
+			if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
+				docTag = "[\(title) • \(full)]"
+			} else {
+				docTag = "[\(title)]"
+			}
+			body = caption != nil ? "\(docTag) \(caption!)" : docTag
+		case 10:
+			if let evName = extractEventName(from: caption) {
+				body = "[Event: \"\(evName)\"]"
+			} else if let cap = caption, !cap.isEmpty {
+				body = "[System: \(cap)]"
+			} else {
+				body = "[System Notice]"
+			}
+		case 11:
+			body = caption != nil ? "[View Once Media] \(caption!)" : "[View Once Media]"
+		case 15:
+			if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
+				body = "[Sticker • \(full)]"
+			} else {
+				body = "[Sticker]"
+			}
+		case 19:
+			body = caption != nil ? "[Poll: \(caption!)]" : "[Poll]"
+		case 20:
+			body = "[Poll Vote]"
+		default:
+			if let cap = caption, !cap.isEmpty {
+				body = cap
+			} else if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
+				body = "[Media • \(full)]"
+			} else {
+				body = "[Media]"
+			}
+		}
+
+		var replySnippet: String? = nil
+		if let blob = sqlite3_column_blob(msgStmt, 10) {
+			let bytes = sqlite3_column_bytes(msgStmt, 10)
+			if bytes > 0 {
+				let data = Data(bytes: blob, count: Int(bytes))
+				let info = parseContextInfo(data: data)
+				if let sId = info.stanzaId {
+					var quotedSender: String? = nil
+					var quotedText: String? = info.quotedText
+
+					if let lStmt = lookupStmt {
+						sqlite3_reset(lStmt)
+						sqlite3_bind_text(lStmt, 1, (sId as NSString).utf8String, -1, nil)
+						if sqlite3_step(lStmt) == SQLITE_ROW {
+							let qIsFromMe = sqlite3_column_int(lStmt, 0) == 1
+							let qSenderName = sqlite3_column_text(lStmt, 1).flatMap({ String(cString: $0) })
+							let qMemberJid = sqlite3_column_text(lStmt, 7).flatMap({ String(cString: $0) })
+							if qIsFromMe {
+								quotedSender = "You"
+							} else {
+								quotedSender = resolveSenderDisplayName(senderName: qSenderName, memberJid: qMemberJid, isGroup: isGroup, partnerName: partnerName)
+							}
+
+							if quotedText == nil || quotedText!.isEmpty {
+								if let qt = sqlite3_column_text(lStmt, 2).flatMap({ String(cString: $0) }), !qt.isEmpty {
+									quotedText = qt
+								} else {
+									let qType = sqlite3_column_int(lStmt, 3)
+									let qTitle = sqlite3_column_text(lStmt, 4).flatMap({ String(cString: $0) })
+									let qVCardName = sqlite3_column_text(lStmt, 5).flatMap({ String(cString: $0) })
+									let qVCardString = sqlite3_column_text(lStmt, 6).flatMap({ String(cString: $0) })
+									switch qType {
+									case 1: quotedText = "[Image]"
+									case 2: quotedText = "[Video]"
+									case 3: quotedText = "[Voice Note]"
+									case 4, 14:
+										let (cName, _) = parseVCard(vcardName: qVCardName, vcardString: qVCardString)
+										quotedText = cName != nil ? "[Contact: \(cName!)]" : "[Contact]"
+									case 5: quotedText = "[Location]"
+									case 8: quotedText = "[\(qTitle ?? "Document")]"
+									case 15: quotedText = "[Sticker]"
+									case 19: quotedText = "[Poll]"
+									default: quotedText = "[Media]"
+									}
+								}
+							}
+						}
+					}
+
+					if quotedSender == nil {
+						if let part = info.participant {
+							if isGroup {
+								if let resolved = resolveJIDName(db: db, jid: part) {
+									quotedSender = resolved
+								} else {
+									quotedSender = "Member"
+								}
+							} else if part.contains(contactJID) || contactJID.contains(part) {
+								quotedSender = partnerName
+							}
+						}
+					}
+
+					if let qText = quotedText {
+						let oneLiner = qText.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+						let maxLen = full ? 70 : 40
+						let truncated = oneLiner.count > maxLen ? String(oneLiner.prefix(maxLen)) + "..." : oneLiner
+						if let qs = quotedSender {
+							replySnippet = "↳ \(qs): \"\(truncated)\""
+						} else {
+							replySnippet = "↳ \"\(truncated)\""
+						}
+					}
+				}
+			}
+		}
+
+		rows.append(MsgRow(date: dateStr, sender: sender, replySnippet: replySnippet, text: body))
+	}
+	sqlite3_finalize(msgStmt)
+
+	for row in rows.reversed() {
+		let lines = row.text.components(separatedBy: "\n")
+		let replyTag = row.replySnippet != nil ? " [\(row.replySnippet!)]" : ""
+		if full || lines.count == 1 {
+			print("[\(row.date)] \(row.sender)\(replyTag): \(row.text)")
+		} else {
+			print("[\(row.date)] \(row.sender)\(replyTag): \(lines[0])")
+			for line in lines.dropFirst() {
+				print("    \(line)")
+			}
+		}
+	}
+
+	if rows.isEmpty {
+		print("No messages found in this conversation.")
+	}
+}
+
+// MARK: - Subcommand: Search
+
+func searchMessages(query: String, contact: String?, days: Int?, limit: Int) {
+	guard let db = getDB() else { return }
+	defer { sqlite3_close(db) }
+
+	var conditions = ["(m.ZTEXT LIKE ? OR mi.ZTITLE LIKE ? OR mi.ZMEDIALOCALPATH LIKE ?)", "s.ZCONTACTJID NOT LIKE '%@status'"]
+
+	if let c = contact {
+		let matches = findMatchingSessions(db: db, target: c)
+		if matches.isEmpty {
+			print("No matching contacts found for: '\(c)'")
+			return
+		}
+		let idList = matches.map { String($0.pk) }.joined(separator: ",")
+		conditions.append("s.Z_PK IN (\(idList))")
+	}
+
+	if let d = days, d > 0 {
+		let since = Date().addingTimeInterval(-Double(d * 86400)).timeIntervalSinceReferenceDate
+		conditions.append("m.ZMESSAGEDATE >= \(since)")
+	}
+
+	let whereClause = conditions.joined(separator: " AND ")
+	let sql = """
+	SELECT m.ZMESSAGEDATE, s.ZPARTNERNAME, m.ZISFROMME, m.ZTEXT, s.ZCONTACTJID,
+	       m.ZMESSAGETYPE, mi.ZTITLE, mi.ZMEDIALOCALPATH, mi.ZFILESIZE,
+	       mi.ZVCARDNAME, mi.ZVCARDSTRING,
+	       COALESCE(
+	           NULLIF(gm.ZCONTACTNAME, ''),
+	           NULLIF(cs_member.ZPARTNERNAME, ''),
+	           NULLIF(ppn.ZPUSHNAME, ''),
+	           NULLIF(gm.ZFIRSTNAME, '')
+	       ) AS SENDERNAME,
+	       gm.ZMEMBERJID
+	FROM ZWAMESSAGE m
+	JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK
+	LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+	LEFT JOIN ZWAPROFILEPUSHNAME ppn ON gm.ZMEMBERJID = ppn.ZJID
+	LEFT JOIN ZWACHATSESSION cs_member ON gm.ZMEMBERJID = cs_member.ZCONTACTJID
+	LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	WHERE \(whereClause)
+	ORDER BY m.ZMESSAGEDATE DESC
+	LIMIT ?;
+	"""
+
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
+		fputs("Error searching: \(String(cString: sqlite3_errmsg(db)))\n", stderr)
+		return
+	}
+
+	let queryPattern = "%\(query)%"
+	sqlite3_bind_text(stmt, 1, (queryPattern as NSString).utf8String, -1, nil)
+	sqlite3_bind_text(stmt, 2, (queryPattern as NSString).utf8String, -1, nil)
+	sqlite3_bind_text(stmt, 3, (queryPattern as NSString).utf8String, -1, nil)
+	sqlite3_bind_int(stmt, 4, Int32(limit))
+
+	print("Search results for: '\(query)' (max \(limit))")
+	print(String(repeating: "-", count: 80))
+
+	var count = 0
+	while sqlite3_step(stmt) == SQLITE_ROW {
+		let dateSec = sqlite3_column_double(stmt, 0)
+		let dateStr = formatDate(dateSec)
+		let rawPartner = sqlite3_column_text(stmt, 1).flatMap { String(cString: $0) } ?? "Unknown"
+		let cleanPartner = cleanUnicode(rawPartner).replacingOccurrences(of: "\u{00A0}", with: " ")
+		let partner = cleanPartner.isEmpty ? "Unknown" : cleanPartner
+		let isFromMe = sqlite3_column_int(stmt, 2) == 1
+		let rawText = sqlite3_column_text(stmt, 3).flatMap { String(cString: $0) }
+		let contactJID = sqlite3_column_text(stmt, 4).flatMap { String(cString: $0) } ?? ""
+		let isGroup = contactJID.hasSuffix("@g.us")
+		let msgType = sqlite3_column_int(stmt, 5)
+		let docTitle = sqlite3_column_text(stmt, 6).flatMap { String(cString: $0) }
+		let localPath = sqlite3_column_text(stmt, 7).flatMap { String(cString: $0) }
+		let fileSize = sqlite3_column_int64(stmt, 8)
+		let vcardName = sqlite3_column_text(stmt, 9).flatMap { String(cString: $0) }
+		let vcardString = sqlite3_column_text(stmt, 10).flatMap { String(cString: $0) }
+		let senderName = sqlite3_column_text(stmt, 11).flatMap { String(cString: $0) }
+		let memberJid = sqlite3_column_text(stmt, 12).flatMap { String(cString: $0) }
+		let sender: String
+		if isFromMe {
+			sender = "You"
+		} else {
+			sender = resolveSenderDisplayName(senderName: senderName, memberJid: memberJid, isGroup: isGroup, partnerName: partner)
+		}
+
+		let text: String
+		if let t = rawText, !t.isEmpty {
+			text = t
+		} else {
+			let szStr = fileSize > 0 ? " (\(formatFileSize(fileSize)))" : ""
+			switch msgType {
+			case 1: text = "[Image\(szStr)]"
+			case 2: text = "[Video\(szStr)]"
+			case 3: text = "[Voice Note\(szStr)]"
+			case 4, 14:
+				let (cName, cPhone) = parseVCard(vcardName: vcardName, vcardString: vcardString)
+				if let cn = cName, let cp = cPhone {
+					text = "[Contact: \(cn) • \(cp)]"
+				} else if let cn = cName {
+					text = "[Contact: \(cn)]"
+				} else {
+					text = "[Contact]"
+				}
+			case 5: text = "[Location]"
+			case 6: text = "[Group Event]"
+			case 8:
+				let name = docTitle ?? (localPath != nil ? (localPath! as NSString).lastPathComponent : "Document")
+				text = "[\(name)\(szStr)]"
+			case 10: text = "[System Notice]"
+			case 11: text = "[View Once]"
+			case 15: text = "[Sticker]"
+			case 19: text = "[Poll]"
+			default:
+				text = localPath != nil ? "[Attachment\(szStr)]" : "[Media]"
+			}
+		}
+
+		let singleLine = text.replacingOccurrences(of: "\n", with: " ")
+		let preview = singleLine.count > 100 ? "\(singleLine.prefix(97))..." : singleLine
+
+		print("[\(dateStr)] [\(partner)] \(sender): \(preview)")
+		count += 1
+	}
+	sqlite3_finalize(stmt)
+
+	// Search cached voice note transcripts
+	if let tdb = getTranscriptDB() {
+		defer { sqlite3_close(tdb) }
+		var tQuery = "SELECT date_str, chat_partner, sender, transcript, duration FROM transcripts WHERE transcript LIKE ?"
+		if let c = contact {
+			tQuery += " AND chat_partner LIKE '%\(c)%'"
+		}
+		tQuery += " ORDER BY date_str DESC LIMIT ?;"
+		var tstmt: OpaquePointer?
+		if sqlite3_prepare_v2(tdb, tQuery, -1, &tstmt, nil) == SQLITE_OK {
+			sqlite3_bind_text(tstmt, 1, (queryPattern as NSString).utf8String, -1, nil)
+			sqlite3_bind_int(tstmt, 2, Int32(limit))
+			while sqlite3_step(tstmt) == SQLITE_ROW {
+				let dStr = sqlite3_column_text(tstmt, 0).flatMap { String(cString: $0) } ?? ""
+				let pName = sqlite3_column_text(tstmt, 1).flatMap { String(cString: $0) } ?? "Unknown"
+				let sName = sqlite3_column_text(tstmt, 2).flatMap { String(cString: $0) } ?? "Unknown"
+				let tText = sqlite3_column_text(tstmt, 3).flatMap { String(cString: $0) } ?? ""
+				let dur = Int(sqlite3_column_int(tstmt, 4))
+				let durStr = dur > 0 ? " (\(formatDuration(dur)))" : ""
+				let preview = tText.count > 90 ? "\(tText.prefix(87))..." : tText
+				print("[\(dStr)] [\(pName)] \(sName): [Voice Note\(durStr)] \"\(preview)\"")
+				count += 1
+			}
+			sqlite3_finalize(tstmt)
+		}
+	}
+
+	if count == 0 {
+		print("No matching messages found.")
+	}
+}
+
+// MARK: - Subcommand: Draft
+
+func draftMessage(target: String, message: String) {
+	guard let db = getDB() else { return }
+	let matches = findMatchingSessions(db: db, target: target)
+	let matchingSession = matches.first
+	let resolvedPhone = resolveContactPhone(db: db, contact: target)
+	sqlite3_close(db)
+
+	// Always copy draft to macOS clipboard for convenience
+	let pasteboard = NSPasteboard.general
+	pasteboard.clearContents()
+	pasteboard.setString(message, forType: .string)
+
+	var allowedQueryCharacters = CharacterSet.urlQueryAllowed
+	allowedQueryCharacters.remove(charactersIn: "&#+=?")
+	guard let encodedText = message.addingPercentEncoding(withAllowedCharacters: allowedQueryCharacters) else {
+		fputs("Error: Failed to URL-encode message.\n", stderr)
+		exit(1)
+	}
+
+	let digitsOnly = extractDigits(target)
+	let letters = target.filter { $0.isLetter }
+	let isRawPhone = digitsOnly.count >= 7 && letters.isEmpty
+
+	if !isRawPhone, let session = matchingSession, session.contactJID.hasSuffix("@g.us") {
+		let cleanPartner = cleanUnicode(session.partnerName).replacingOccurrences(of: "\u{00A0}", with: " ")
+		let urlString = "whatsapp://send?text=\(encodedText)"
+		if let url = URL(string: urlString) {
+			NSWorkspace.shared.open(url)
+		}
+		print("Opened WhatsApp with pre-filled draft for group '\(cleanPartner)'.")
+		print("Draft is also copied to your clipboard (Cmd+V).")
+		return
+	}
+
+	guard let phone = resolvedPhone, !phone.isEmpty else {
+		fputs("Error: Could not resolve '\(target)' to a valid contact, group, or phone number.\n", stderr)
+		fputs("Tip: Provide the phone number in international digits (e.g. +1234567890), a contact name, or a group name.\n", stderr)
+		exit(1)
+	}
+
+	let urlString = "whatsapp://send?phone=\(phone)&text=\(encodedText)"
+	guard let url = URL(string: urlString) else {
+		fputs("Error: Malformed URL: \(urlString)\n", stderr)
+		exit(1)
+	}
+
+	NSWorkspace.shared.open(url)
+	print("Opened WhatsApp with draft composed for \(target) (\(phone)).")
+	print("Review the draft in WhatsApp and press Enter to send.")
+}
+
+// MARK: - Subcommand: Voice Notes
+
+func listVoiceNotes(target: String, limit: Int, transcribe: Bool) {
+	guard let db = getDB() else { return }
+	defer { sqlite3_close(db) }
+
+	let matches = findMatchingSessions(db: db, target: target)
+	guard let session = matches.first else {
+		print("Chat not found matching: '\(target)'")
+		return
+	}
+
+	let partner = cleanUnicode(session.partnerName).replacingOccurrences(of: "\u{00A0}", with: " ")
+	print("Voice notes in chat: \(partner) (showing up to \(limit))")
+	print(String(repeating: "-", count: 80))
+
+	let query = """
+	SELECT m.ZMESSAGEDATE, m.ZISFROMME, mi.ZMEDIALOCALPATH, mi.ZMOVIEDURATION,
+	       m.ZSTANZAID, m.Z_PK,
+	       COALESCE(
+	           NULLIF(gm.ZCONTACTNAME, ''),
+	           NULLIF(cs_member.ZPARTNERNAME, ''),
+	           NULLIF(ppn.ZPUSHNAME, ''),
+	           NULLIF(gm.ZFIRSTNAME, '')
+	       ) AS SENDERNAME,
+	       gm.ZMEMBERJID
+	FROM ZWAMESSAGE m
+	JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+	LEFT JOIN ZWAPROFILEPUSHNAME ppn ON gm.ZMEMBERJID = ppn.ZJID
+	LEFT JOIN ZWACHATSESSION cs_member ON gm.ZMEMBERJID = cs_member.ZCONTACTJID
+	WHERE m.ZCHATSESSION = ? AND m.ZMESSAGETYPE = 3 AND mi.ZMEDIALOCALPATH IS NOT NULL
+	ORDER BY m.ZMESSAGEDATE DESC
+	LIMIT ?;
+	"""
+
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, query, -1, &stmt, nil) != SQLITE_OK {
+		fputs("Error querying voice notes: \(String(cString: sqlite3_errmsg(db)))\n", stderr)
+		return
+	}
+
+	sqlite3_bind_int(stmt, 1, session.pk)
+	sqlite3_bind_int(stmt, 2, Int32(limit))
+
+	let colIdx = "#".padding(toLength: 4, withPad: " ", startingAt: 0)
+	let colDate = "TIMESTAMP".padding(toLength: 22, withPad: " ", startingAt: 0)
+	let colSender = "SENDER".padding(toLength: 15, withPad: " ", startingAt: 0)
+	let colDur = "DURATION".padding(toLength: 10, withPad: " ", startingAt: 0)
+	let colDetail = "TRANSCRIPT / AUDIO PATH"
+	print("\(colIdx)\(colDate)\(colSender)\(colDur)\(colDetail)")
+	print(String(repeating: "-", count: 95))
+
+	var count = 0
+	while sqlite3_step(stmt) == SQLITE_ROW {
+		count += 1
+		let dateSec = sqlite3_column_double(stmt, 0)
+		let dateStr = formatDate(dateSec)
+		let isFromMe = sqlite3_column_int(stmt, 1) == 1
+		let mediaPath = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) }
+		let duration = Int(sqlite3_column_int(stmt, 3))
+		let durStr = duration > 0 ? formatDuration(duration) : "--:--"
+		let stanzaId = sqlite3_column_text(stmt, 4).flatMap { String(cString: $0) }
+		let msgPk = sqlite3_column_int(stmt, 5)
+		let messageId = (stanzaId != nil && !stanzaId!.isEmpty) ? stanzaId! : "msg_\(msgPk)"
+		let isGroup = session.contactJID.hasSuffix("@g.us")
+		let senderName = sqlite3_column_text(stmt, 6).flatMap { String(cString: $0) }
+		let memberJid = sqlite3_column_text(stmt, 7).flatMap { String(cString: $0) }
+		let sender: String
+		if isFromMe {
+			sender = "You"
+		} else {
+			sender = resolveSenderDisplayName(senderName: senderName, memberJid: memberJid, isGroup: isGroup, partnerName: partner)
+		}
+		let fullPath = resolveMediaPath(mediaPath) ?? "(missing)"
+
+		var transcriptText = getCachedTranscript(messageId: messageId)
+		if transcriptText == nil && transcribe {
+			if let fp = resolveMediaPath(mediaPath), FileManager.default.fileExists(atPath: fp) {
+				if let t = transcribeAudioFile(filePath: fp) {
+					saveCachedTranscript(messageId: messageId, mediaPath: mediaPath ?? "", chatPartner: partner, sender: sender, dateStr: dateStr, duration: duration, transcript: t)
+					transcriptText = t
+				}
+			}
+		}
+
+		let padIdx = "\(count)".padding(toLength: 4, withPad: " ", startingAt: 0)
+		let padDate = dateStr.padding(toLength: 22, withPad: " ", startingAt: 0)
+		let padSender = (sender.count > 13 ? "\(sender.prefix(11)).." : sender).padding(toLength: 15, withPad: " ", startingAt: 0)
+		let padDur = durStr.padding(toLength: 10, withPad: " ", startingAt: 0)
+
+		if let t = transcriptText {
+			print("\(padIdx)\(padDate)\(padSender)\(padDur)\"\(t)\"")
+		} else {
+			print("\(padIdx)\(padDate)\(padSender)\(padDur)\(fullPath)")
+		}
+	}
+	sqlite3_finalize(stmt)
+
+	if count == 0 {
+		print("No voice notes found in this chat.")
+	}
+}
+
+func batchTranscribe(target: String, limit: Int) {
+	guard let db = getDB() else { return }
+	defer { sqlite3_close(db) }
+
+	let matches = findMatchingSessions(db: db, target: target)
+	guard let session = matches.first else {
+		print("Chat not found matching: '\(target)'")
+		return
+	}
+
+	let partner = cleanUnicode(session.partnerName).replacingOccurrences(of: "\u{00A0}", with: " ")
+	print("Transcribing voice notes for: \(partner) (up to \(limit))")
+	print(String(repeating: "-", count: 80))
+
+	let query = """
+	SELECT m.ZMESSAGEDATE, m.ZISFROMME, mi.ZMEDIALOCALPATH, mi.ZMOVIEDURATION,
+	       m.ZSTANZAID, m.Z_PK
+	FROM ZWAMESSAGE m
+	JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	WHERE m.ZCHATSESSION = ? AND m.ZMESSAGETYPE = 3 AND mi.ZMEDIALOCALPATH IS NOT NULL
+	ORDER BY m.ZMESSAGEDATE DESC
+	LIMIT ?;
+	"""
+
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, query, -1, &stmt, nil) != SQLITE_OK {
+		fputs("Error querying voice notes: \(String(cString: sqlite3_errmsg(db)))\n", stderr)
+		return
+	}
+
+	sqlite3_bind_int(stmt, 1, session.pk)
+	sqlite3_bind_int(stmt, 2, Int32(limit))
+
+	var count = 0
+	var newlyTranscribed = 0
+	while sqlite3_step(stmt) == SQLITE_ROW {
+		count += 1
+		let dateSec = sqlite3_column_double(stmt, 0)
+		let dateStr = formatDate(dateSec)
+		let isFromMe = sqlite3_column_int(stmt, 1) == 1
+		let mediaPath = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) }
+		let duration = Int(sqlite3_column_int(stmt, 3))
+		let durStr = duration > 0 ? formatDuration(duration) : "--:--"
+		let stanzaId = sqlite3_column_text(stmt, 4).flatMap { String(cString: $0) }
+		let msgPk = sqlite3_column_int(stmt, 5)
+		let messageId = (stanzaId != nil && !stanzaId!.isEmpty) ? stanzaId! : "msg_\(msgPk)"
+		let sender = isFromMe ? "You" : partner
+
+		if let cached = getCachedTranscript(messageId: messageId) {
+			print("[\(dateStr)] \(sender) (\(durStr)) [CACHED]: \"\(cached)\"")
+			continue
+		}
+
+		guard let p = mediaPath, let fullPath = resolveMediaPath(p), FileManager.default.fileExists(atPath: fullPath) else {
+			print("[\(dateStr)] \(sender) (\(durStr)): Audio file not cached locally.")
+			continue
+		}
+
+		print("[\(dateStr)] \(sender) (\(durStr)) transcribing...", terminator: "")
+		fflush(stdout)
+		if let transcript = transcribeAudioFile(filePath: fullPath) {
+			saveCachedTranscript(messageId: messageId, mediaPath: p, chatPartner: partner, sender: sender, dateStr: dateStr, duration: duration, transcript: transcript)
+			print(" Done!")
+			print("    \"\(transcript)\"")
+			newlyTranscribed += 1
+		} else {
+			print(" (failed or empty)")
+		}
+	}
+	sqlite3_finalize(stmt)
+
+	if count == 0 {
+		print("No voice notes found in this chat.")
+	} else {
+		print(String(repeating: "-", count: 80))
+		print("Finished. Transcribed \(newlyTranscribed) new voice note(s).")
+	}
+}
+
+func playVoiceNote(target: String, index: Int) {
+	guard let db = getDB() else { return }
+	defer { sqlite3_close(db) }
+
+	let matches = findMatchingSessions(db: db, target: target)
+	guard let session = matches.first else {
+		fputs("Chat not found matching: '\(target)'\n", stderr)
+		return
+	}
+
+	let query = """
+	SELECT m.ZMESSAGEDATE, m.ZISFROMME, mi.ZMEDIALOCALPATH, mi.ZMOVIEDURATION
+	FROM ZWAMESSAGE m
+	JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	WHERE m.ZCHATSESSION = ? AND m.ZMESSAGETYPE = 3 AND mi.ZMEDIALOCALPATH IS NOT NULL
+	ORDER BY m.ZMESSAGEDATE DESC;
+	"""
+
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, query, -1, &stmt, nil) != SQLITE_OK {
+		fputs("Error querying voice notes: \(String(cString: sqlite3_errmsg(db)))\n", stderr)
+		return
+	}
+
+	sqlite3_bind_int(stmt, 1, session.pk)
+
+	var currentIndex = 1
+	var found = false
+
+	while sqlite3_step(stmt) == SQLITE_ROW {
+		if currentIndex == index {
+			let dateSec = sqlite3_column_double(stmt, 0)
+			let dateStr = formatDate(dateSec)
+			let isFromMe = sqlite3_column_int(stmt, 1) == 1
+			let mediaPath = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) }
+			let duration = Int(sqlite3_column_int(stmt, 3))
+			let durStr = duration > 0 ? formatDuration(duration) : "--:--"
+			let sender = isFromMe ? "You" : session.partnerName
+
+			guard let fullPath = resolveMediaPath(mediaPath), FileManager.default.fileExists(atPath: fullPath) else {
+				fputs("Audio file not found on disk for voice note #\(index).\n", stderr)
+				sqlite3_finalize(stmt)
+				return
+			}
+
+			print("Playing voice note #\(index) from \(sender) (\(dateStr), \(durStr))...")
+			print("Audio: \(fullPath)")
+
+			let proc = Process()
+			proc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+			proc.arguments = [fullPath]
+			do {
+				try proc.run()
+				proc.waitUntilExit()
+			} catch {
+				fputs("Error playing audio: \(error.localizedDescription)\n", stderr)
+			}
+
+			found = true
+			break
+		}
+		currentIndex += 1
+	}
+	sqlite3_finalize(stmt)
+
+	if !found {
+		print("No voice note found at index \(index) for \(session.partnerName).")
+	}
+}
+
+// MARK: - Subcommand: Documents & Attachments
+
+func listDocuments(target: String?, type: String?, minSizeMB: Double?, ext: String?, search: String?, limit: Int) {
+	guard let db = getDB() else { return }
+	defer { sqlite3_close(db) }
+
+	var conditions: [String] = ["s.ZCONTACTJID NOT LIKE '%@status'"]
+
+	if let c = target {
+		let matches = findMatchingSessions(db: db, target: c)
+		if matches.isEmpty {
+			print("No matching contacts found for: '\(c)'")
+			return
+		}
+		let idList = matches.map { String($0.pk) }.joined(separator: ",")
+		conditions.append("s.Z_PK IN (\(idList))")
+	}
+
+	let typeFilter = (type ?? "doc").lowercased()
+	switch typeFilter {
+	case "doc", "docs", "document", "documents":
+		conditions.append("m.ZMESSAGETYPE = 8")
+	case "image", "images", "img":
+		conditions.append("m.ZMESSAGETYPE = 1")
+	case "video", "videos", "vid":
+		conditions.append("m.ZMESSAGETYPE = 2")
+	case "audio", "voice":
+		conditions.append("m.ZMESSAGETYPE = 3")
+	case "sticker", "stickers":
+		conditions.append("m.ZMESSAGETYPE = 15")
+	case "contact", "contacts":
+		conditions.append("m.ZMESSAGETYPE IN (4, 14)")
+	case "all", "any", "attachment", "attachments":
+		conditions.append("m.ZMESSAGETYPE IN (1, 2, 3, 4, 8, 14, 15)")
+	default:
+		conditions.append("m.ZMESSAGETYPE = 8")
+	}
+
+	if let minMB = minSizeMB, minMB > 0 {
+		let minBytes = Int64(minMB * 1024 * 1024)
+		conditions.append("mi.ZFILESIZE >= \(minBytes)")
+	}
+
+	if let e = ext, !e.isEmpty {
+		let cleanExt = e.starts(with: ".") ? String(e.dropFirst()) : e
+		conditions.append("(mi.ZMEDIALOCALPATH LIKE '%.\(cleanExt)' OR mi.ZTITLE LIKE '%.\(cleanExt)')")
+	}
+
+	var searchParam: String? = nil
+	if let s = search, !s.isEmpty {
+		conditions.append("(mi.ZTITLE LIKE ? OR mi.ZMEDIALOCALPATH LIKE ? OR m.ZTEXT LIKE ?)")
+		searchParam = "%\(s)%"
+	}
+
+	let whereClause = conditions.joined(separator: " AND ")
+	let query = """
+	SELECT m.ZMESSAGEDATE, s.ZPARTNERNAME, m.ZISFROMME, m.ZMESSAGETYPE,
+	       mi.ZTITLE, mi.ZMEDIALOCALPATH, mi.ZFILESIZE, s.ZCONTACTJID
+	FROM ZWAMESSAGE m
+	JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK
+	JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	WHERE \(whereClause)
+	ORDER BY m.ZMESSAGEDATE DESC
+	LIMIT ?;
+	"""
+
+	var stmt: OpaquePointer?
+	if sqlite3_prepare_v2(db, query, -1, &stmt, nil) != SQLITE_OK {
+		fputs("Error querying documents: \(String(cString: sqlite3_errmsg(db)))\n", stderr)
+		return
+	}
+
+	var bindIdx: Int32 = 1
+	if let sp = searchParam {
+		sqlite3_bind_text(stmt, bindIdx, (sp as NSString).utf8String, -1, nil)
+		bindIdx += 1
+		sqlite3_bind_text(stmt, bindIdx, (sp as NSString).utf8String, -1, nil)
+		bindIdx += 1
+		sqlite3_bind_text(stmt, bindIdx, (sp as NSString).utf8String, -1, nil)
+		bindIdx += 1
+	}
+	sqlite3_bind_int(stmt, bindIdx, Int32(limit))
+
+	let header = target != nil ? "Documents in chat: \(target!)" : "Recent documents & attachments"
+	print("\(header) (showing up to \(limit))")
+	print(String(repeating: "-", count: 100))
+
+	let colIdx = "#".padding(toLength: 4, withPad: " ", startingAt: 0)
+	let colDate = "TIMESTAMP".padding(toLength: 22, withPad: " ", startingAt: 0)
+	let colChat = "CHAT / SENDER".padding(toLength: 24, withPad: " ", startingAt: 0)
+	let colType = "TYPE".padding(toLength: 10, withPad: " ", startingAt: 0)
+	let colSize = "SIZE".padding(toLength: 10, withPad: " ", startingAt: 0)
+	let colFile = "NAME / LOCAL PATH"
+	print("\(colIdx)\(colDate)\(colChat)\(colType)\(colSize)\(colFile)")
+	print(String(repeating: "-", count: 100))
+
+	var count = 0
+	while sqlite3_step(stmt) == SQLITE_ROW {
+		count += 1
+		let dateSec = sqlite3_column_double(stmt, 0)
+		let dateStr = formatDate(dateSec)
+		let rawPartner = sqlite3_column_text(stmt, 1).flatMap { String(cString: $0) } ?? "Unknown"
+		let cleanPartner = cleanUnicode(rawPartner).replacingOccurrences(of: "\u{00A0}", with: " ")
+		let partner = cleanPartner.isEmpty ? "Unknown" : cleanPartner
+		let isFromMe = sqlite3_column_int(stmt, 2) == 1
+		let msgType = sqlite3_column_int(stmt, 3)
+		let title = sqlite3_column_text(stmt, 4).flatMap { String(cString: $0) }
+		let localPath = sqlite3_column_text(stmt, 5).flatMap { String(cString: $0) }
+		let fileSize = sqlite3_column_int64(stmt, 6)
+
+		let typeLabel: String
+		switch msgType {
+		case 1: typeLabel = "Image"
+		case 2: typeLabel = "Video"
+		case 3: typeLabel = "Audio"
+		case 4, 14: typeLabel = "Contact"
+		case 8: typeLabel = "Document"
+		case 15: typeLabel = "Sticker"
+		default: typeLabel = "Media"
+		}
+
+		let sizeStr = formatFileSize(fileSize)
+		let senderDisplay = isFromMe ? "You -> \(partner)" : partner
+
+		let fullPath = resolveMediaPath(localPath)
+		let fileExists = fullPath != nil && FileManager.default.fileExists(atPath: fullPath!)
+
+		var displayName = title ?? ""
+		if displayName.isEmpty {
+			if let lp = localPath {
+				displayName = (lp as NSString).lastPathComponent
+			} else {
+				displayName = "Attachment"
+			}
+		}
+
+		let padIdx = "\(count)".padding(toLength: 4, withPad: " ", startingAt: 0)
+		let padDate = dateStr.padding(toLength: 22, withPad: " ", startingAt: 0)
+		let padChat = (senderDisplay.count > 22 ? "\(senderDisplay.prefix(20)).." : senderDisplay).padding(toLength: 24, withPad: " ", startingAt: 0)
+		let padType = typeLabel.padding(toLength: 10, withPad: " ", startingAt: 0)
+		let padSize = sizeStr.padding(toLength: 10, withPad: " ", startingAt: 0)
+
+		print("\(padIdx)\(padDate)\(padChat)\(padType)\(padSize)\(displayName)")
+		if let fp = fullPath, fileExists {
+			print("    Path: \(fp)")
+		}
+	}
+	sqlite3_finalize(stmt)
+
+	if count == 0 {
+		print("No documents or attachments found matching criteria.")
+	}
+}
+
+// MARK: - CLI Help & Usage
+
+func printUsage() {
+	let helpText = """
+	OVERVIEW: WhatsApp macOS CLI
+
+	A fast command-line tool to inspect, search, and draft WhatsApp messages on macOS.
+	Queries your local unencrypted SQLite database (~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite)
+	and interfaces directly with WhatsApp Desktop via the native URL scheme.
+
+	USAGE:
+		whatsapp <subcommand> [options]
+
+	COMMANDS:
+		chats        List recent chat conversations, unread badges, and preview snippets
+		read         Read conversation history from a specific contact or group chat
+		documents    List or search documents and media attachments (PDFs, docs, images, etc.)
+		voice-notes  List voice notes in a chat with duration, transcripts, and audio paths
+		transcribe   Batch transcribe voice notes in a chat locally and cache them
+		play         Play a voice note from a chat via native macOS audio player (afplay)
+		search       Search all messages across all chats (including voice note transcripts)
+		unread       Quickly list only chats that have unread messages
+		draft        Open WhatsApp with a draft message pre-filled to a contact or phone number
+		help         Show this help message
+
+	SUBCOMMAND OPTIONS:
+
+	  chats:
+		whatsapp chats [--limit <N>] [--unread] [--search <term>]
+		  --limit <N>      Maximum number of chats to display (default: 20)
+		  --unread         Filter to only chats with unread messages > 0
+		  --search <term>  Filter chats by contact name or group title
+
+	  read:
+		whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe]
+		  <contact/phone>  Contact name, group name, or phone number to read
+		  --limit <N>      Number of messages to retrieve (default: 25)
+		  --all            Display full multiline message content without truncating
+		  --transcribe, -t Transcribe any un-cached voice notes on-the-fly and display them
+
+	  documents:
+		whatsapp documents [<contact/phone>] [--type <doc|image|video|audio|all>] [--min-size <MB>] [--ext <ext>] [--search <term>] [--limit <N>]
+		  (Aliases: docs, files, attachments)
+		  <contact/phone>  Optional: filter to a specific contact or group
+		  --type <type>    Filter media: doc (default), image, video, audio, all
+		  --min-size <MB>  Filter to files larger than N megabytes
+		  --ext <ext>      Filter by file extension (e.g. --ext pdf)
+		  --search <term>  Search filename or title
+		  --limit <N>      Number of items to retrieve (default: 25)
+
+	  voice-notes:
+		whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe]
+		  <contact/phone>  Contact name, group name, or phone number to list voice notes from
+		  --limit <N>      Number of voice notes to retrieve (default: 20)
+		  --transcribe, -t Transcribe any un-cached voice notes and show transcripts in table
+
+	  transcribe:
+		whatsapp transcribe <contact/phone> [--limit <N>]
+		  <contact/phone>  Contact name, group name, or phone number
+		  --limit <N>      Number of voice notes to transcribe (default: 10)
+
+	  play:
+		whatsapp play <contact/phone> [--index <N>]
+		  <contact/phone>  Contact name, group name, or phone number
+		  --index <N>      Voice note index (1 = latest, 2 = 2nd latest, etc. default: 1)
+
+	  search:
+		whatsapp search <query> [--contact <name>] [--days <N>] [--limit <N>]
+		  <query>          Search term in message text, attachment filenames, and voice note transcripts
+		  --contact <name> Scope search to a specific contact or group name
+		  --days <N>       Only search messages from the past N days
+		  --limit <N>      Limit results (default: 25)
+
+	  unread:
+		whatsapp unread
+		  Shows up to 50 chats with pending unread messages.
+
+	  draft:
+		whatsapp draft --to <contact/phone> --message <text>
+		  --to <target>    Recipient phone number (e.g. +1234567890) or contact name.
+		                   Contact names are automatically resolved from your local chat history.
+		  --message <text> Message text to populate in the WhatsApp compose box.
+		  Note: This brings WhatsApp to the foreground with the chat opened and message pre-filled,
+		        allowing you to review before pressing Return to send.
+
+	EXAMPLES:
+		whatsapp chats --limit 10
+		whatsapp unread
+		whatsapp read "Erik Rusis" --limit 15
+		whatsapp read "Famiglia" --all
+		whatsapp documents --ext pdf
+		whatsapp documents "+593 96 916 3788"
+		whatsapp documents --min-size 10
+		whatsapp attachments "Famiglia" --type image
+		whatsapp voice-notes "Aditi" --transcribe
+		whatsapp transcribe "Aditi" --limit 5
+		whatsapp play "Aditi" --index 1
+		whatsapp search "dinner" --days 14
+		whatsapp draft --to "Aram Piruzyan" --message "Hey, are we still on for lunch?"
+		whatsapp draft --to "+1234567890" --message "Hello from my terminal!"
+	"""
+	print(helpText)
+}
+
+// MARK: - Main Entrypoint
+
+func main() {
+	let args = Array(CommandLine.arguments.dropFirst())
+	guard !args.isEmpty else {
+		printUsage()
+		return
+	}
+
+	let command = args[0].lowercased()
+
+	switch command {
+	case "chats":
+		var limit = 20
+		var unreadOnly = false
+		var search: String? = nil
+
+		var i = 1
+		while i < args.count {
+			if args[i] == "--limit", i + 1 < args.count {
+				limit = Int(args[i + 1]) ?? 20
+				i += 2
+			} else if args[i] == "--unread" {
+				unreadOnly = true
+				i += 1
+			} else if args[i] == "--search", i + 1 < args.count {
+				search = args[i + 1]
+				i += 2
+			} else {
+				i += 1
+			}
+		}
+		listChats(limit: limit, unreadOnly: unreadOnly, search: search)
+
+	case "unread":
+		listChats(limit: 50, unreadOnly: true, search: nil)
+
+	case "read":
+		guard args.count >= 2 else {
+			fputs("Usage: whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe]\n", stderr)
+			return
+		}
+		let target = args[1]
+		var limit = 25
+		var full = false
+		var transcribe = false
+
+		var i = 2
+		while i < args.count {
+			if args[i] == "--limit", i + 1 < args.count {
+				limit = Int(args[i + 1]) ?? 25
+				i += 2
+			} else if args[i] == "--all" {
+				full = true
+				i += 1
+			} else if args[i] == "--transcribe" || args[i] == "-t" {
+				transcribe = true
+				i += 1
+			} else {
+				i += 1
+			}
+		}
+		readChat(target: target, limit: limit, full: full, transcribe: transcribe)
+
+	case "documents", "document", "docs", "files", "attachments", "attachment":
+		var target: String? = nil
+		var type: String? = (command == "attachments" || command == "attachment") ? "all" : "doc"
+		var minSize: Double? = nil
+		var ext: String? = nil
+		var search: String? = nil
+		var limit = 25
+
+		var i = 1
+		if i < args.count && !args[i].starts(with: "--") && !args[i].starts(with: "-") {
+			target = args[i]
+			i += 1
+		}
+
+		while i < args.count {
+			if args[i] == "--type", i + 1 < args.count {
+				type = args[i + 1]
+				i += 2
+			} else if args[i] == "--min-size", i + 1 < args.count {
+				minSize = Double(args[i + 1])
+				i += 2
+			} else if args[i] == "--ext", i + 1 < args.count {
+				ext = args[i + 1]
+				i += 2
+			} else if args[i] == "--search", i + 1 < args.count {
+				search = args[i + 1]
+				i += 2
+			} else if args[i] == "--limit", i + 1 < args.count {
+				limit = Int(args[i + 1]) ?? 25
+				i += 2
+			} else {
+				i += 1
+			}
+		}
+		listDocuments(target: target, type: type, minSizeMB: minSize, ext: ext, search: search, limit: limit)
+
+	case "voice-notes", "voicenotes", "vn":
+		guard args.count >= 2 else {
+			fputs("Usage: whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe]\n", stderr)
+			return
+		}
+		let target = args[1]
+		var limit = 20
+		var transcribe = false
+
+		var i = 2
+		while i < args.count {
+			if args[i] == "--limit", i + 1 < args.count {
+				limit = Int(args[i + 1]) ?? 20
+				i += 2
+			} else if args[i] == "--transcribe" || args[i] == "-t" {
+				transcribe = true
+				i += 1
+			} else {
+				i += 1
+			}
+		}
+		listVoiceNotes(target: target, limit: limit, transcribe: transcribe)
+
+	case "transcribe":
+		guard args.count >= 2 else {
+			fputs("Usage: whatsapp transcribe <contact/phone> [--limit <N>]\n", stderr)
+			return
+		}
+		let target = args[1]
+		var limit = 10
+
+		var i = 2
+		while i < args.count {
+			if args[i] == "--limit", i + 1 < args.count {
+				limit = Int(args[i + 1]) ?? 10
+				i += 2
+			} else {
+				i += 1
+			}
+		}
+		batchTranscribe(target: target, limit: limit)
+
+	case "play", "listen":
+		guard args.count >= 2 else {
+			fputs("Usage: whatsapp play <contact/phone> [--index <N>]\n", stderr)
+			return
+		}
+		let target = args[1]
+		var index = 1
+
+		var i = 2
+		while i < args.count {
+			if args[i] == "--index", i + 1 < args.count {
+				index = Int(args[i + 1]) ?? 1
+				i += 2
+			} else {
+				i += 1
+			}
+		}
+		playVoiceNote(target: target, index: index)
+
+	case "search":
+		guard args.count >= 2 else {
+			fputs("Usage: whatsapp search <query> [--contact <name>] [--days <N>] [--limit <N>]\n", stderr)
+			return
+		}
+		let query = args[1]
+		var contact: String? = nil
+		var days: Int? = nil
+		var limit = 25
+
+		var i = 2
+		while i < args.count {
+			if args[i] == "--contact", i + 1 < args.count {
+				contact = args[i + 1]
+				i += 2
+			} else if args[i] == "--days", i + 1 < args.count {
+				days = Int(args[i + 1])
+				i += 2
+			} else if args[i] == "--limit", i + 1 < args.count {
+				limit = Int(args[i + 1]) ?? 25
+				i += 2
+			} else {
+				i += 1
+			}
+		}
+		searchMessages(query: query, contact: contact, days: days, limit: limit)
+
+	case "draft", "send":
+		var to: String? = nil
+		var message: String? = nil
+
+		var i = 1
+		while i < args.count {
+			if args[i] == "--to", i + 1 < args.count {
+				to = args[i + 1]
+				i += 2
+			} else if args[i] == "--message", i + 1 < args.count {
+				message = args[i + 1]
+				i += 2
+			} else {
+				i += 1
+			}
+		}
+
+		guard let target = to, let msg = message else {
+			fputs("Usage: whatsapp draft --to <contact/phone> --message <text>\n", stderr)
+			return
+		}
+		draftMessage(target: target, message: msg)
+
+	case "help", "-h", "--help":
+		printUsage()
+
+	default:
+		fputs("Unknown command: \(command)\n\n", stderr)
+		printUsage()
+	}
+}
+
+main()

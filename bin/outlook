@@ -1,0 +1,557 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+# 	"msal",
+# 	"requests",
+# 	"python-dotenv",
+# ]
+# ///
+
+import os
+import sys
+import argparse
+import email.utils
+from pathlib import Path
+import requests
+import msal
+from dotenv import load_dotenv
+
+# Load .env from ~/.local/bin/.env first, then current working directory
+local_bin_env = Path.home() / ".local" / "bin" / ".env"
+if local_bin_env.exists():
+	load_dotenv(local_bin_env)
+load_dotenv()
+
+CLIENT_ID = os.getenv("MSGRAPH_CLIENT_ID", "c55069b9-a83a-4355-85fc-24925fbb072b")
+AUTHORITY = "https://login.microsoftonline.com/consumers"
+SCOPES = [
+	"Mail.ReadWrite",
+	"Mail.Send",
+	"User.Read",
+	"MailboxSettings.ReadWrite",
+]
+CACHE_DIR = Path.home() / ".local" / "share" / "outlook"
+CACHE_PATH = CACHE_DIR / "token_cache.bin"
+GRAPH_ENDPOINT = "https://graph.microsoft.com/v1.0"
+
+
+def get_token_cache() -> msal.SerializableTokenCache:
+	cache = msal.SerializableTokenCache()
+	if CACHE_PATH.exists():
+		try:
+			cache.deserialize(CACHE_PATH.read_text())
+		except Exception as e:
+			sys.stderr.write(f"Warning: Could not read token cache: {e}\n")
+	return cache
+
+
+def save_token_cache(cache: msal.SerializableTokenCache):
+	if cache.has_state_changed:
+		CACHE_DIR.mkdir(parents=True, exist_ok=True)
+		os.chmod(CACHE_DIR, 0o700)
+		CACHE_PATH.write_text(cache.serialize())
+		os.chmod(CACHE_PATH, 0o600)
+
+
+def get_access_token(interactive: bool = True) -> str:
+	cache = get_token_cache()
+	app = msal.PublicClientApplication(
+		CLIENT_ID,
+		authority=AUTHORITY,
+		token_cache=cache,
+	)
+
+	accounts = app.get_accounts()
+	if accounts:
+		result = app.acquire_token_silent(SCOPES, account=accounts[0])
+		if result and "access_token" in result:
+			save_token_cache(cache)
+			return result["access_token"]
+
+	if not interactive:
+		sys.exit("Error: Not authenticated. Run 'outlook auth' to sign in.")
+
+	# Device code flow
+	flow = app.initiate_device_flow(scopes=SCOPES)
+	if "user_code" not in flow:
+		sys.exit(f"Error initiating device code login: {flow.get('error_description') or flow}")
+
+	print("\n" + "=" * 60)
+	print(flow["message"])
+	print("=" * 60 + "\n", flush=True)
+
+	result = app.acquire_token_by_device_flow(flow)
+	if "access_token" in result:
+		save_token_cache(cache)
+		print("Authentication successful!\n")
+		return result["access_token"]
+
+	error_desc = result.get("error_description", result.get("error", "Unknown error"))
+	sys.exit(f"Authentication failed: {error_desc}")
+
+
+def get_headers(token: str) -> dict:
+	return {
+		"Authorization": f"Bearer {token}",
+		"Accept": "application/json",
+		"Prefer": 'outlook.body-content-type="text"',
+	}
+
+
+def format_address(addr_obj: dict) -> str:
+	if not addr_obj or "emailAddress" not in addr_obj:
+		return "Unknown"
+	info = addr_obj["emailAddress"]
+	name = info.get("name", "")
+	address = info.get("address", "")
+	if name and name != address:
+		return f"{name} <{address}>"
+	return address
+
+
+def parse_recipients(recipient_inputs: list | None) -> list[dict]:
+	if not recipient_inputs:
+		return []
+	results = []
+	for item in recipient_inputs:
+		if isinstance(item, list):
+			subitems = item
+		else:
+			subitems = [item]
+		for subitem in subitems:
+			for part in subitem.split(","):
+				part = part.strip()
+				if not part:
+					continue
+				name, addr = email.utils.parseaddr(part)
+				clean_addr = addr if addr else part
+				if name:
+					results.append({"emailAddress": {"name": name, "address": clean_addr}})
+				else:
+					results.append({"emailAddress": {"address": clean_addr}})
+	return results
+
+
+def cmd_auth(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+	resp = requests.get(f"{GRAPH_ENDPOINT}/me", headers=headers)
+	if resp.status_code == 200:
+		user = resp.json()
+		print(f"Logged in as: {user.get('displayName')} ({user.get('userPrincipalName') or user.get('mail')})")
+	else:
+		print("Authenticated successfully.")
+
+
+def cmd_list(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+
+	params = {
+		"$top": str(args.limit),
+		"$select": "id,subject,receivedDateTime,from,isRead,hasAttachments",
+		"$orderby": "receivedDateTime desc",
+	}
+
+	if getattr(args, "unread_only", False):
+		params["$filter"] = "isRead eq false"
+
+	resp = requests.get(f"{GRAPH_ENDPOINT}/me/mailFolders/inbox/messages", headers=headers, params=params)
+	if resp.status_code != 200:
+		sys.exit(f"Error fetching messages: {resp.status_code} {resp.text}")
+
+	data = resp.json()
+	messages = data.get("value", [])
+	if not messages:
+		print("No messages found in inbox.")
+		return
+
+	print(f"{'#':<3} {'STATUS':<7} {'DATE':<19} {'FROM':<30} {'SUBJECT'}")
+	print("-" * 90)
+	for idx, msg in enumerate(messages, 1):
+		status = "READ" if msg.get("isRead") else "UNREAD"
+		date_str = msg.get("receivedDateTime", "")[:19].replace("T", " ")
+		from_str = format_address(msg.get("from"))
+		if len(from_str) > 28:
+			from_str = from_str[:25] + "..."
+		subject = msg.get("subject") or "(No Subject)"
+		if len(subject) > 40:
+			subject = subject[:37] + "..."
+		msg_id = msg.get("id")
+		print(f"{idx:<3} {status:<7} {date_str:<19} {from_str:<30} {subject}")
+		if args.verbose:
+			print(f"    ID: {msg_id}")
+
+
+def cmd_search(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+
+	params = {
+		"$top": str(args.limit),
+		"$select": "id,subject,receivedDateTime,from,isRead,hasAttachments",
+		"$search": f'"{args.query}"',
+	}
+
+	resp = requests.get(f"{GRAPH_ENDPOINT}/me/messages", headers=headers, params=params)
+	if resp.status_code != 200:
+		sys.exit(f"Error searching messages: {resp.status_code} {resp.text}")
+
+	data = resp.json()
+	messages = data.get("value", [])
+	if not messages:
+		print(f"No messages matching '{args.query}'.")
+		return
+
+	print(f"{'#':<3} {'STATUS':<7} {'DATE':<19} {'FROM':<30} {'SUBJECT'}")
+	print("-" * 90)
+	for idx, msg in enumerate(messages, 1):
+		status = "READ" if msg.get("isRead") else "UNREAD"
+		date_str = msg.get("receivedDateTime", "")[:19].replace("T", " ")
+		from_str = format_address(msg.get("from"))
+		if len(from_str) > 28:
+			from_str = from_str[:25] + "..."
+		subject = msg.get("subject") or "(No Subject)"
+		if len(subject) > 40:
+			subject = subject[:37] + "..."
+		msg_id = msg.get("id")
+		print(f"{idx:<3} {status:<7} {date_str:<19} {from_str:<30} {subject}")
+		if args.verbose:
+			print(f"    ID: {msg_id}")
+
+
+def cmd_read(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+
+	msg_id = args.message_id
+	resp = requests.get(f"{GRAPH_ENDPOINT}/me/messages/{msg_id}", headers=headers)
+	if resp.status_code != 200:
+		sys.exit(f"Error fetching message: {resp.status_code} {resp.text}")
+
+	msg = resp.json()
+	print("-" * 60)
+	print(f"Subject: {msg.get('subject') or '(No Subject)'}")
+	print(f"From:    {format_address(msg.get('from'))}")
+	to_addrs = ", ".join(format_address(r) for r in msg.get("toRecipients", []))
+	print(f"To:      {to_addrs}")
+	date_str = msg.get("receivedDateTime", "")[:19].replace("T", " ")
+	print(f"Date:    {date_str}")
+	print("-" * 60)
+
+	body = msg.get("body", {}).get("content", "").strip()
+	if not body:
+		body = msg.get("bodyPreview", "(Empty message)")
+	print(body)
+	print("-" * 60)
+
+
+def cmd_draft(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+	headers["Content-Type"] = "application/json"
+
+	body = ""
+	if args.file:
+		if args.file == "-":
+			body = sys.stdin.read()
+		else:
+			file_path = Path(args.file)
+			if not file_path.exists():
+				sys.exit(f"Error: File not found: {args.file}")
+			body = file_path.read_text()
+	elif args.body is not None:
+		body = args.body
+	elif not sys.stdin.isatty():
+		body = sys.stdin.read()
+
+	payload = {
+		"subject": args.subject or "",
+		"importance": args.importance,
+		"body": {
+			"contentType": "HTML" if args.html else "Text",
+			"content": body,
+		},
+	}
+
+	to_recipients = parse_recipients(args.to)
+	if to_recipients:
+		payload["toRecipients"] = to_recipients
+
+	cc_recipients = parse_recipients(args.cc)
+	if cc_recipients:
+		payload["ccRecipients"] = cc_recipients
+
+	bcc_recipients = parse_recipients(args.bcc)
+	if bcc_recipients:
+		payload["bccRecipients"] = bcc_recipients
+
+	resp = requests.post(f"{GRAPH_ENDPOINT}/me/messages", headers=headers, json=payload)
+	if resp.status_code not in (200, 201):
+		sys.exit(f"Error creating draft: {resp.status_code} {resp.text}")
+
+	draft = resp.json()
+	print("Draft created successfully!")
+	print(f"ID:      {draft.get('id')}")
+	print(f"Subject: {draft.get('subject') or '(No Subject)'}")
+	if draft.get("toRecipients"):
+		to_display = ", ".join(format_address(r) for r in draft.get("toRecipients", []))
+		print(f"To:      {to_display}")
+	if draft.get("ccRecipients"):
+		cc_display = ", ".join(format_address(r) for r in draft.get("ccRecipients", []))
+		print(f"CC:      {cc_display}")
+	if draft.get("bccRecipients"):
+		bcc_display = ", ".join(format_address(r) for r in draft.get("bccRecipients", []))
+		print(f"BCC:     {bcc_display}")
+	if getattr(args, "send", False):
+		msg_id = draft.get("id")
+		send_resp = requests.post(f"{GRAPH_ENDPOINT}/me/messages/{msg_id}/send", headers=headers)
+		if send_resp.status_code not in (200, 202):
+			sys.exit(f"Error sending email: {send_resp.status_code} {send_resp.text}")
+		print("Email sent successfully!")
+
+
+WELL_KNOWN_FOLDERS = {
+	"inbox": "inbox",
+	"archive": "archive",
+	"drafts": "drafts",
+	"deleteditems": "deleteditems",
+	"deleted items": "deleteditems",
+	"junk": "junkemail",
+	"junkemail": "junkemail",
+	"junk email": "junkemail",
+	"sent": "sentitems",
+	"sentitems": "sentitems",
+	"sent items": "sentitems",
+	"outbox": "outbox",
+}
+
+
+def fetch_all_folders(headers: dict, parent_id: str | None = None) -> list[dict]:
+	url = f"{GRAPH_ENDPOINT}/me/mailFolders" if parent_id is None else f"{GRAPH_ENDPOINT}/me/mailFolders/{parent_id}/childFolders"
+	folders = []
+	next_link = f"{url}?$top=100"
+	while next_link:
+		resp = requests.get(next_link, headers=headers)
+		if resp.status_code != 200:
+			break
+		data = resp.json()
+		folders.extend(data.get("value", []))
+		next_link = data.get("@odata.nextLink")
+	return folders
+
+
+def resolve_folder_id(headers: dict, identifier: str) -> str:
+	lowered = identifier.lower().strip()
+	if lowered in WELL_KNOWN_FOLDERS:
+		return WELL_KNOWN_FOLDERS[lowered]
+
+	def search(parent_id: str | None = None) -> str | None:
+		for f in fetch_all_folders(headers, parent_id):
+			if f.get("id") == identifier or f.get("displayName", "").lower() == lowered:
+				return f.get("id")
+			if f.get("childFolderCount", 0) > 0:
+				found = search(f.get("id"))
+				if found:
+					return found
+		return None
+
+	match = search()
+	return match if match else identifier
+
+
+def cmd_folders(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+
+	if getattr(args, "create", None):
+		folder_name = args.create
+		resp = requests.post(f"{GRAPH_ENDPOINT}/me/mailFolders", headers=headers, json={"displayName": folder_name})
+		if resp.status_code in (200, 201):
+			data = resp.json()
+			print(f"Created folder '{folder_name}' (ID: {data.get('id')})")
+		else:
+			sys.exit(f"Error creating folder: {resp.status_code} {resp.text}")
+		return
+
+	if getattr(args, "delete", None):
+		target = args.delete
+		folder_id = resolve_folder_id(headers, target)
+		resp = requests.delete(f"{GRAPH_ENDPOINT}/me/mailFolders/{folder_id}", headers=headers)
+		if resp.status_code in (200, 204):
+			print(f"Deleted folder '{target}'.")
+		else:
+			sys.exit(f"Error deleting folder: {resp.status_code} {resp.text}")
+		return
+
+	def print_tree(parent_id: str | None = None, depth: int = 0):
+		folders = fetch_all_folders(headers, parent_id)
+		for f in folders:
+			indent = "  " * depth
+			name = f.get("displayName", "Unnamed")
+			total = f.get("totalItemCount", 0)
+			unread = f.get("unreadItemCount", 0)
+			fid = f.get("id", "")
+			unread_info = f", Unread: {unread}" if unread > 0 else ""
+			print(f"{indent}- {name} ({total} items{unread_info})")
+			if getattr(args, "verbose", False):
+				print(f"{indent}    ID: {fid}")
+			if f.get("childFolderCount", 0) > 0:
+				print_tree(fid, depth + 1)
+
+	print_tree()
+
+
+def cmd_move(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+	headers["Content-Type"] = "application/json"
+
+	dest_id = resolve_folder_id(headers, args.destination)
+	payload = {"destinationId": dest_id}
+
+	resp = requests.post(f"{GRAPH_ENDPOINT}/me/messages/{args.message_id}/move", headers=headers, json=payload)
+	if resp.status_code in (200, 201):
+		moved = resp.json()
+		print(f"Successfully moved message to '{args.destination}'.")
+		if getattr(args, "verbose", False):
+			print(f"New Message ID: {moved.get('id')}")
+	else:
+		sys.exit(f"Error moving message: {resp.status_code} {resp.text}")
+
+
+def cmd_rules(args):
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+
+	if getattr(args, "delete", None):
+		rule_id = args.delete
+		resp = requests.delete(f"{GRAPH_ENDPOINT}/me/mailFolders/inbox/messageRules/{rule_id}", headers=headers)
+		if resp.status_code in (200, 204):
+			print(f"Deleted rule '{rule_id}'.")
+		else:
+			sys.exit(f"Error deleting rule: {resp.status_code} {resp.text}")
+		return
+
+	resp = requests.get(f"{GRAPH_ENDPOINT}/me/mailFolders/inbox/messageRules", headers=headers)
+	if resp.status_code == 403:
+		sys.exit("Error 403: Access denied. 'MailboxSettings.ReadWrite' scope is required. Run 'outlook auth' to sign in and grant permission.")
+	if resp.status_code != 200:
+		sys.exit(f"Error fetching rules: {resp.status_code} {resp.text}")
+
+	rules = resp.json().get("value", [])
+	if not rules:
+		print("No inbox rules found.")
+		return
+
+	print(f"{'#':<3} {'STATUS':<9} {'NAME'}")
+	print("-" * 60)
+	for idx, r in enumerate(rules, 1):
+		status = "ENABLED" if r.get("isEnabled") else "DISABLED"
+		name = r.get("displayName") or "(Unnamed Rule)"
+		rid = r.get("id")
+		print(f"{idx:<3} {status:<9} {name}")
+		if getattr(args, "verbose", False):
+			print(f"    ID: {rid}")
+			conditions = r.get("conditions", {})
+			actions = r.get("actions", {})
+			if conditions:
+				print(f"    Conditions: {conditions}")
+			if actions:
+				print(f"    Actions: {actions}")
+
+
+def main():
+	parser = argparse.ArgumentParser(
+		prog="outlook",
+		description="CLI to read, search, draft, organize emails, folders, and rules via Microsoft Graph API",
+	)
+	subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+
+	# auth
+	p_auth = subparsers.add_parser("auth", help="Authenticate with Microsoft Graph")
+	p_auth.set_defaults(func=cmd_auth)
+
+	# list / inbox
+	p_list = subparsers.add_parser("list", help="List recent emails in inbox")
+	p_list.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
+	p_list.add_argument("-v", "--verbose", action="store_true", help="Show full message IDs")
+	p_list.set_defaults(func=cmd_list)
+
+	# unread
+	p_unread = subparsers.add_parser("unread", help="List unread emails in inbox")
+	p_unread.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
+	p_unread.add_argument("-v", "--verbose", action="store_true", help="Show full message IDs")
+	p_unread.set_defaults(func=lambda args: (setattr(args, "unread_only", True), cmd_list(args)))
+
+	# search
+	p_search = subparsers.add_parser("search", help="Search emails")
+	p_search.add_argument("query", help="Search string")
+	p_search.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
+	p_search.add_argument("-v", "--verbose", action="store_true", help="Show full message IDs")
+	p_search.set_defaults(func=cmd_search)
+
+	# read
+	p_read = subparsers.add_parser("read", help="Read a specific email by ID")
+	p_read.add_argument("message_id", help="Message ID")
+	p_read.set_defaults(func=cmd_read)
+
+	# draft
+	p_draft = subparsers.add_parser("draft", help="Create a draft email")
+	p_draft.add_argument("-t", "--to", nargs="+", action="extend", help="Recipient email address(es)")
+	p_draft.add_argument("-c", "--cc", nargs="+", action="extend", help="CC recipient email address(es)")
+	p_draft.add_argument("-b", "--bcc", nargs="+", action="extend", help="BCC recipient email address(es)")
+	p_draft.add_argument("-s", "--subject", default="", help="Draft subject line")
+	p_draft.add_argument("--body", help="Email body text")
+	p_draft.add_argument("-f", "--file", help="Path to file containing email body (use '-' for stdin)")
+	p_draft.add_argument("--html", action="store_true", help="Treat body as HTML (default: plain text)")
+	p_draft.add_argument("--importance", choices=["low", "normal", "high"], default="normal", help="Email importance level (default: normal)")
+	p_draft.add_argument("--send", action="store_true", help="Send the email immediately after creating the draft")
+	p_draft.set_defaults(func=cmd_draft)
+
+	# send
+	p_send = subparsers.add_parser("send", help="Send an email")
+	p_send.add_argument("-t", "--to", nargs="+", action="extend", required=True, help="Recipient email address(es)")
+	p_send.add_argument("-c", "--cc", nargs="+", action="extend", help="CC recipient email address(es)")
+	p_send.add_argument("-b", "--bcc", nargs="+", action="extend", help="BCC recipient email address(es)")
+	p_send.add_argument("-s", "--subject", default="", help="Email subject line")
+	p_send.add_argument("--body", help="Email body text")
+	p_send.add_argument("-f", "--file", help="Path to file containing email body (use '-' for stdin)")
+	p_send.add_argument("--html", action="store_true", help="Treat body as HTML (default: plain text)")
+	p_send.add_argument("--importance", choices=["low", "normal", "high"], default="normal", help="Email importance level (default: normal)")
+	p_send.set_defaults(func=cmd_draft, send=True)
+
+	# folders
+	p_folders = subparsers.add_parser("folders", help="List or manage mail folders")
+	p_folders.add_argument("-v", "--verbose", action="store_true", help="Show full folder IDs")
+	p_folders.add_argument("--create", metavar="NAME", help="Create a new folder")
+	p_folders.add_argument("--delete", metavar="ID_OR_NAME", help="Delete a folder by ID or name")
+	p_folders.set_defaults(func=cmd_folders)
+
+	# move
+	p_move = subparsers.add_parser("move", help="Move an email to another folder")
+	p_move.add_argument("message_id", help="Message ID to move")
+	p_move.add_argument("destination", help="Destination folder name (e.g. inbox, archive, or custom folder)")
+	p_move.add_argument("-v", "--verbose", action="store_true", help="Show new message ID")
+	p_move.set_defaults(func=cmd_move)
+
+	# rules
+	p_rules = subparsers.add_parser("rules", help="List or delete inbox rules")
+	p_rules.add_argument("-v", "--verbose", action="store_true", help="Show rule IDs, conditions, and actions")
+	p_rules.add_argument("--delete", metavar="RULE_ID", help="Delete a rule by ID")
+	p_rules.set_defaults(func=cmd_rules)
+
+	args = parser.parse_args()
+	if not args.command:
+		# Default action if no subcommand is passed: list inbox
+		args.limit = 10
+		args.verbose = False
+		args.unread_only = False
+		cmd_list(args)
+	else:
+		args.func(args)
+
+
+if __name__ == "__main__":
+	main()
