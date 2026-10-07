@@ -88,6 +88,87 @@ func extractEventName(from text: String?) -> String? {
 	return nil
 }
 
+func parseReceiptTimestamp(data: Data) -> Date? {
+	var idx = 0
+	let count = data.count
+	while idx < count {
+		let tagByte = data[idx]
+		idx += 1
+		let wire = tagByte & 0x07
+		let fieldNum = tagByte >> 3
+		if wire == 0 {
+			var val: UInt64 = 0
+			var shift: UInt64 = 0
+			while idx < count {
+				let b = data[idx]
+				idx += 1
+				val |= UInt64(b & 0x7F) << shift
+				shift += 7
+				if (b & 0x80) == 0 { break }
+			}
+			if fieldNum == 3 && val > 1500000000 && val < 2500000000 {
+				return Date(timeIntervalSince1970: Double(val))
+			}
+		} else if wire == 2 {
+			var length = 0
+			var shift = 0
+			while idx < count {
+				let b = data[idx]
+				idx += 1
+				length |= Int(b & 0x7F) << shift
+				shift += 7
+				if (b & 0x80) == 0 { break }
+			}
+			if length < 0 || idx + length > count { break }
+			idx += length
+		} else if wire == 1 {
+			idx += 8
+		} else if wire == 5 {
+			idx += 4
+		} else {
+			break
+		}
+	}
+	return nil
+}
+
+func formatMessageStatus(status: Int, isFromMe: Bool, msgType: Int, receiptData: Data?, msgDate: Date?) -> String? {
+	guard isFromMe else { return nil }
+	var receiptTime: String? = nil
+	if let data = receiptData, let rDate = parseReceiptTimestamp(data: data) {
+		let cal = Calendar.current
+		let formatter = DateFormatter()
+		if let mDate = msgDate, cal.isDate(rDate, inSameDayAs: mDate) {
+			formatter.dateFormat = "HH:mm"
+		} else {
+			formatter.dateFormat = "MM-dd HH:mm"
+		}
+		receiptTime = formatter.string(from: rDate)
+	}
+
+	switch status {
+	case 0:
+		return "⏳ Sending"
+	case 1:
+		return "✓ Sent"
+	case 5, 6:
+		if let t = receiptTime {
+			return "✓✓ Delivered \(t)"
+		}
+		return "✓✓ Delivered"
+	case 8:
+		let action = (msgType == 3) ? "Played" : "Read"
+		if let t = receiptTime {
+			return "✓✓ \(action) \(t)"
+		}
+		return "✓✓ \(action)"
+	case 12, 13:
+		return "⚠️ Failed"
+	default:
+		return nil
+	}
+}
+
 // MARK: - Transcript Cache
 
 let cacheDir = (("~/.local/share/whatsapp" as NSString).expandingTildeInPath)
@@ -752,12 +833,15 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 	       m.ZSTANZAID, m.Z_PK, mi.ZMETADATA,
 	       mi.ZVCARDNAME, mi.ZVCARDSTRING, mi.ZLATITUDE, mi.ZLONGITUDE,
 	       m.ZGROUPEVENTTYPE,
-	       gm.ZMEMBERJID
+	       gm.ZMEMBERJID,
+	       m.ZMESSAGESTATUS,
+	       minfo.ZRECEIPTINFO
 	FROM ZWAMESSAGE m
 	LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
 	LEFT JOIN ZWAPROFILEPUSHNAME ppn ON gm.ZMEMBERJID = ppn.ZJID
 	LEFT JOIN ZWACHATSESSION cs_member ON gm.ZMEMBERJID = cs_member.ZCONTACTJID
 	LEFT JOIN ZWAMEDIAITEM mi ON m.ZMEDIAITEM = mi.Z_PK
+	LEFT JOIN ZWAMESSAGEINFO minfo ON m.Z_PK = minfo.ZMESSAGE
 	WHERE m.ZCHATSESSION = ?
 	ORDER BY m.ZMESSAGEDATE DESC
 	LIMIT ?;
@@ -775,6 +859,7 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 	struct MsgRow {
 		let date: String
 		let sender: String
+		let statusTag: String?
 		let replySnippet: String?
 		let text: String
 	}
@@ -800,6 +885,14 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 		let lon = sqlite3_column_double(msgStmt, 14)
 		let groupEventType = sqlite3_column_int(msgStmt, 15)
 		let memberJid = sqlite3_column_text(msgStmt, 16).flatMap { String(cString: $0) }
+		let msgStatus = Int(sqlite3_column_int(msgStmt, 17))
+		var receiptData: Data? = nil
+		if let blob = sqlite3_column_blob(msgStmt, 18) {
+			let bytes = sqlite3_column_bytes(msgStmt, 18)
+			if bytes > 0 {
+				receiptData = Data(bytes: blob, count: Int(bytes))
+			}
+		}
 
 		// Filter out reactions, album containers, and internal protocol handshakes
 		if msgType == 59 || msgType == 66 {
@@ -1016,17 +1109,26 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 			}
 		}
 
-		rows.append(MsgRow(date: dateStr, sender: sender, replySnippet: replySnippet, text: body))
+		let statusTag = formatMessageStatus(
+			status: msgStatus,
+			isFromMe: isFromMe,
+			msgType: Int(msgType),
+			receiptData: receiptData,
+			msgDate: Date(timeIntervalSinceReferenceDate: dateSec)
+		)
+
+		rows.append(MsgRow(date: dateStr, sender: sender, statusTag: statusTag, replySnippet: replySnippet, text: body))
 	}
 	sqlite3_finalize(msgStmt)
 
 	for row in rows.reversed() {
 		let lines = row.text.components(separatedBy: "\n")
+		let statusStr = row.statusTag != nil ? " (\(row.statusTag!))" : ""
 		let replyTag = row.replySnippet != nil ? " [\(row.replySnippet!)]" : ""
 		if full || lines.count == 1 {
-			print("[\(row.date)] \(row.sender)\(replyTag): \(row.text)")
+			print("[\(row.date)] \(row.sender)\(statusStr)\(replyTag): \(row.text)")
 		} else {
-			print("[\(row.date)] \(row.sender)\(replyTag): \(lines[0])")
+			print("[\(row.date)] \(row.sender)\(statusStr)\(replyTag): \(lines[0])")
 			for line in lines.dropFirst() {
 				print("    \(line)")
 			}
@@ -1777,6 +1879,10 @@ func main() {
 	}
 
 	let command = args[0].lowercased()
+	if args.contains("--help") || args.contains("-h") || command == "help" {
+		printUsage()
+		return
+	}
 
 	switch command {
 	case "chats":
