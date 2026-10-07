@@ -148,22 +148,22 @@ func formatMessageStatus(status: Int, isFromMe: Bool, msgType: Int, receiptData:
 
 	switch status {
 	case 0:
-		return "⏳ Sending"
+		return "Sending"
 	case 1:
-		return "✓ Sent"
+		return "Sent"
 	case 5, 6:
 		if let t = receiptTime {
-			return "✓✓ Delivered \(t)"
+			return "Delivered \(t)"
 		}
-		return "✓✓ Delivered"
+		return "Delivered"
 	case 8:
 		let action = (msgType == 3) ? "Played" : "Read"
 		if let t = receiptTime {
-			return "✓✓ \(action) \(t)"
+			return "\(action) \(t)"
 		}
-		return "✓✓ \(action)"
+		return action
 	case 12, 13:
-		return "⚠️ Failed"
+		return "Failed"
 	default:
 		return nil
 	}
@@ -865,6 +865,7 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 	}
 
 	var rows: [MsgRow] = []
+	var isTrailing = true
 
 	while sqlite3_step(msgStmt) == SQLITE_ROW {
 		let dateSec = sqlite3_column_double(msgStmt, 0)
@@ -905,6 +906,10 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 			if (rawText == nil || rawText!.isEmpty) && mediaPath == nil {
 				continue
 			}
+		}
+
+		if !isFromMe && msgType != 6 && msgType != 10 {
+			isTrailing = false
 		}
 
 		let sender: String
@@ -1109,13 +1114,18 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 			}
 		}
 
-		let statusTag = formatMessageStatus(
-			status: msgStatus,
-			isFromMe: isFromMe,
-			msgType: Int(msgType),
-			receiptData: receiptData,
-			msgDate: Date(timeIntervalSinceReferenceDate: dateSec)
-		)
+		let statusTag: String?
+		if isFromMe && isTrailing {
+			statusTag = formatMessageStatus(
+				status: msgStatus,
+				isFromMe: isFromMe,
+				msgType: Int(msgType),
+				receiptData: receiptData,
+				msgDate: Date(timeIntervalSinceReferenceDate: dateSec)
+			)
+		} else {
+			statusTag = nil
+		}
 
 		rows.append(MsgRow(date: dateStr, sender: sender, statusTag: statusTag, replySnippet: replySnippet, text: body))
 	}
@@ -1123,7 +1133,7 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 
 	for row in rows.reversed() {
 		let lines = row.text.components(separatedBy: "\n")
-		let statusStr = row.statusTag != nil ? " (\(row.statusTag!))" : ""
+		let statusStr = row.statusTag != nil ? " [\(row.statusTag!)]" : ""
 		let replyTag = row.replySnippet != nil ? " [\(row.replySnippet!)]" : ""
 		if full || lines.count == 1 {
 			print("[\(row.date)] \(row.sender)\(statusStr)\(replyTag): \(row.text)")
