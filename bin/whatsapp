@@ -156,10 +156,58 @@ func saveCachedTranscript(messageId: String, mediaPath: String, chatPartner: Str
 	sqlite3_step(stmt)
 }
 
-func transcribeAudioFile(filePath: String, timeoutSeconds: Double = 15.0) -> String? {
+func resolveSpeechRecognizer(localeIdentifier: String?) -> SFSpeechRecognizer? {
+	let raw = localeIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+	if raw.isEmpty {
+		if let rec = SFSpeechRecognizer(locale: Locale(identifier: "en-US")), rec.isAvailable {
+			return rec
+		}
+		return SFSpeechRecognizer()
+	}
+	let lower = raw.lowercased()
+	var candidates: [String] = []
+	switch lower {
+	case "es", "spanish", "es-419":
+		candidates = ["es-419", "es-ES", "es-US", "es-MX", "es"]
+	case "en", "english", "en-us":
+		candidates = ["en-US", "en-GB", "en-CA", "en-AU", "en"]
+	case "fr", "french":
+		candidates = ["fr-FR", "fr-CA", "fr"]
+	case "de", "german":
+		candidates = ["de-DE", "de-AT", "de-CH", "de"]
+	case "it", "italian":
+		candidates = ["it-IT", "it"]
+	case "pt", "portuguese":
+		candidates = ["pt-BR", "pt-PT", "pt"]
+	case "ru", "russian":
+		candidates = ["ru-RU", "ru"]
+	case "zh", "chinese":
+		candidates = ["zh-CN", "zh-TW", "zh-HK"]
+	case "ja", "japanese":
+		candidates = ["ja-JP", "ja"]
+	case "ko", "korean":
+		candidates = ["ko-KR", "ko"]
+	case "ar", "arabic":
+		candidates = ["ar-SA", "ar"]
+	default:
+		candidates = [raw, raw.replacingOccurrences(of: "_", with: "-")]
+	}
+	for id in candidates {
+		if let rec = SFSpeechRecognizer(locale: Locale(identifier: id)), rec.isAvailable {
+			return rec
+		}
+	}
+	if let rec = SFSpeechRecognizer(locale: Locale(identifier: raw)), rec.isAvailable {
+		return rec
+	}
+	fputs("Warning: Speech recognizer not available for language '\(raw)'. Falling back to system default.\n", stderr)
+	return SFSpeechRecognizer()
+}
+
+func transcribeAudioFile(filePath: String, lang: String? = nil, durationSeconds: Int = 0, timeoutSeconds: Double? = nil) -> String? {
 	guard FileManager.default.fileExists(atPath: filePath) else { return nil }
 	let fileURL = URL(fileURLWithPath: filePath)
-	guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")), recognizer.isAvailable else {
+	guard let recognizer = resolveSpeechRecognizer(localeIdentifier: lang), recognizer.isAvailable else {
 		return nil
 	}
 
@@ -181,7 +229,8 @@ func transcribeAudioFile(filePath: String, timeoutSeconds: Double = 15.0) -> Str
 		}
 	}
 
-	let deadline = Date().addingTimeInterval(timeoutSeconds)
+	let actualTimeout = timeoutSeconds ?? max(20.0, Double(durationSeconds) * 1.5 + 5.0)
+	let deadline = Date().addingTimeInterval(actualTimeout)
 	while !isDone && Date() < deadline {
 		RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
 	}
@@ -481,7 +530,7 @@ func listChats(limit: Int, unreadOnly: Bool, search: String?) {
 			case 6: content = "[Group Event]"
 			case 8: content = "[Document]"
 			case 10: content = "[System Notice]"
-			case 11: content = "[View Once]"
+			case 11, 12: content = "[View Once]"
 			case 15: content = "[Sticker]"
 			case 19: content = "[Poll]"
 			case 59: content = "[Reaction]"
@@ -650,7 +699,7 @@ func parseContextInfo(data: Data) -> (stanzaId: String?, participant: String?, q
 
 // MARK: - Subcommand: Read
 
-func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false) {
+func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, retranscribe: Bool = false, lang: String? = nil) {
 	guard let db = getDB() else { return }
 	defer { sqlite3_close(db) }
 
@@ -798,11 +847,12 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false) 
 			body = caption != nil ? "\(vidTag) \(caption!)" : vidTag
 		case 3:
 			let dur = movieDur > 0 ? " (\(formatDuration(movieDur)))" : ""
-			if let cached = getCachedTranscript(messageId: messageId) {
-				body = "[Voice Note\(dur)] \"\(cached)\""
+			let cached = retranscribe ? nil : getCachedTranscript(messageId: messageId)
+			if let c = cached {
+				body = "[Voice Note\(dur)] \"\(c)\""
 			} else if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
-				if transcribe {
-					if let t = transcribeAudioFile(filePath: full) {
+				if transcribe || retranscribe {
+					if let t = transcribeAudioFile(filePath: full, lang: lang, durationSeconds: movieDur) {
 						saveCachedTranscript(messageId: messageId, mediaPath: p, chatPartner: partnerName, sender: sender, dateStr: dateStr, duration: movieDur, transcript: t)
 						body = "[Voice Note\(dur)] \"\(t)\""
 					} else {
@@ -867,7 +917,7 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false) 
 			} else {
 				body = "[System Notice]"
 			}
-		case 11:
+		case 11, 12:
 			body = caption != nil ? "[View Once Media] \(caption!)" : "[View Once Media]"
 		case 15:
 			if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
@@ -1202,7 +1252,7 @@ func draftMessage(target: String, message: String) {
 
 // MARK: - Subcommand: Voice Notes
 
-func listVoiceNotes(target: String, limit: Int, transcribe: Bool) {
+func listVoiceNotes(target: String, limit: Int, transcribe: Bool, retranscribe: Bool = false, lang: String? = nil) {
 	guard let db = getDB() else { return }
 	defer { sqlite3_close(db) }
 
@@ -1276,10 +1326,10 @@ func listVoiceNotes(target: String, limit: Int, transcribe: Bool) {
 		}
 		let fullPath = resolveMediaPath(mediaPath) ?? "(missing)"
 
-		var transcriptText = getCachedTranscript(messageId: messageId)
-		if transcriptText == nil && transcribe {
+		var transcriptText = retranscribe ? nil : getCachedTranscript(messageId: messageId)
+		if transcriptText == nil && (transcribe || retranscribe) {
 			if let fp = resolveMediaPath(mediaPath), FileManager.default.fileExists(atPath: fp) {
-				if let t = transcribeAudioFile(filePath: fp) {
+				if let t = transcribeAudioFile(filePath: fp, lang: lang, durationSeconds: duration) {
 					saveCachedTranscript(messageId: messageId, mediaPath: mediaPath ?? "", chatPartner: partner, sender: sender, dateStr: dateStr, duration: duration, transcript: t)
 					transcriptText = t
 				}
@@ -1304,7 +1354,7 @@ func listVoiceNotes(target: String, limit: Int, transcribe: Bool) {
 	}
 }
 
-func batchTranscribe(target: String, limit: Int) {
+func batchTranscribe(target: String, limit: Int, retranscribe: Bool = false, lang: String? = nil) {
 	guard let db = getDB() else { return }
 	defer { sqlite3_close(db) }
 
@@ -1352,7 +1402,7 @@ func batchTranscribe(target: String, limit: Int) {
 		let messageId = (stanzaId != nil && !stanzaId!.isEmpty) ? stanzaId! : "msg_\(msgPk)"
 		let sender = isFromMe ? "You" : partner
 
-		if let cached = getCachedTranscript(messageId: messageId) {
+		if !retranscribe, let cached = getCachedTranscript(messageId: messageId) {
 			print("[\(dateStr)] \(sender) (\(durStr)) [CACHED]: \"\(cached)\"")
 			continue
 		}
@@ -1364,7 +1414,7 @@ func batchTranscribe(target: String, limit: Int) {
 
 		print("[\(dateStr)] \(sender) (\(durStr)) transcribing...", terminator: "")
 		fflush(stdout)
-		if let transcript = transcribeAudioFile(filePath: fullPath) {
+		if let transcript = transcribeAudioFile(filePath: fullPath, lang: lang, durationSeconds: duration) {
 			saveCachedTranscript(messageId: messageId, mediaPath: p, chatPartner: partner, sender: sender, dateStr: dateStr, duration: duration, transcript: transcript)
 			print(" Done!")
 			print("    \"\(transcript)\"")
@@ -1641,11 +1691,13 @@ func printUsage() {
 		  --search <term>  Filter chats by contact name or group title
 
 	  read:
-		whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe]
+		whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]
 		  <contact/phone>  Contact name, group name, or phone number to read
 		  --limit <N>      Number of messages to retrieve (default: 25)
 		  --all            Display full multiline message content without truncating
 		  --transcribe, -t Transcribe any un-cached voice notes on-the-fly and display them
+		  --retranscribe   Force re-transcribing voice notes even if cached
+		  --lang, -l <code> Language code or name for speech recognition (e.g. es, en, fr; default: en-US)
 
 	  documents:
 		whatsapp documents [<contact/phone>] [--type <doc|image|video|audio|all>] [--min-size <MB>] [--ext <ext>] [--search <term>] [--limit <N>]
@@ -1658,15 +1710,19 @@ func printUsage() {
 		  --limit <N>      Number of items to retrieve (default: 25)
 
 	  voice-notes:
-		whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe]
+		whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe] [--retranscribe] [--lang <code>]
 		  <contact/phone>  Contact name, group name, or phone number to list voice notes from
 		  --limit <N>      Number of voice notes to retrieve (default: 20)
 		  --transcribe, -t Transcribe any un-cached voice notes and show transcripts in table
+		  --retranscribe   Force re-transcribing voice notes even if cached
+		  --lang, -l <code> Language code or name for speech recognition (e.g. es, en; default: en-US)
 
 	  transcribe:
-		whatsapp transcribe <contact/phone> [--limit <N>]
+		whatsapp transcribe <contact/phone> [--limit <N>] [--retranscribe] [--lang <code>]
 		  <contact/phone>  Contact name, group name, or phone number
 		  --limit <N>      Number of voice notes to transcribe (default: 10)
+		  --retranscribe   Force re-transcribing voice notes even if cached
+		  --lang, -l <code> Language code or name for speech recognition (e.g. es, en; default: en-US)
 
 	  play:
 		whatsapp play <contact/phone> [--index <N>]
@@ -1750,13 +1806,15 @@ func main() {
 
 	case "read":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe]\n", stderr)
+			fputs("Usage: whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]\n", stderr)
 			return
 		}
 		let target = args[1]
 		var limit = 25
 		var full = false
 		var transcribe = false
+		var retranscribe = false
+		var lang: String? = nil
 
 		var i = 2
 		while i < args.count {
@@ -1769,11 +1827,17 @@ func main() {
 			} else if args[i] == "--transcribe" || args[i] == "-t" {
 				transcribe = true
 				i += 1
+			} else if args[i] == "--retranscribe" || args[i] == "--force" {
+				retranscribe = true
+				i += 1
+			} else if (args[i] == "--lang" || args[i] == "-l" || args[i] == "--locale"), i + 1 < args.count {
+				lang = args[i + 1]
+				i += 2
 			} else {
 				i += 1
 			}
 		}
-		readChat(target: target, limit: limit, full: full, transcribe: transcribe)
+		readChat(target: target, limit: limit, full: full, transcribe: transcribe, retranscribe: retranscribe, lang: lang)
 
 	case "documents", "document", "docs", "files", "attachments", "attachment":
 		var target: String? = nil
@@ -1813,12 +1877,14 @@ func main() {
 
 	case "voice-notes", "voicenotes", "vn":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe]\n", stderr)
+			fputs("Usage: whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe] [--retranscribe] [--lang <code>]\n", stderr)
 			return
 		}
 		let target = args[1]
 		var limit = 20
 		var transcribe = false
+		var retranscribe = false
+		var lang: String? = nil
 
 		var i = 2
 		while i < args.count {
@@ -1828,30 +1894,44 @@ func main() {
 			} else if args[i] == "--transcribe" || args[i] == "-t" {
 				transcribe = true
 				i += 1
+			} else if args[i] == "--retranscribe" || args[i] == "--force" {
+				retranscribe = true
+				i += 1
+			} else if (args[i] == "--lang" || args[i] == "-l" || args[i] == "--locale"), i + 1 < args.count {
+				lang = args[i + 1]
+				i += 2
 			} else {
 				i += 1
 			}
 		}
-		listVoiceNotes(target: target, limit: limit, transcribe: transcribe)
+		listVoiceNotes(target: target, limit: limit, transcribe: transcribe, retranscribe: retranscribe, lang: lang)
 
 	case "transcribe":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp transcribe <contact/phone> [--limit <N>]\n", stderr)
+			fputs("Usage: whatsapp transcribe <contact/phone> [--limit <N>] [--retranscribe] [--lang <code>]\n", stderr)
 			return
 		}
 		let target = args[1]
 		var limit = 10
+		var retranscribe = false
+		var lang: String? = nil
 
 		var i = 2
 		while i < args.count {
 			if args[i] == "--limit", i + 1 < args.count {
 				limit = Int(args[i + 1]) ?? 10
 				i += 2
+			} else if args[i] == "--retranscribe" || args[i] == "--force" {
+				retranscribe = true
+				i += 1
+			} else if (args[i] == "--lang" || args[i] == "-l" || args[i] == "--locale"), i + 1 < args.count {
+				lang = args[i + 1]
+				i += 2
 			} else {
 				i += 1
 			}
 		}
-		batchTranscribe(target: target, limit: limit)
+		batchTranscribe(target: target, limit: limit, retranscribe: retranscribe, lang: lang)
 
 	case "play", "listen":
 		guard args.count >= 2 else {
