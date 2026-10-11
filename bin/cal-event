@@ -263,31 +263,30 @@ func handleAddReminder(config: Config, store: EKEventStore, allCalendars: [EKCal
 		targetCalendar = store.defaultCalendarForNewReminders() ?? allCalendars.first!
 	}
 
-	// Search target calendar for existing reminder (complete or incomplete)
+	// Deduplication / reactivation is strictly scoped to Grocery lists
+	let isGroceryList = targetCalendar.title.caseInsensitiveCompare("Grocery") == .orderedSame || targetCalendar.title.caseInsensitiveCompare("Groceries") == .orderedSame
 	let inputNorm = normalizeTitle(config.summary)
 	var matchedExisting: EKReminder? = nil
-	let sem = DispatchSemaphore(value: 0)
-	let predicate = store.predicateForReminders(in: [targetCalendar])
-	store.fetchReminders(matching: predicate) { foundList in
-		defer { sem.signal() }
-		guard let foundList = foundList else { return }
-		// Try exact normalized match first
-		if let exact = foundList.first(where: { normalizeTitle($0.title ?? "") == inputNorm }) {
-			matchedExisting = exact
-			return
-		}
-		// If input is a single word or prefix, check if one contains the other
-		if !inputNorm.isEmpty {
-			if let partial = foundList.first(where: {
-				let existingNorm = normalizeTitle($0.title ?? "")
-				return existingNorm == inputNorm ||
-					(inputNorm.count >= 4 && (existingNorm.contains(inputNorm) || inputNorm.contains(existingNorm)))
-			}) {
-				matchedExisting = partial
+
+	if isGroceryList && !inputNorm.isEmpty {
+		let sem = DispatchSemaphore(value: 0)
+		let predicate = store.predicateForReminders(in: [targetCalendar])
+		store.fetchReminders(matching: predicate) { foundList in
+			defer { sem.signal() }
+			guard let foundList = foundList else { return }
+			// 1. Prioritize active (incomplete) reminders first
+			if let activeMatch = foundList.first(where: { !$0.isCompleted && normalizeTitle($0.title ?? "") == inputNorm }) {
+				matchedExisting = activeMatch
+				return
+			}
+			// 2. Fall back to completed reminders to reactivate
+			if let completedMatch = foundList.first(where: { $0.isCompleted && normalizeTitle($0.title ?? "") == inputNorm }) {
+				matchedExisting = completedMatch
+				return
 			}
 		}
+		sem.wait()
 	}
-	sem.wait()
 
 	let reminder: EKReminder
 	var wasReactivated = false
