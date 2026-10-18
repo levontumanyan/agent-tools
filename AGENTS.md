@@ -6,3 +6,10 @@
 - **Apple Pay CLI**: Queries and searches local Apple Pay transactions on macOS; see `apple-pay --help` for options.
 - **iMessage CLI**: Queries and searches local iMessage chat history on macOS; see `imessage --help` for options.
 - **Browser Automation MCP**: Use the dedicated Patchright stealth Chromium instance via MCP (`brave-mcp` / `uv run --script`) for agent browsing; see `brave-mcp --help` for options. Never launch a second Brave binary alongside an active one on macOS because shared Mach port rendezvous (`com.brave.Browser.MachPortRendezvousServer`) freezes tab opening and IPC in the primary browser.
+
+# Development
+
+- **Swift tools (`src/*.swift`)**: Edit source in `src/` and run `make` to compile optimized binaries into `bin/`. Compiled binaries in `bin/` are gitignored.
+- **Script tools (`bin/*`)**: Standalone executables edited directly in `bin/`.
+- **Make targets**: `make` / `make build` (compiles `src/*.swift` -> `bin/%`), `make clean` (removes compiled binaries).
+

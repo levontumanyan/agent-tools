@@ -1863,17 +1863,17 @@ func printUsage() {
 	EXAMPLES:
 		whatsapp chats --limit 10
 		whatsapp unread
-		whatsapp read "Erik Rusis" --limit 15
-		whatsapp read "Famiglia" --all
+		whatsapp read "Jane Doe" --limit 15
+		whatsapp read "Family" --all
 		whatsapp documents --ext pdf
-		whatsapp documents "+593 96 916 3788"
+		whatsapp documents "+1234567890"
 		whatsapp documents --min-size 10
-		whatsapp attachments "Famiglia" --type image
-		whatsapp voice-notes "Aditi" --transcribe
-		whatsapp transcribe "Aditi" --limit 5
-		whatsapp play "Aditi" --index 1
+		whatsapp attachments "Family" --type image
+		whatsapp voice-notes "Jane Doe" --transcribe
+		whatsapp transcribe "Jane Doe" --limit 5
+		whatsapp play "Jane Doe" --index 1
 		whatsapp search "dinner" --days 14
-		whatsapp draft --to "Aram Piruzyan" --message "Hey, are we still on for lunch?"
+		whatsapp draft --to "Jane Doe" --message "Hey, are we still on for lunch?"
 		whatsapp draft --to "+1234567890" --message "Hello from my terminal!"
 	"""
 	print(helpText)

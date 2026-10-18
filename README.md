@@ -15,19 +15,21 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 
 | Tool | Type | Integration | What Your Agent Can Do |
 | :--- | :--- | :--- | :--- |
-| [`whatsapp`](bin/whatsapp) | CLI | Local SQLite + AppleScript UI | List recent/unread chats, full-text search messages, read threads, list/extract attachments & documents, and stage drafts. |
+| [`whatsapp`](src/whatsapp.swift) | CLI | Local SQLite + AppleScript UI | List recent/unread chats, full-text search messages, read threads, list/extract attachments & documents, and stage drafts. |
 | [`imessage`](bin/imessage) | CLI | macOS `~/Library/Messages/chat.db` | Search and read local iMessage / SMS conversation history and recent threads. |
-| [`cal-event`](bin/cal-event) | CLI | macOS `EventKit` | Create, query, and manage Apple Calendar events and Apple Reminders (`--reminder`) with native iCloud sync. |
+| [`cal-event`](src/cal-event.swift) | CLI | macOS `EventKit` | Create, query, and manage Apple Calendar events and Apple Reminders (`--reminder`) with native iCloud sync. |
 | [`outlook`](bin/outlook) | CLI | Microsoft Graph API | Read, search, draft, and send Outlook emails from the terminal. |
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
 | [`brave-mcp`](bin/brave-mcp) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in Brave or standalone stealth Chromium. |
+| [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, and auto-restore iTerm2 windows, tabs, custom titles, and active `agy` conversations across reboots. |
 
 # Quickstart
 
-Clone the repository and add `bin/` to your `$PATH`:
+Clone the repository, compile native tools, and add `bin/` to your `$PATH`:
 
 ```sh
 git clone https://github.com/levontumanyan/agent-tools.git ~/repos/agent-tools
+make -C ~/repos/agent-tools
 ```
 
 Add to `~/.zshrc` or `~/.bashrc`:
@@ -109,3 +111,11 @@ apple-pay --help
 # Agent Instructions (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
 
 Paste the rules from [`AGENTS.md`](AGENTS.md) into your global agent instructions so your AI assistant automatically knows how and when to invoke each tool.
+
+# Permissions
+
+Grant your terminal or IDE the following under **System Settings > Privacy & Security**:
+- **Full Disk Access**: `imessage`, `whatsapp`, `apple-pay`
+- **Calendars & Reminders**: `cal-event`
+- **Speech Recognition**: `whatsapp` (for local voice-note transcription)
+

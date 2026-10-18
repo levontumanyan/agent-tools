@@ -91,7 +91,7 @@ func printUsage() {
 	  cal-event search "LATAM" --details
 	  cal-event add "Doctor Appointment" --start "2026-09-15 14:00" --duration 60 --alarm 60,1440
 	  cal-event add "Take day off" --reminder --due "2026-10-14 08:00"
-	  cal-event add "Buy bus ticket" --reminder --due "2026-10-13 09:00" --notes "Via WhatsApp +593 99 744 7580"
+	  cal-event add "Buy bus ticket" --reminder --due "2026-10-13 09:00" --notes "Via WhatsApp +1234567890"
 	  cal-event add "Groceries" --reminder --calendar "Grocery"
 	  cal-event list-reminders
 	  cal-event list --reminder
@@ -172,6 +172,10 @@ func handleAdd(config: Config, store: EKEventStore, allCalendars: [EKCalendar]) 
 		matchedCal = allCalendars.first {
 			$0.title.caseInsensitiveCompare(calName) == .orderedSame
 		}
+	}
+
+	if matchedCal == nil && config.calendarName == nil {
+		matchedCal = store.defaultCalendarForNewEvents ?? allCalendars.first
 	}
 
 	guard let targetCalendar = matchedCal else {
