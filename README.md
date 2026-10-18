@@ -9,6 +9,7 @@ CLI utilities built for local automation and AI agents.
 - `outlook`: Read, search, draft, and send Outlook email via Microsoft Graph API.
 - `apple-pay`: Query and search Apple Pay transactions on macOS.
 - `imessage`: Query and search local iMessage chat history.
+- `brave-mcp`: FastMCP browser automation server over CDP or standalone stealth Chromium via Patchright.
 
 # Installation
 

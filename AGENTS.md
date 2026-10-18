@@ -5,3 +5,4 @@
 - **Outlook CLI**: Reads, searches, and drafts Outlook emails via Microsoft Graph API; see `outlook --help` for options.
 - **Apple Pay CLI**: Queries and searches local Apple Pay transactions on macOS; see `apple-pay --help` for options.
 - **iMessage CLI**: Queries and searches local iMessage chat history on macOS; see `imessage --help` for options.
+- **Browser Automation MCP**: Use the dedicated Patchright stealth Chromium instance via MCP (`brave-mcp` / `uv run --script`) for agent browsing; see `brave-mcp --help` for options. Never launch a second Brave binary alongside an active one on macOS because shared Mach port rendezvous (`com.brave.Browser.MachPortRendezvousServer`) freezes tab opening and IPC in the primary browser.

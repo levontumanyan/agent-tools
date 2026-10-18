@@ -1,0 +1,355 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = [
+# 	"mcp<2",
+# 	"patchright",
+# ]
+# ///
+"""FastMCP server providing browser automation tools over CDP / stealth Chromium using patchright."""
+
+import argparse
+import asyncio
+import datetime
+import os
+import signal
+import sys
+from typing import Optional
+from mcp.server.fastmcp import FastMCP
+from patchright.async_api import Browser, BrowserContext, Page, async_playwright
+
+mcp = FastMCP("brave-browser")
+
+CDP_PORT = int(os.environ.get("BRAVE_CDP_PORT", "9222"))
+CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
+PROFILE_DIR = os.path.expanduser("~/.agent-chromium-profile")
+IDLE_TIMEOUT_SECONDS = int(os.environ.get("BRAVE_MCP_IDLE_TIMEOUT", "300"))
+
+
+class BraveSessionManager:
+	"""Manages dedicated stealth Chromium browser or CDP connection for AI agents."""
+
+	def __init__(self, cdp_url: str):
+		self.cdp_url = cdp_url
+		self._playwright = None
+		self._browser: Optional[Browser] = None
+		self._context: Optional[BrowserContext] = None
+		self._active_tab_index: int = 0
+		self._idle_task: Optional[asyncio.Task] = None
+
+	def _touch_activity(self):
+		if self._idle_task is not None and not self._idle_task.done():
+			self._idle_task.cancel()
+		try:
+			loop = asyncio.get_running_loop()
+			self._idle_task = loop.create_task(self._idle_watchdog())
+		except RuntimeError:
+			pass
+
+	async def _idle_watchdog(self):
+		try:
+			await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
+			# Auto-stop the driver on idle if attached via CDP or if no persistent context is open
+			if self._browser is not None or self._context is None:
+				await self.close()
+		except asyncio.CancelledError:
+			pass
+
+	async def close(self):
+		"""Cleanly stop the patchright node driver and release browser handles."""
+		if (
+			self._idle_task is not None
+			and not self._idle_task.done()
+			and asyncio.current_task() is not self._idle_task
+		):
+			self._idle_task.cancel()
+		self._idle_task = None
+		self._context = None
+		self._browser = None
+		if self._playwright is not None:
+			try:
+				await self._playwright.stop()
+			except Exception:
+				pass
+			finally:
+				self.close_sync()
+
+	def close_sync(self):
+		"""Synchronously terminate the patchright node driver subprocess if still alive."""
+		if self._playwright is None:
+			return
+		try:
+			proc = getattr(self._playwright._impl_obj._connection._transport, "_proc", None)
+			if proc is not None and getattr(proc, "pid", None):
+				os.kill(proc.pid, signal.SIGTERM)
+		except Exception:
+			pass
+		self._playwright = None
+
+	async def get_context(self) -> BrowserContext:
+		self._touch_activity()
+		if self._playwright is None:
+			self._playwright = await async_playwright().start()
+
+		# Check if an existing context is still alive
+		if self._context is not None:
+			try:
+				_ = self._context.pages
+				return self._context
+			except Exception:
+				self._context = None
+
+		# 1. Try attaching to existing CDP session (e.g., if launched on port 9222)
+		try:
+			self._browser = await self._playwright.chromium.connect_over_cdp(
+				self.cdp_url,
+				timeout=1000,
+			)
+			if self._browser.contexts:
+				self._context = self._browser.contexts[0]
+				return self._context
+		except Exception:
+			self._browser = None
+
+		# 2. Launch dedicated standalone stealth Chromium (avoids macOS Mach port collisions)
+		os.makedirs(PROFILE_DIR, exist_ok=True)
+		self._context = await self._playwright.chromium.launch_persistent_context(
+			user_data_dir=PROFILE_DIR,
+			headless=False,
+			args=["--disable-blink-features=AutomationControlled"],
+		)
+		return self._context
+
+	async def get_pages(self) -> list[Page]:
+		context = await self.get_context()
+		return context.pages
+
+	async def get_active_page(self) -> Page:
+		pages = await self.get_pages()
+		if not pages:
+			context = await self.get_context()
+			page = await context.new_page()
+			self._active_tab_index = 0
+			return page
+
+		if self._active_tab_index >= len(pages):
+			self._active_tab_index = max(0, len(pages) - 1)
+
+		page = pages[self._active_tab_index]
+		return page
+
+	def set_active_tab(self, index: int):
+		self._active_tab_index = index
+
+
+session = BraveSessionManager(CDP_URL)
+
+
+@mcp.tool()
+async def brave_status() -> str:
+	"""Check connection status to Brave Browser and list all open tabs."""
+	try:
+		pages = await session.get_pages()
+		lines = [f"Connected to browser session at {CDP_URL}"]
+		lines.append(f"Total open tabs: {len(pages)}")
+		for idx, page in enumerate(pages):
+			active_marker = " (ACTIVE)" if idx == session._active_tab_index else ""
+			title = await page.title()
+			lines.append(f"\t[{idx}] {title} - {page.url}{active_marker}")
+		return "\n".join(lines)
+	except Exception as exc:
+		return f"Disconnected: {exc}"
+
+
+@mcp.tool()
+async def brave_navigate(url: str, new_tab: bool = False, timeout_ms: int = 30000) -> str:
+	"""Navigate the active Brave tab to a specific URL, or open in a new tab."""
+	try:
+		if new_tab:
+			context = await session.get_context()
+			page = await context.new_page()
+			pages = await session.get_pages()
+			session.set_active_tab(len(pages) - 1)
+		else:
+			page = await session.get_active_page()
+
+		# Ensure URL has protocol
+		if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("about:"):
+			url = "https://" + url
+
+		response = await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+		status = response.status if response else "loaded"
+		title = await page.title()
+		return f"Navigated to '{url}' [HTTP {status}] - Title: '{title}'"
+	except Exception as exc:
+		return f"Navigation error: {exc}"
+
+
+@mcp.tool()
+async def brave_get_content(selector: str = "body", max_length: int = 4000) -> str:
+	"""Extract visible text content from the active tab or a specific selector (default: 'body')."""
+	try:
+		page = await session.get_active_page()
+		element = page.locator(selector).first
+		if await element.count() == 0:
+			return f"Element '{selector}' not found on page {page.url}"
+
+		text = await element.inner_text()
+		text = text.strip()
+		if len(text) > max_length:
+			truncated = text[:max_length]
+			return f"[Showing first {max_length} characters of {len(text)}]:\n{truncated}\n... (truncated)"
+		return text if text else "(Page element contains no visible text)"
+	except Exception as exc:
+		return f"Error extracting content: {exc}"
+
+
+@mcp.tool()
+async def brave_click(selector: str, timeout_ms: int = 5000) -> str:
+	"""Click an element on the active page by CSS selector, text (e.g. text='Sign In'), or XPath."""
+	try:
+		page = await session.get_active_page()
+		locator = page.locator(selector).first
+		await locator.click(timeout=timeout_ms)
+		return f"Clicked element matching '{selector}' on {page.url}"
+	except Exception as exc:
+		return f"Error clicking element '{selector}': {exc}"
+
+
+@mcp.tool()
+async def brave_type(selector: str, text: str, clear_first: bool = True, press_enter: bool = False, timeout_ms: int = 5000) -> str:
+	"""Type text into an input field or textarea on the active page."""
+	try:
+		page = await session.get_active_page()
+		locator = page.locator(selector).first
+		if clear_first:
+			await locator.fill(text, timeout=timeout_ms)
+		else:
+			await locator.type(text, timeout=timeout_ms)
+
+		if press_enter:
+			await locator.press("Enter")
+			return f"Typed text into '{selector}' and pressed Enter"
+		return f"Typed text into '{selector}'"
+	except Exception as exc:
+		return f"Error typing into '{selector}': {exc}"
+
+
+@mcp.tool()
+async def brave_press_key(key: str) -> str:
+	"""Press a keyboard key on the active page (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown')."""
+	try:
+		page = await session.get_active_page()
+		await page.keyboard.press(key)
+		return f"Pressed key '{key}' on {page.url}"
+	except Exception as exc:
+		return f"Error pressing key '{key}': {exc}"
+
+
+@mcp.tool()
+async def brave_scroll(direction: str = "down", amount: int = 600) -> str:
+	"""Scroll the active page up or down (direction: 'up' or 'down', amount in pixels)."""
+	try:
+		page = await session.get_active_page()
+		delta = amount if direction.lower() == "down" else -amount
+		await page.mouse.wheel(0, delta)
+		return f"Scrolled {direction} by {amount}px"
+	except Exception as exc:
+		return f"Error scrolling: {exc}"
+
+
+@mcp.tool()
+async def brave_screenshot(save_path: str = "") -> str:
+	"""Capture a screenshot of the active page view and return the file path for inspection."""
+	try:
+		page = await session.get_active_page()
+		if not save_path:
+			timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+			save_path = f"/tmp/brave_screenshot_{timestamp}.png"
+
+		await page.screenshot(path=save_path, full_page=False)
+		title = await page.title()
+		return f"Screenshot saved to: {save_path}\nPage Title: {title}\nURL: {page.url}"
+	except Exception as exc:
+		return f"Error taking screenshot: {exc}"
+
+
+@mcp.tool()
+async def brave_evaluate_js(expression: str) -> str:
+	"""Evaluate a JavaScript expression in the active page context and return the result."""
+	try:
+		page = await session.get_active_page()
+		result = await page.evaluate(expression)
+		return f"Result: {result}"
+	except Exception as exc:
+		return f"JavaScript execution error: {exc}"
+
+
+@mcp.tool()
+async def brave_switch_tab(index: int) -> str:
+	"""Switch focus to an open tab by its numeric index (see brave_status)."""
+	try:
+		pages = await session.get_pages()
+		if index < 0 or index >= len(pages):
+			return f"Invalid tab index {index}. Total open tabs: {len(pages)}"
+
+		session.set_active_tab(index)
+		page = pages[index]
+		await page.bring_to_front()
+		title = await page.title()
+		return f"Switched to tab [{index}]: '{title}' ({page.url})"
+	except Exception as exc:
+		return f"Error switching tab: {exc}"
+
+
+@mcp.tool()
+async def brave_new_tab(url: str = "about:blank") -> str:
+	"""Open a new browser tab and switch to it."""
+	return await brave_navigate(url=url, new_tab=True)
+
+
+@mcp.tool()
+async def brave_close_tab(index: int = -1) -> str:
+	"""Close a tab by index (-1 closes the active tab)."""
+	try:
+		pages = await session.get_pages()
+		if not pages:
+			return "No tabs to close."
+
+		target_index = session._active_tab_index if index == -1 else index
+		if target_index < 0 or target_index >= len(pages):
+			return f"Invalid tab index {target_index}."
+
+		page = pages[target_index]
+		url = page.url
+		await page.close()
+
+		pages = await session.get_pages()
+		session.set_active_tab(max(0, len(pages) - 1))
+		return f"Closed tab [{target_index}] ({url}). Remaining open tabs: {len(pages)}"
+	except Exception as exc:
+		return f"Error closing tab: {exc}"
+
+
+def main():
+	parser = argparse.ArgumentParser(
+		description="FastMCP server providing browser automation tools over CDP or standalone stealth Chromium using patchright."
+	)
+	parser.parse_args()
+
+	def _handle_signal(signum, _frame):
+		raise SystemExit(0)
+
+	for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+		signal.signal(sig, _handle_signal)
+
+	try:
+		mcp.run()
+	except (KeyboardInterrupt, SystemExit):
+		pass
+	finally:
+		session.close_sync()
+		os._exit(0)
+
+
+if __name__ == "__main__":
+	main()
