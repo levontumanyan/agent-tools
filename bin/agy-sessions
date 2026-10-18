@@ -1,0 +1,770 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+Save, inspect, test, and auto-restore iTerm2 + Antigravity CLI (agy) sessions across reboots.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+AGY_DIR = Path.home() / ".gemini" / "antigravity-cli"
+SESSIONS_FILE = AGY_DIR / "iterm-sessions.json"
+LOCK_FILE = AGY_DIR / "iterm-sessions.lock"
+SUMMARIES_DB = AGY_DIR / "conversation_summaries.db"
+PRESENCE_DIR = AGY_DIR / "presence"
+RESTORE_PENDING_FILE = AGY_DIR / ".restore_pending"
+
+
+def get_boot_time() -> int:
+	"""Return macOS kernel boot timestamp in seconds."""
+	try:
+		out = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
+		m = re.search(r"sec\s*=\s*(\d+)", out)
+		return int(m.group(1)) if m else 0
+	except Exception:
+		return 0
+
+
+def get_iterm_state() -> list[dict]:
+	"""Query iTerm2 via AppleScript for all windows, tabs, and sessions (sorted deterministically)."""
+	start_tok = "__AGY_" + "SESS_BEGIN__"
+	end_tok = "__AGY_" + "SESS_FINAL__"
+	script = f"""
+	tell application "iTerm2"
+		set out to ""
+		repeat with w in windows
+			set wId to (id of w as string)
+			set b to bounds of w
+			set bStr to (item 1 of b as string) & "," & (item 2 of b as string) & "," & (item 3 of b as string) & "," & (item 4 of b as string)
+			set tCount to count of tabs of w
+			set tIdx to 0
+			repeat with t in tabs of w
+				set sIdx to 0
+				repeat with s in sessions of t
+					set c to contents of s
+					if length of c > 1500 then
+						set c to text ((length of c) - 1500) thru (length of c) of c
+					end if
+					set out to out & "{start_tok}" & wId & "\\t" & tCount & "\\t" & tIdx & "\\t" & sIdx & "\\t" & bStr & "\\t" & (id of s) & "\\t" & (tty of s) & "\\t" & (name of s) & "\\n" & c & "{end_tok}"
+					set sIdx to sIdx + 1
+				end repeat
+				set tIdx to tIdx + 1
+			end repeat
+		end repeat
+		return out
+	end tell
+	"""
+	try:
+		osa = subprocess.check_output(["osascript", "-e", script], text=True, stderr=subprocess.DEVNULL)
+	except Exception:
+		return []
+
+	raw_sessions = []
+	blocks = re.findall(re.escape(start_tok) + r"(.*?)" + re.escape(end_tok), osa, re.S)
+	for b in blocks:
+		header, body = b.split("\n", 1)
+		w_id, t_count, t_idx, s_idx, bounds, sid, tty, name = header.split("\t")
+		matches = re.findall(r"agy (?:--conversation[= ]|-c )([0-9a-f-]{36})", body)
+		scroll_cid = matches[-1] if matches else ""
+		b_list = [int(x) for x in bounds.split(",")]
+		raw_sessions.append({
+			"window_id": int(w_id) if w_id.isdigit() else w_id,
+			"window_tab_count": int(t_count),
+			"tab": int(t_idx),
+			"pane": int(s_idx),
+			"bounds": b_list,
+			"session_id": sid,
+			"tty": tty.strip(),
+			"tab_name": name.strip(),
+			"scrollback_cid": scroll_cid,
+		})
+
+	# Deterministic window ordering by window_id (creation order in iTerm2)
+	unique_wins = sorted({s["window_id"] for s in raw_sessions})
+	win_map = {wid: idx for idx, wid in enumerate(unique_wins)}
+	for s in raw_sessions:
+		s["window"] = win_map[s["window_id"]]
+	raw_sessions.sort(key=lambda x: (x["window"], x["tab"], x["pane"]))
+	return raw_sessions
+
+
+def get_live_processes() -> tuple[dict, dict, dict, dict]:
+	"""Return mappings of tty->(agy_pid, cmd), tty->zsh_pid, pid->cwd, pid->cid."""
+	ps_out = subprocess.check_output(["ps", "-o", "pid=,tty=,command=", "-ax"], text=True)
+	tty_to_agy = {}
+	tty_to_zsh = {}
+	for line in ps_out.splitlines():
+		parts = line.strip().split(None, 2)
+		if len(parts) == 3:
+			pid, tty_short, cmd = parts[0], parts[1], parts[2]
+			if tty_short == "??":
+				continue
+			tty = "/dev/" + tty_short
+			if cmd == "agy" or cmd.startswith("agy "):
+				tty_to_agy[tty] = (pid, cmd)
+			elif cmd in ("-zsh", "zsh", "/bin/zsh"):
+				tty_to_zsh[tty] = pid
+
+	all_pids = [p for p, _ in tty_to_agy.values()] + list(tty_to_zsh.values())
+	pid_to_cwd = {}
+	if all_pids:
+		try:
+			lsof_cwd = subprocess.check_output(
+				["lsof", "-a", "-p", ",".join(all_pids), "-d", "cwd", "-Fn"],
+				text=True,
+				stderr=subprocess.DEVNULL,
+			)
+			cur_pid = None
+			for line in lsof_cwd.splitlines():
+				if line.startswith("p"):
+					cur_pid = line[1:]
+				elif line.startswith("n/") and cur_pid:
+					pid_to_cwd[cur_pid] = line[1:].strip()
+		except Exception:
+			pass
+
+	agy_pids = [p for p, _ in tty_to_agy.values()]
+	pid_to_cid = {}
+	if agy_pids:
+		try:
+			lsof_agy = subprocess.check_output(
+				["lsof", "-p", ",".join(agy_pids), "-Fn"],
+				text=True,
+				stderr=subprocess.DEVNULL,
+			)
+			cur_pid = None
+			for line in lsof_agy.splitlines():
+				if line.startswith("p"):
+					cur_pid = line[1:]
+				elif line.startswith("n") and "/presence/" in line and line.endswith(".lock") and cur_pid:
+					m = re.search(r"/presence/([0-9a-f-]+)\.lock$", line)
+					if m:
+						pid_to_cid[cur_pid] = m.group(1)
+		except Exception:
+			pass
+
+	return tty_to_agy, tty_to_zsh, pid_to_cwd, pid_to_cid
+
+
+def get_locked_cids() -> set[str]:
+	"""Return set of conversation IDs currently held by any live agy process."""
+	_, _, _, pid_to_cid = get_live_processes()
+	return set(pid_to_cid.values())
+
+
+def get_conversation_title(cid: str) -> str:
+	if not cid or not SUMMARIES_DB.exists():
+		return ""
+	try:
+		conn = sqlite3.connect(str(SUMMARIES_DB))
+		cur = conn.cursor()
+		cur.execute("SELECT title FROM conversation_summaries WHERE conversation_id=?", (cid,))
+		row = cur.fetchone()
+		conn.close()
+		return row[0] if row else ""
+	except Exception:
+		return ""
+
+
+def extract_extra_flags(cmd: str) -> list[str]:
+	"""Extract persistent CLI flags like --dangerously-skip-permissions from an agy command."""
+	if not cmd or cmd == "(zsh)":
+		return []
+	parts = shlex.split(cmd)
+	flags = []
+	skip_next = False
+	for tok in parts[1:]:
+		if skip_next:
+			skip_next = False
+			continue
+		if tok in ("-c", "--continue"):
+			continue
+		if tok.startswith("--conversation="):
+			continue
+		if tok == "--conversation":
+			skip_next = True
+			continue
+		flags.append(tok)
+	return flags
+
+
+def load_saved_data() -> dict:
+	if not SESSIONS_FILE.exists():
+		return {"updated_at": 0, "boot_time": 0, "sessions": []}
+	try:
+		return json.loads(SESSIONS_FILE.read_text())
+	except Exception:
+		return {"updated_at": 0, "boot_time": 0, "sessions": []}
+
+
+def save_data(data: dict) -> None:
+	AGY_DIR.mkdir(parents=True, exist_ok=True)
+	tmp = SESSIONS_FILE.with_suffix(".tmp")
+	tmp.write_text(json.dumps(data, indent="\t") + "\n")
+	tmp.replace(SESSIONS_FILE)
+
+
+def cmd_save(args: argparse.Namespace) -> int:
+	iterm_sessions = get_iterm_state()
+	if not iterm_sessions:
+		if not args.quiet:
+			print("No iTerm2 sessions found.", file=sys.stderr)
+		return 1
+
+	tty_to_agy, tty_to_zsh, pid_to_cwd, pid_to_cid = get_live_processes()
+	prev_data = load_saved_data()
+	prev_by_sid = {s.get("session_id"): s for s in prev_data.get("sessions", []) if s.get("session_id")}
+
+	saved_sessions = []
+	for s in iterm_sessions:
+		if s["tab_name"] == "agy-restore-test":
+			continue
+		tty = s["tty"]
+		sid = s["session_id"]
+		prev = prev_by_sid.get(sid, {})
+
+		agy_info = tty_to_agy.get(tty)
+		zsh_pid = tty_to_zsh.get(tty, "")
+
+		if agy_info:
+			pid, raw_cmd = agy_info
+			cid = pid_to_cid.get(pid, "") or s["scrollback_cid"] or prev.get("conversation_id", "")
+			cwd = pid_to_cwd.get(pid, "") or prev.get("cwd", "")
+			flags = extract_extra_flags(raw_cmd) or prev.get("flags", [])
+			state = "LIVE"
+		else:
+			cid = s["scrollback_cid"] or prev.get("conversation_id", "")
+			cwd = pid_to_cwd.get(zsh_pid, "") or prev.get("cwd", "")
+			flags = prev.get("flags", [])
+			state = "SAVED"
+
+		title = get_conversation_title(cid) or prev.get("conversation_title", "")
+		saved_sessions.append({
+			"window": s["window"],
+			"window_id": s["window_id"],
+			"window_tab_count": s["window_tab_count"],
+			"tab": s["tab"],
+			"pane": s["pane"],
+			"bounds": s["bounds"],
+			"session_id": sid,
+			"tty": tty,
+			"tab_name": s["tab_name"],
+			"cwd": cwd,
+			"conversation_id": cid,
+			"conversation_title": title,
+			"flags": flags,
+			"state_at_save": state,
+			"restored": False,
+			"force_restore": False,
+		})
+
+	LOCK_FILE.touch(exist_ok=True)
+	with open(LOCK_FILE, "r+") as lf:
+		fcntl.flock(lf, fcntl.LOCK_EX)
+		boot_raw = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True).strip()
+		(AGY_DIR / ".saved_boot_time").write_text(boot_raw + "\n")
+		RESTORE_PENDING_FILE.touch(exist_ok=True)
+		save_data({
+			"updated_at": time.time(),
+			"updated_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+			"boot_time": get_boot_time(),
+			"sessions": saved_sessions,
+		})
+		fcntl.flock(lf, fcntl.LOCK_UN)
+
+	if not args.quiet:
+		print(f"Saved {len(saved_sessions)} iTerm2 agy sessions to {SESSIONS_FILE}")
+	return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+	data = load_saved_data()
+	sessions = data.get("sessions", [])
+	locked_cids = get_locked_cids()
+	cur_boot = get_boot_time()
+	saved_boot = data.get("boot_time", 0)
+	reboot_state = "SAME BOOT (armed for next reboot)" if cur_boot == saved_boot else "NEW BOOT DETECTED (will auto-restore)"
+	print(f"Snapshot: {SESSIONS_FILE} (updated: {data.get('updated_iso', 'never')})")
+	print(f"Boot status: {reboot_state} | Total saved tabs: {len(sessions)}\n")
+	for s in sessions:
+		cid = s.get("conversation_id", "")
+		is_live = cid in locked_cids if cid else False
+		status_str = "\033[32mLIVE\033[0m" if is_live else ("\033[33mSAVED\033[0m" if not s.get("restored") else "RESTORED")
+		short_cwd = s.get("cwd", "").replace(str(Path.home()), "~")
+		coord = f"w{s['window']}t{s['tab']}p{s['pane']}"
+		print(f"{coord:<7} | {status_str:<17} | name={s.get('tab_name', ''):<23} | cwd={short_cwd:<22} | {cid} | {s.get('conversation_title', '')}")
+	return 0
+
+
+def set_iterm_session_name(tty: str, name: str) -> None:
+	if not tty or not name:
+		return
+	script = f"""
+	tell application "iTerm2"
+		repeat with w in windows
+			repeat with t in tabs of w
+				repeat with s in sessions of t
+					if (tty of s) is "{tty}" then
+						set name of s to {json.dumps(name)}
+						return
+					end if
+				end repeat
+			end repeat
+		end repeat
+	end tell
+	"""
+	subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_zsh_hook(args: argparse.Namespace) -> int:
+	"""
+	Outputs zsh commands to stdout to be eval'd by ~/.zshrc when a restored iTerm2 tab starts.
+	Only fires when:
+	- A reboot occurred since the snapshot was saved (current_boot_time != saved_boot_time), OR
+	- A session entry has force_restore=True (used by `agy-sessions test`), OR
+	- AGY_RESTORE_CID is explicitly set in the environment.
+	"""
+	iterm_sid_env = os.environ.get("ITERM_SESSION_ID", "")
+	explicit_cid = os.environ.get("AGY_RESTORE_CID", "")
+	if not iterm_sid_env and not explicit_cid:
+		return 0
+
+	if not SESSIONS_FILE.exists():
+		return 0
+
+	sid_uuid = iterm_sid_env.split(":", 1)[1] if ":" in iterm_sid_env else iterm_sid_env
+	cur_boot = get_boot_time()
+
+	LOCK_FILE.touch(exist_ok=True)
+	with open(LOCK_FILE, "r+") as lf:
+		fcntl.flock(lf, fcntl.LOCK_EX)
+		try:
+			data = load_saved_data()
+			saved_boot = data.get("boot_time", 0)
+			is_post_reboot = (saved_boot > 0 and cur_boot != saved_boot)
+			sessions = data.get("sessions", [])
+
+			if is_post_reboot:
+				unrestored = [s for s in sessions if not s.get("restored") and s.get("conversation_id")]
+			else:
+				unrestored = [s for s in sessions if s.get("force_restore") and not s.get("restored") and s.get("conversation_id")]
+
+			if not unrestored and not explicit_cid:
+				return 0
+
+			locked_cids = get_locked_cids()
+			iterm_now = get_iterm_state()
+
+			# If a reboot just occurred and macOS did NOT restore the windows (e.g. only 1 default window/tab opened),
+			# trigger full window/tab layout recreation in the background and claim the first session in this tab!
+			if is_post_reboot and len(iterm_now) <= 2 and len(sessions) > 2 and not data.get("recreate_triggered"):
+				data["recreate_triggered"] = True
+				save_data(data)
+				subprocess.Popen(
+					[str(Path.home() / ".local" / "bin" / "agy-sessions"), "restore"],
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL,
+				)
+				return 0
+
+			cur_iterm = None
+			for item in iterm_now:
+				if sid_uuid and item["session_id"] == sid_uuid:
+					cur_iterm = item
+					break
+				if args.tty and item["tty"] == args.tty:
+					cur_iterm = item
+					break
+
+			matched = None
+			# 1. Explicit AGY_RESTORE_CID or force_restore test entry
+			if explicit_cid:
+				for s in unrestored:
+					if s["conversation_id"] == explicit_cid:
+						matched = s
+						break
+				if not matched:
+					matched = {
+						"conversation_id": explicit_cid,
+						"conversation_title": get_conversation_title(explicit_cid),
+						"cwd": os.environ.get("AGY_RESTORE_CWD", os.getcwd()),
+						"tab_name": os.environ.get("AGY_RESTORE_NAME", ""),
+						"flags": [],
+						"restored": False,
+					}
+
+			if not matched:
+				for s in unrestored:
+					if s.get("force_restore") and s.get("tab_name") == "agy-restore-test":
+						matched = s
+						break
+
+			# 2. Exact session_id UUID match
+			if not matched and sid_uuid:
+				for s in unrestored:
+					if s.get("session_id") == sid_uuid:
+						matched = s
+						break
+
+			# 3. Match by restored scrollback conversation_id in this exact iTerm pane
+			if not matched and cur_iterm and cur_iterm.get("scrollback_cid"):
+				scid = cur_iterm["scrollback_cid"]
+				for s in unrestored:
+					if s["conversation_id"] == scid:
+						matched = s
+						break
+
+			# 4. Match by (window_tab_count, tab, pane) across rebooted windows
+			if not matched and cur_iterm:
+				cur_cwd = os.getcwd()
+				for s in unrestored:
+					if (
+						s.get("window_tab_count") == cur_iterm["window_tab_count"]
+						and s.get("tab") == cur_iterm["tab"]
+						and s.get("pane") == cur_iterm["pane"]
+						and s.get("cwd") == cur_cwd
+					):
+						matched = s
+						break
+
+			# 5. Fallback match by (window, tab, pane)
+			if not matched and cur_iterm:
+				for s in unrestored:
+					if (
+						s.get("window") == cur_iterm["window"]
+						and s.get("tab") == cur_iterm["tab"]
+						and s.get("pane") == cur_iterm["pane"]
+					):
+						matched = s
+						break
+
+			if not matched:
+				return 0
+
+			cid = matched["conversation_id"]
+			matched["restored"] = True
+			matched["force_restore"] = False
+			remaining = [s for s in sessions if not s.get("restored") and s.get("conversation_id")]
+			if not remaining:
+				RESTORE_PENDING_FILE.unlink(missing_ok=True)
+			save_data(data)
+
+			if cid in locked_cids:
+				return 0
+
+			cwd = matched.get("cwd") or os.getcwd()
+			tab_name = matched.get("tab_name", "")
+			title = matched.get("conversation_title") or cid
+			flags = matched.get("flags", [])
+			tty = (cur_iterm["tty"] if cur_iterm else args.tty) or ""
+
+			if tty and tab_name:
+				set_iterm_session_name(tty, tab_name)
+
+			flag_str = (" " + " ".join(shlex.quote(f) for f in flags)) if flags else ""
+			delay = round((matched.get("tab", 0) % 6) * 0.25, 2)
+			print(f"cd {shlex.quote(cwd)} || true")
+			print(f"printf '\\033[1;36m[agy-sessions]\\033[0m Restoring session: \\033[1m%s\\033[0m (%s)\\n' {shlex.quote(title)} {shlex.quote(cid)}")
+			if delay > 0 and is_post_reboot:
+				print(f"sleep {delay}")
+			print("unset AGY_RESTORE_CID AGY_RESTORE_CWD AGY_RESTORE_NAME")
+			print(f"agy{flag_str} --conversation={shlex.quote(cid)}")
+			return 0
+		finally:
+			fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+	"""
+	Restore any saved sessions that are not currently running agy.
+	- If the tab already exists in iTerm2 at an idle zsh prompt, sends the agy resume command to it.
+	- If windows/tabs are missing (e.g. after a fresh start), recreates them via AppleScript.
+	"""
+	data = load_saved_data()
+	sessions = [s for s in data.get("sessions", []) if s.get("conversation_id")]
+	if not sessions:
+		print("No saved sessions found in", SESSIONS_FILE)
+		return 1
+
+	locked_cids = get_locked_cids()
+	iterm_now = get_iterm_state()
+	tty_to_agy, _, _, _ = get_live_processes()
+
+	by_sid = {s["session_id"]: s for s in iterm_now}
+	by_coord = {(s["window"], s["tab"], s["pane"]): s for s in iterm_now if len(iterm_now) >= len(sessions) // 2}
+
+	restored_in_place = 0
+	missing_by_window: dict[int, list[dict]] = {}
+
+	for s in sessions:
+		cid = s["conversation_id"]
+		if cid in locked_cids:
+			continue
+		target_iterm = by_sid.get(s.get("session_id")) or by_coord.get((s["window"], s["tab"], s["pane"]))
+		if target_iterm and target_iterm["tty"] not in tty_to_agy:
+			if args.recreate_only:
+				continue
+			tty = target_iterm["tty"]
+			cwd = s.get("cwd") or str(Path.home())
+			flags = s.get("flags", [])
+			flag_str = (" " + " ".join(shlex.quote(f) for f in flags)) if flags else ""
+			cmd_str = f"cd {shlex.quote(cwd)} && agy{flag_str} --conversation={shlex.quote(cid)}"
+			tab_name = s.get("tab_name", "")
+			osa = f"""
+			tell application "iTerm2"
+				repeat with w in windows
+					repeat with t in tabs of w
+						repeat with sess in sessions of t
+							if (tty of sess) is "{tty}" then
+								if {json.dumps(tab_name)} is not "" then
+									set name of sess to {json.dumps(tab_name)}
+								end if
+								tell sess to write text {json.dumps(cmd_str)}
+								return
+							end if
+						end repeat
+					end repeat
+				end repeat
+			end tell
+			"""
+			subprocess.run(["osascript", "-e", osa], check=False)
+			restored_in_place += 1
+		elif not target_iterm:
+			missing_by_window.setdefault(s["window"], []).append(s)
+
+	recreated = 0
+	for w_idx, win_sessions in sorted(missing_by_window.items()):
+		if args.in_place_only:
+			continue
+		win_sessions.sort(key=lambda x: x["tab"])
+		bounds = win_sessions[0].get("bounds", [100, 100, 1200, 900])
+		win_id = None
+		for idx, s in enumerate(win_sessions):
+			cid = s["conversation_id"]
+			cwd = s.get("cwd") or str(Path.home())
+			tab_name = s.get("tab_name", "")
+			flags = s.get("flags", [])
+			flag_str = (" " + " ".join(shlex.quote(f) for f in flags)) if flags else ""
+			cmd_str = f"cd {shlex.quote(cwd)} && agy{flag_str} --conversation={shlex.quote(cid)}"
+			if idx == 0:
+				osa = f"""
+				tell application "iTerm2"
+					set newWin to (create window with default profile)
+					set bounds of newWin to {{{bounds[0]}, {bounds[1]}, {bounds[2]}, {bounds[3]}}}
+					tell current session of current tab of newWin
+						if {json.dumps(tab_name)} is not "" then
+							set name to {json.dumps(tab_name)}
+						end if
+						write text {json.dumps(cmd_str)}
+					end tell
+					return id of newWin
+				end tell
+				"""
+				win_id = subprocess.check_output(["osascript", "-e", osa], text=True).strip()
+			else:
+				osa = f"""
+				tell application "iTerm2"
+					repeat with w in windows
+						if (id of w as string) is "{win_id}" then
+							tell w
+								set newTab to (create tab with default profile)
+								tell current session of newTab
+									if {json.dumps(tab_name)} is not "" then
+										set name to {json.dumps(tab_name)}
+									end if
+									write text {json.dumps(cmd_str)}
+								end tell
+							end tell
+							exit repeat
+						end if
+					end repeat
+				end tell
+				"""
+				subprocess.run(["osascript", "-e", osa], check=False)
+			recreated += 1
+			time.sleep(0.2)
+
+	# Update boot_time so post-reboot hook won't fire again during this boot
+	LOCK_FILE.touch(exist_ok=True)
+	with open(LOCK_FILE, "r+") as lf:
+		fcntl.flock(lf, fcntl.LOCK_EX)
+		data = load_saved_data()
+		data["boot_time"] = get_boot_time()
+		data["recreate_triggered"] = False
+		for s in data.get("sessions", []):
+			s["restored"] = True
+		save_data(data)
+		fcntl.flock(lf, fcntl.LOCK_UN)
+
+	print(f"Restored {restored_in_place} existing tab(s) in-place, recreated {recreated} missing tab(s).")
+	return 0
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+	"""
+	End-to-end live test before rebooting:
+	1. Picks an idle conversation ID (not currently open in another tab) or uses --cid.
+	2. Injects a temporary pending restore entry in iterm-sessions.json with force_restore=True.
+	3. Opens a new iTerm2 tab with a standard default login shell (no command passed!).
+	4. Verifies that ~/.zshrc -> `agy-sessions zsh-hook` automatically sets the tab title,
+	   changes directory, and launches `agy --conversation=<cid>`.
+	"""
+	locked_cids = get_locked_cids()
+	data = load_saved_data()
+	test_cid = args.cid
+	test_cwd = str(Path.home() / "repos" / "knowledge-base")
+	test_title = "Test Session"
+
+	if not test_cid:
+		for s in data.get("sessions", []):
+			if s.get("conversation_id") and s["conversation_id"] not in locked_cids:
+				test_cid = s["conversation_id"]
+				test_cwd = s.get("cwd") or test_cwd
+				test_title = s.get("conversation_title") or test_title
+				break
+
+	if not test_cid:
+		print("Could not find an unlocked conversation_id to test with.", file=sys.stderr)
+		return 1
+
+	LOCK_FILE.touch(exist_ok=True)
+	with open(LOCK_FILE, "r+") as lf:
+		fcntl.flock(lf, fcntl.LOCK_EX)
+		data = load_saved_data()
+		data["sessions"] = [s for s in data.get("sessions", []) if s.get("tab_name") != "agy-restore-test"]
+		data["sessions"].append({
+			"window": 0,
+			"window_id": 0,
+			"window_tab_count": 0,
+			"tab": 99,
+			"pane": 0,
+			"bounds": [100, 100, 1000, 800],
+			"session_id": "TEST-PENDING-SID",
+			"tty": "",
+			"tab_name": "agy-restore-test",
+			"cwd": test_cwd,
+			"conversation_id": test_cid,
+			"conversation_title": test_title,
+			"flags": [],
+			"state_at_save": "TEST",
+			"restored": False,
+			"force_restore": True,
+		})
+		save_data(data)
+		(AGY_DIR / ".restore_test").touch(exist_ok=True)
+		RESTORE_PENDING_FILE.touch(exist_ok=True)
+		fcntl.flock(lf, fcntl.LOCK_UN)
+
+	print(f"1. Seeded force_restore test entry -> {test_title} ({test_cid})")
+	print("2. Opening a brand-new iTerm2 tab with a plain default shell (testing ~/.zshrc auto-resume hook)...")
+
+	osa = """
+	tell application "iTerm2"
+		tell front window
+			set newTab to (create tab with default profile)
+			tell current session of newTab
+				return (tty) & "\\t" & (id)
+			end tell
+		end tell
+	end tell
+	"""
+	out = subprocess.check_output(["osascript", "-e", osa], text=True).strip()
+	new_tty, new_sid = out.split("\t")
+	print(f"   Created tab on {new_tty} (session_id={new_sid})")
+
+	started_pid = None
+	started_cmd = ""
+	for _ in range(12):
+		time.sleep(0.5)
+		tty_to_agy, _, _, _ = get_live_processes()
+		if new_tty in tty_to_agy:
+			started_pid, started_cmd = tty_to_agy[new_tty]
+			break
+
+	(AGY_DIR / ".restore_test").unlink(missing_ok=True)
+	with open(LOCK_FILE, "r+") as lf:
+		fcntl.flock(lf, fcntl.LOCK_EX)
+		data = load_saved_data()
+		data["sessions"] = [s for s in data.get("sessions", []) if s.get("tab_name") != "agy-restore-test"]
+		save_data(data)
+		remaining = [s for s in data["sessions"] if not s.get("restored") and s.get("conversation_id")]
+		if not remaining:
+			RESTORE_PENDING_FILE.unlink(missing_ok=True)
+		fcntl.flock(lf, fcntl.LOCK_UN)
+
+	if started_pid and test_cid in started_cmd:
+		print(f"3. \033[1;32mSUCCESS!\033[0m New tab automatically set title='agy-restore-test', cd'd to {test_cwd}, and resumed `{started_cmd}` (PID {started_pid}) via ~/.zshrc!")
+		if args.close_after:
+			close_osa = f"""
+			tell application "iTerm2"
+				repeat with w in windows
+					repeat with t in tabs of w
+						repeat with s in sessions of t
+							if (tty of s) is "{new_tty}" then
+								close s
+								return
+							end if
+						end repeat
+					end repeat
+				end repeat
+			end tell
+			"""
+			subprocess.run(["osascript", "-e", close_osa], check=False)
+			print("4. Closed temporary test tab and re-armed snapshot.")
+		return 0
+	else:
+		print(f"3. \033[1;31mFAILED:\033[0m Expected `{test_cid}` on {new_tty}, got `{started_cmd}`", file=sys.stderr)
+		return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+	parser = argparse.ArgumentParser(
+		prog="agy-sessions",
+		description="Save, inspect, test, and auto-restore iTerm2 + Antigravity CLI (agy) sessions across reboots.",
+	)
+	sub = parser.add_subparsers(dest="subcommand", required=True)
+
+	p_save = sub.add_parser("save", help="Snapshot all open iTerm2 windows/tabs and their agy conversation IDs")
+	p_save.add_argument("-q", "--quiet", action="store_true", help="Suppress output")
+	p_save.set_defaults(func=cmd_save)
+
+	p_status = sub.add_parser("status", help="Show saved iTerm2 tabs and their live/pending status")
+	p_status.set_defaults(func=cmd_status)
+
+	p_hook = sub.add_parser("zsh-hook", help="Internal hook called by ~/.zshrc to auto-resume matched iTerm2 tabs")
+	p_hook.add_argument("--tty", default="", help="Current tty path from zsh")
+	p_hook.set_defaults(func=cmd_zsh_hook)
+
+	p_restore = sub.add_parser("restore", help="Restore all stopped/missing agy tabs in-place or by recreating windows")
+	p_restore.add_argument("--in-place-only", action="store_true", help="Only restore existing idle tabs")
+	p_restore.add_argument("--recreate-only", action="store_true", help="Only recreate missing windows/tabs")
+	p_restore.set_defaults(func=cmd_restore)
+
+	p_test = sub.add_parser("test", help="Live-test auto-restoration in a new iTerm2 tab before rebooting")
+	p_test.add_argument("--cid", default="", help="Specific conversation ID to test with")
+	p_test.add_argument("--close-after", action="store_true", help="Automatically close the test tab after verifying")
+	p_test.set_defaults(func=cmd_test)
+
+	return parser
+
+
+def main() -> int:
+	parser = build_parser()
+	args = parser.parse_args()
+	return args.func(args)
+
+
+if __name__ == "__main__":
+	sys.exit(main())

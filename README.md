@@ -22,6 +22,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
 | [`brave-mcp`](bin/brave-mcp) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in Brave or standalone stealth Chromium. |
 | [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, and auto-restore iTerm2 windows, tabs, custom titles, and active `agy` conversations across reboots. |
+| [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
 
 # Quickstart
 
@@ -49,6 +50,8 @@ cal-event --help
 outlook --help
 apple-pay --help
 brave-mcp --help
+agy-sessions --help
+antigravity-shipper --help
 ```
 
 # Stealth Browser MCP (`brave-mcp`)
