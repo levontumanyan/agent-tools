@@ -21,7 +21,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`outlook`](bin/outlook) | CLI | Microsoft Graph API | Read, search, draft, and send Outlook emails from the terminal. |
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
 | [`brave-mcp`](bin/brave-mcp) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in Brave or standalone stealth Chromium. |
-| [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, and auto-restore iTerm2 windows, tabs, custom titles, and active `agy` conversations across reboots. |
+| [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, auto-restore, and gracefully cull stale (>6h) `agy` sessions in iTerm2 while keeping tabs open. |
 | [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
 
 # Quickstart

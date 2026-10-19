@@ -933,7 +933,11 @@ func DiscoverRecentTranscripts(maxCount int) ([]SessionSummary, error) {
 				if dirChanged {
 					scanBrainDirNewEntries(dir, dirInfo.ModTime(), cache, now)
 				}
-				statHotTranscripts(cache, hotLimit, now)
+				effectiveHotLimit := hotLimit
+				if maxCount <= 0 {
+					effectiveHotLimit = len(cache.orderedIDs)
+				}
+				statHotTranscripts(cache, effectiveHotLimit, now)
 			}
 		}
 

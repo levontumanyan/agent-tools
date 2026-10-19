@@ -16,9 +16,9 @@ import (
 func main() {
 	var (
 		pgConnStr   = flag.String("db", "", "PostgreSQL connection string (e.g. postgres://user:pass@localhost:5432/antigravity)")
-		pollSec     = flag.Int("interval", 3, "Polling interval in seconds")
+		pollSec     = flag.Int("interval", 60, "Polling interval in seconds")
 		once        = flag.Bool("once", false, "Run single sync pass and exit")
-		recentLimit = flag.Int("limit", 20, "Number of recent sessions to monitor")
+		recentLimit = flag.Int("limit", 0, "Number of recent sessions to monitor (0 for all)")
 	)
 	flag.Parse()
 
@@ -94,7 +94,11 @@ func main() {
 		}
 	}
 
-	log.Printf("Running initial telemetry sync pass (monitoring last %d sessions)...", *recentLimit)
+	if *recentLimit <= 0 {
+		log.Println("Running initial telemetry sync pass (monitoring all sessions)...")
+	} else {
+		log.Printf("Running initial telemetry sync pass (monitoring last %d sessions)...", *recentLimit)
+	}
 	syncPass()
 
 	if *once {
