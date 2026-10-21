@@ -19,6 +19,7 @@ func main() {
 		pollSec     = flag.Int("interval", 60, "Polling interval in seconds")
 		once        = flag.Bool("once", false, "Run single sync pass and exit")
 		recentLimit = flag.Int("limit", 0, "Number of recent sessions to monitor (0 for all)")
+		stateFile   = flag.String("state", "", "Path to state cache file (default ~/.gemini/antigravity-shipper-state.json)")
 	)
 	flag.Parse()
 
@@ -54,8 +55,24 @@ func main() {
 	defer db.Close()
 	log.Println("Connected to PostgreSQL successfully.")
 
+	resolvedStatePath := *stateFile
+	if resolvedStatePath == "" {
+		if p, err := DefaultStatePath(); err == nil {
+			resolvedStatePath = p
+		}
+	}
+
+	state, err := LoadState(resolvedStatePath)
+	if err != nil {
+		log.Printf("Warning: error loading state cache (%v), starting fresh", err)
+	}
+
 	// Track incremental parser state and DB sync watermarks per transcript path
 	sessionStates := make(map[string]*TranscriptState)
+	if state != nil && len(state.Sessions) > 0 {
+		state.PopulateSessionStates(sessionStates)
+		log.Printf("Loaded %d session watermarks from state cache (%s).", len(state.Sessions), resolvedStatePath)
+	}
 
 	syncPass := func() {
 		transcripts, err := DiscoverRecentTranscripts(*recentLimit)
@@ -64,12 +81,13 @@ func main() {
 			return
 		}
 
+		dirty := false
 		for _, t := range transcripts {
 			st, seen := sessionStates[t.Path]
 			if seen && st.InitialSynced && !t.ModTime.After(st.ModTime) && t.Size == st.FileSize {
 				continue
 			}
-			if !seen {
+			if !seen || st.Meta == nil {
 				st = NewTranscriptState(t.Path)
 				sessionStates[t.Path] = st
 			}
@@ -88,9 +106,20 @@ func main() {
 				continue
 			}
 
+			dirty = true
+			if state != nil {
+				state.UpdateFromSession(st)
+			}
+
 			meta := st.Meta
 			log.Printf("[%s] Synced session: %d steps, %d prompts, %d tools (%d autonomous, %d failed), %d loops (ws: %s)",
 				meta.ShortID, meta.TotalSteps, len(meta.Prompts), meta.TotalToolCalls, meta.AutonomousCalls, meta.FailedCalls, len(meta.LoopEvents), meta.Workspace)
+		}
+
+		if dirty && state != nil && resolvedStatePath != "" {
+			if err := state.SaveState(resolvedStatePath); err != nil {
+				log.Printf("Warning: failed saving state cache: %v", err)
+			}
 		}
 	}
 
