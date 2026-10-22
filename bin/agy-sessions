@@ -298,7 +298,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 	locked_cids = get_locked_cids()
 	cur_boot = get_boot_time()
 	saved_boot = data.get("boot_time", 0)
-	reboot_state = "SAME BOOT (armed for next reboot)" if cur_boot == saved_boot else "NEW BOOT DETECTED (will auto-restore)"
+	is_reboot = (saved_boot > 0 and abs(cur_boot - saved_boot) > 30)
+	reboot_state = "NEW BOOT DETECTED (will auto-restore)" if is_reboot else "SAME BOOT (armed for next reboot)"
 	print(f"Snapshot: {SESSIONS_FILE} (updated: {data.get('updated_iso', 'never')})")
 	print(f"Boot status: {reboot_state} | Total saved tabs: {len(sessions)}\n")
 	for s in sessions:
@@ -356,7 +357,7 @@ def cmd_zsh_hook(args: argparse.Namespace) -> int:
 		try:
 			data = load_saved_data()
 			saved_boot = data.get("boot_time", 0)
-			is_post_reboot = (saved_boot > 0 and cur_boot != saved_boot)
+			is_post_reboot = (saved_boot > 0 and abs(cur_boot - saved_boot) > 30)
 			sessions = data.get("sessions", [])
 
 			if is_post_reboot:
@@ -365,6 +366,8 @@ def cmd_zsh_hook(args: argparse.Namespace) -> int:
 				unrestored = [s for s in sessions if s.get("force_restore") and not s.get("restored") and s.get("conversation_id")]
 
 			if not unrestored and not explicit_cid:
+				RESTORE_ACTIVE_FILE.unlink(missing_ok=True)
+				RESTORE_PENDING_FILE.unlink(missing_ok=True)
 				return 0
 
 			locked_cids = get_locked_cids()
@@ -462,6 +465,7 @@ def cmd_zsh_hook(args: argparse.Namespace) -> int:
 			remaining = [s for s in sessions if not s.get("restored") and s.get("conversation_id")]
 			if not remaining:
 				RESTORE_PENDING_FILE.unlink(missing_ok=True)
+				RESTORE_ACTIVE_FILE.unlink(missing_ok=True)
 			save_data(data)
 
 			if cid in locked_cids:
@@ -609,6 +613,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
 		for s in data.get("sessions", []):
 			s["restored"] = True
 		save_data(data)
+		RESTORE_ACTIVE_FILE.unlink(missing_ok=True)
+		RESTORE_PENDING_FILE.unlink(missing_ok=True)
 		fcntl.flock(lf, fcntl.LOCK_UN)
 
 	print(f"Restored {restored_in_place} existing tab(s) in-place, recreated {recreated} missing tab(s).")
