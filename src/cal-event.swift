@@ -2,6 +2,7 @@
 
 import Foundation
 import EventKit
+import SQLite3
 
 // ============================================================================
 // cal-event: Fast CLI to add/query/edit/delete events via macOS EventKit
@@ -12,6 +13,7 @@ enum Mode {
 	case add
 	case list
 	case listCalendars
+	case listSections
 	case edit
 	case delete
 }
@@ -50,6 +52,7 @@ func printUsage() {
 	  cal-event search "<query>" [options]
 	  cal-event list-calendars [--reminder]
 	  cal-event list-reminders [options]
+	  cal-event list-sections [--calendar "<name>"]
 
 	Target Defaults (for add):
 	  Account:  iCloud
@@ -96,8 +99,10 @@ func printUsage() {
 	  cal-event list-reminders
 	  cal-event list --reminder
 	  cal-event list-calendars --reminder
+	  cal-event list-sections --calendar "Grocery"
 	  cal-event edit "Doctor Appointment" --start "2026-09-15 15:30"
 	  cal-event update "Doctor Appointment" --title "Dentist Appointment" --location "Dental Clinic"
+	  cal-event update "Wallnut" --reminder --title "Walnuts 🌰" --calendar "Grocery"
 	  cal-event delete "Doctor Appointment"
 	  cal-event delete "Buy bus ticket" --reminder
 	"""
@@ -383,6 +388,170 @@ func handleAddReminder(config: Config, store: EKEventStore, allCalendars: [EKCal
 	}
 }
 
+struct SectionInfo {
+	let id: String
+	let displayName: String
+	var activeCount: Int = 0
+	var completedCount: Int = 0
+}
+
+struct ReminderSectionsMap {
+	var reminderToSection: [String: String] = [:]
+	var orderedSections: [SectionInfo] = []
+}
+
+func loadSectionsForList(calendarName: String) -> ReminderSectionsMap? {
+	let fileManager = FileManager.default
+	let baseDir = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Group Containers/group.com.apple.reminders/Container_v1/Stores")
+	guard let contents = try? fileManager.contentsOfDirectory(at: baseDir, includingPropertiesForKeys: nil) else {
+		return nil
+	}
+	let sqliteFiles = contents.filter { $0.pathExtension == "sqlite" }
+
+	for dbUrl in sqliteFiles {
+		var db: OpaquePointer?
+		if sqlite3_open_v2(dbUrl.path, &db, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
+			continue
+		}
+		defer { sqlite3_close(db) }
+
+		var listStmt: OpaquePointer?
+		let listSql = "SELECT Z_PK, cast(ZSECTIONIDSORDERINGASDATA as text), cast(ZMEMBERSHIPSOFREMINDERSINSECTIONSASDATA as text) FROM ZREMCDBASELIST WHERE ZNAME = ? COLLATE NOCASE LIMIT 1;"
+		if sqlite3_prepare_v2(db, listSql, -1, &listStmt, nil) != SQLITE_OK {
+			continue
+		}
+		sqlite3_bind_text(listStmt, 1, (calendarName as NSString).utf8String, -1, nil)
+
+		guard sqlite3_step(listStmt) == SQLITE_ROW else {
+			sqlite3_finalize(listStmt)
+			continue
+		}
+
+		let listPK = sqlite3_column_int(listStmt, 0)
+		var orderingJSON: String? = nil
+		if let textPtr = sqlite3_column_text(listStmt, 1) {
+			orderingJSON = String(cString: textPtr)
+		}
+		var membershipJSON: String? = nil
+		if let textPtr = sqlite3_column_text(listStmt, 2) {
+			membershipJSON = String(cString: textPtr)
+		}
+		sqlite3_finalize(listStmt)
+
+		var secStmt: OpaquePointer?
+		let secSql = "SELECT ZCKIDENTIFIER, ZDISPLAYNAME FROM ZREMCDBASESECTION WHERE ZLIST = ? AND (ZMARKEDFORDELETION = 0 OR ZMARKEDFORDELETION IS NULL);"
+		var sectionsDict: [String: String] = [:]
+		if sqlite3_prepare_v2(db, secSql, -1, &secStmt, nil) == SQLITE_OK {
+			sqlite3_bind_int(secStmt, 1, listPK)
+			while sqlite3_step(secStmt) == SQLITE_ROW {
+				if let idPtr = sqlite3_column_text(secStmt, 0), let namePtr = sqlite3_column_text(secStmt, 1) {
+					sectionsDict[String(cString: idPtr)] = String(cString: namePtr)
+				}
+			}
+			sqlite3_finalize(secStmt)
+		}
+
+		if sectionsDict.isEmpty {
+			return nil
+		}
+
+		var result = ReminderSectionsMap()
+
+		if let mStr = membershipJSON, let mData = mStr.data(using: .utf8),
+		   let mObj = try? JSONSerialization.jsonObject(with: mData) as? [String: Any],
+		   let mList = mObj["memberships"] as? [[String: Any]] {
+			for item in mList {
+				if let mID = item["memberID"] as? String, let gID = item["groupID"] as? String, let sName = sectionsDict[gID] {
+					result.reminderToSection[mID] = sName
+				}
+			}
+		}
+
+		var orderedIDs: [String] = []
+		if let oStr = orderingJSON, let oData = oStr.data(using: .utf8),
+		   let oObj = try? JSONSerialization.jsonObject(with: oData) as? [String: Any],
+		   let oList = oObj["orderedIdentifiers"] as? [String] {
+			orderedIDs = oList
+		}
+
+		var counts: [String: (active: Int, comp: Int)] = [:]
+		var remStmt: OpaquePointer?
+		let remSql = "SELECT ZCKIDENTIFIER, ZCOMPLETED FROM ZREMCDREMINDER WHERE ZLIST = ? AND (ZMARKEDFORDELETION = 0 OR ZMARKEDFORDELETION IS NULL);"
+		if sqlite3_prepare_v2(db, remSql, -1, &remStmt, nil) == SQLITE_OK {
+			sqlite3_bind_int(remStmt, 1, listPK)
+			while sqlite3_step(remStmt) == SQLITE_ROW {
+				if let idPtr = sqlite3_column_text(remStmt, 0) {
+					let remID = String(cString: idPtr)
+					let isComp = sqlite3_column_int(remStmt, 1) != 0
+					if let secName = result.reminderToSection[remID] {
+						var c = counts[secName] ?? (0, 0)
+						if isComp { c.comp += 1 } else { c.active += 1 }
+						counts[secName] = c
+					}
+				}
+			}
+			sqlite3_finalize(remStmt)
+		}
+
+		for sID in orderedIDs {
+			if let name = sectionsDict[sID] {
+				let c = counts[name] ?? (0, 0)
+				result.orderedSections.append(SectionInfo(id: sID, displayName: name, activeCount: c.active, completedCount: c.comp))
+			}
+		}
+
+		for (sID, name) in sectionsDict {
+			if !orderedIDs.contains(sID) {
+				let c = counts[name] ?? (0, 0)
+				result.orderedSections.append(SectionInfo(id: sID, displayName: name, activeCount: c.active, completedCount: c.comp))
+			}
+		}
+
+		return result
+	}
+	return nil
+}
+
+func handleListSections(config: Config, store: EKEventStore, allCalendars: [EKCalendar]) {
+	let targetCalendars: [EKCalendar]
+	if let calName = config.calendarName {
+		let matched = allCalendars.filter { $0.title.caseInsensitiveCompare(calName) == .orderedSame }
+		if matched.isEmpty {
+			fputs("Error: Reminder list '\(calName)' not found.\n", stderr)
+			exit(1)
+		}
+		targetCalendars = matched
+	} else {
+		targetCalendars = allCalendars
+	}
+
+	var foundAny = false
+	for cal in targetCalendars {
+		guard let secMap = loadSectionsForList(calendarName: cal.title), !secMap.orderedSections.isEmpty else {
+			continue
+		}
+		foundAny = true
+		print("Sections in [\(cal.title)] (\(secMap.orderedSections.count) cards):")
+		for (i, sec) in secMap.orderedSections.enumerated() {
+			var countStr = ""
+			if sec.activeCount > 0 || sec.completedCount > 0 {
+				countStr = " (\(sec.activeCount) active, \(sec.completedCount) completed)"
+			} else {
+				countStr = " (Empty)"
+			}
+			print("  \(i + 1). [\(sec.displayName)]\(countStr)")
+		}
+	}
+
+	if !foundAny {
+		if let calName = config.calendarName {
+			print("No sections/cards found in list '\(calName)'.")
+		} else {
+			print("No sections/cards found in any reminder lists.")
+		}
+	}
+}
+
 func handleListReminders(config: Config, store: EKEventStore, allCalendars: [EKCalendar]) {
 	let sem = DispatchSemaphore(value: 0)
 	var targetCalendars: [EKCalendar]? = nil
@@ -412,6 +581,13 @@ func handleListReminders(config: Config, store: EKEventStore, allCalendars: [EKC
 			return
 		}
 
+		var sectionsCache: [String: ReminderSectionsMap] = [:]
+		for cal in (targetCalendars ?? allCalendars) {
+			if let secMap = loadSectionsForList(calendarName: cal.title) {
+				sectionsCache[cal.title.lowercased()] = secMap
+			}
+		}
+
 		let df = DateFormatter()
 		df.dateStyle = .medium
 		df.timeStyle = .short
@@ -422,7 +598,9 @@ func handleListReminders(config: Config, store: EKEventStore, allCalendars: [EKC
 			if let comps = r.dueDateComponents, let date = Calendar.current.date(from: comps) {
 				dueStr = df.string(from: date)
 			}
-			print("  • [\(calTitle)] Due: \(dueStr) - \(r.title ?? "")")
+			let secName = sectionsCache[calTitle.lowercased()]?.reminderToSection[r.calendarItemIdentifier]
+			let cardTag = secName != nil ? " [Card: \(secName!)]" : ""
+			print("  • [\(calTitle)] Due: \(dueStr) - \(r.title ?? "")\(cardTag)")
 			if config.showDetails, let notes = r.notes, !notes.isEmpty {
 				print("    Notes: \(notes)")
 			}
@@ -905,6 +1083,10 @@ func main() {
 	if args[0] == "list-calendars" || args.contains("--list-calendars") {
 		config.mode = .listCalendars
 		args.removeFirst()
+	} else if args[0] == "list-sections" || args[0] == "sections" || args[0] == "cards" {
+		config.mode = .listSections
+		config.isReminder = true
+		args.removeFirst()
 	} else if args[0] == "list-reminders" || args[0] == "reminders" {
 		config.mode = .list
 		config.isReminder = true
@@ -1087,6 +1269,11 @@ func main() {
 					return
 				}
 
+				if config.mode == .listSections {
+					handleListSections(config: config, store: store, allCalendars: allReminderLists)
+					return
+				}
+
 				if config.mode == .list {
 					handleListReminders(config: config, store: store, allCalendars: allReminderLists)
 					return
@@ -1120,6 +1307,11 @@ func main() {
 					for cal in allReminderLists {
 						print("  • Account: [\(cal.source.title)] -> List: [\(cal.title)]")
 					}
+					return
+				}
+
+				if config.mode == .listSections {
+					handleListSections(config: config, store: store, allCalendars: allReminderLists)
 					return
 				}
 
