@@ -489,6 +489,82 @@ func handleDeleteReminder(config: Config, store: EKEventStore, allCalendars: [EK
 	sem.wait()
 }
 
+func handleEditReminder(config: Config, store: EKEventStore, allCalendars: [EKCalendar]) {
+	guard let query = config.searchQuery?.trimmingCharacters(in: .whitespaces), !query.isEmpty else {
+		fputs("Error: Missing search query for reminder to edit.\nUsage: cal-event edit \"<query>\" --reminder [options]\n", stderr)
+		exit(1)
+	}
+
+	let sem = DispatchSemaphore(value: 0)
+	var targetCalendars: [EKCalendar]? = nil
+	if let calName = config.calendarName {
+		let matched = allCalendars.filter { $0.title.caseInsensitiveCompare(calName) == .orderedSame }
+		if !matched.isEmpty { targetCalendars = matched }
+	}
+
+	let predicate = store.predicateForIncompleteReminders(withDueDateStarting: config.rangeStart, ending: config.rangeEnd, calendars: targetCalendars)
+	store.fetchReminders(matching: predicate) { reminders in
+		defer { sem.signal() }
+		guard var list = reminders, !list.isEmpty else {
+			fputs("Error: No reminders found matching '\(query)'.\n", stderr)
+			exit(1)
+		}
+
+		let q = query.lowercased()
+		list = list.filter { r in
+			let titleMatch = r.title?.lowercased().contains(q) ?? false
+			let notesMatch = r.notes?.lowercased().contains(q) ?? false
+			return titleMatch || notesMatch
+		}
+
+		if list.isEmpty {
+			fputs("Error: No reminders found matching '\(query)'.\n", stderr)
+			exit(1)
+		}
+
+		if list.count > 1 {
+			fputs("Error: Multiple reminders (\(list.count)) matched '\(query)':\n", stderr)
+			for r in list {
+				let calTitle = r.calendar.title
+				let title = r.title ?? "(No Title)"
+				fputs("  • [\(calTitle)] \(title)\n", stderr)
+			}
+			fputs("Please refine your query or specify --calendar.\n", stderr)
+			exit(1)
+		}
+
+		let reminder = list[0]
+		if let newTitle = config.newTitle {
+			reminder.title = newTitle
+		}
+		if let notes = config.notes {
+			reminder.notes = notes
+		}
+		if let url = config.url {
+			reminder.url = url
+		}
+		if let start = config.startDate {
+			let cal = Calendar.current
+			if config.isAllDay == true {
+				reminder.dueDateComponents = cal.dateComponents([.year, .month, .day], from: start)
+			} else {
+				reminder.dueDateComponents = cal.dateComponents([.year, .month, .day, .hour, .minute], from: start)
+			}
+		}
+
+		do {
+			try store.save(reminder, commit: true)
+			print("✅ Reminder updated successfully:")
+			print("   • Title: \(reminder.title ?? "")")
+			print("   • List:  [\(reminder.calendar.source.title)] -> \(reminder.calendar.title)")
+		} catch {
+			fputs("Error updating reminder: \(error.localizedDescription)\n", stderr)
+			exit(1)
+		}
+	}
+	sem.wait()
+}
+
 func handleList(config: Config, store: EKEventStore, allCalendars: [EKCalendar]) {
 	let calendar = Calendar.current
 	let now = Date()
@@ -1021,6 +1097,11 @@ func main() {
 					return
 				}
 
+				if config.mode == .edit {
+					handleEditReminder(config: config, store: store, allCalendars: allReminderLists)
+					return
+				}
+
 				handleAddReminder(config: config, store: store, allCalendars: allReminderLists)
 			}
 		} else {
@@ -1049,6 +1130,11 @@ func main() {
 
 				if config.mode == .delete {
 					handleDeleteReminder(config: config, store: store, allCalendars: allReminderLists)
+					return
+				}
+
+				if config.mode == .edit {
+					handleEditReminder(config: config, store: store, allCalendars: allReminderLists)
 					return
 				}
 
