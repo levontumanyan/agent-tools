@@ -404,6 +404,97 @@ struct SessionInfo {
 	let partnerName: String
 	let contactJID: String
 	let contactIdentifier: String?
+	let username: String?
+}
+
+var cachedUsernameMap: [String: String]? = nil
+
+func getUsernameMap() -> [String: String] {
+	if let cached = cachedUsernameMap {
+		return cached
+	}
+
+	var map: [String: String] = [:]
+
+	// 1. Check LID.sqlite (primary store for WhatsApp username mappings)
+	let lidPath = ("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/LID.sqlite" as NSString).expandingTildeInPath
+	var db: OpaquePointer?
+	if sqlite3_open_v2(lidPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
+		let query = "SELECT ZIDENTIFIER, ZPHONENUMBER, ZUSERNAME FROM ZWAZACCOUNT WHERE ZUSERNAME IS NOT NULL AND ZUSERNAME != '';"
+		var stmt: OpaquePointer?
+		if sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK {
+			while sqlite3_step(stmt) == SQLITE_ROW {
+				let ident = sqlite3_column_text(stmt, 0).flatMap { String(cString: $0) }
+				let phone = sqlite3_column_text(stmt, 1).flatMap { String(cString: $0) }
+				let user = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) }
+				if let u = user, !u.isEmpty {
+					if let id = ident, !id.isEmpty {
+						map[id.lowercased()] = u
+					}
+					if let p = phone, !p.isEmpty {
+						let digits = extractDigits(p)
+						if !digits.isEmpty {
+							map[digits] = u
+						}
+					}
+				}
+			}
+			sqlite3_finalize(stmt)
+		}
+		sqlite3_close(db)
+	}
+
+	// 2. Check ContactsV2.sqlite (supplements address book contacts)
+	let contactsPath = ("~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ContactsV2.sqlite" as NSString).expandingTildeInPath
+	if sqlite3_open_v2(contactsPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
+		let query = "SELECT ZLID, ZWHATSAPPID, ZUSERNAME FROM ZWAADDRESSBOOKCONTACT WHERE ZUSERNAME IS NOT NULL AND ZUSERNAME != '';"
+		var stmt: OpaquePointer?
+		if sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK {
+			while sqlite3_step(stmt) == SQLITE_ROW {
+				let lid = sqlite3_column_text(stmt, 0).flatMap { String(cString: $0) }
+				let waid = sqlite3_column_text(stmt, 1).flatMap { String(cString: $0) }
+				let user = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) }
+				if let u = user, !u.isEmpty {
+					if let l = lid, !l.isEmpty {
+						map[l.lowercased()] = u
+					}
+					if let w = waid, !w.isEmpty {
+						let digits = extractDigits(w)
+						if !digits.isEmpty {
+							map[digits] = u
+						}
+					}
+				}
+			}
+			sqlite3_finalize(stmt)
+		}
+		sqlite3_close(db)
+	}
+
+	cachedUsernameMap = map
+	return map
+}
+
+func resolveUsername(forJID jid: String, identifier: String?) -> String? {
+	let map = getUsernameMap()
+	if let u = map[jid.lowercased()] {
+		return u
+	}
+	if let ident = identifier {
+		let digits = extractDigits(ident)
+		if !digits.isEmpty, let u = map[digits] {
+			return u
+		}
+	}
+	return nil
+}
+
+func cleanTargetUsername(_ target: String) -> String {
+	var t = target.trimmingCharacters(in: .whitespacesAndNewlines)
+	if t.hasPrefix("@") {
+		t.removeFirst()
+	}
+	return t
 }
 
 func getAllSessions(db: OpaquePointer) -> [SessionInfo] {
@@ -421,7 +512,8 @@ func getAllSessions(db: OpaquePointer) -> [SessionInfo] {
 			let partner = sqlite3_column_text(stmt, 1).flatMap { String(cString: $0) } ?? ""
 			let jid = sqlite3_column_text(stmt, 2).flatMap { String(cString: $0) } ?? ""
 			let ident = sqlite3_column_text(stmt, 3).flatMap { String(cString: $0) }
-			sessions.append(SessionInfo(pk: pk, partnerName: partner, contactJID: jid, contactIdentifier: ident))
+			let user = resolveUsername(forJID: jid, identifier: ident)
+			sessions.append(SessionInfo(pk: pk, partnerName: partner, contactJID: jid, contactIdentifier: ident, username: user))
 		}
 		sqlite3_finalize(stmt)
 	}
@@ -429,18 +521,20 @@ func getAllSessions(db: OpaquePointer) -> [SessionInfo] {
 }
 
 func matchesTarget(session: SessionInfo, target: String) -> Bool {
-	let normTarget = normalizeForMatching(target)
+	let targetNoAt = cleanTargetUsername(target)
+	let normTarget = normalizeForMatching(targetNoAt)
 	let targetDigits = extractDigits(target)
 
 	let normPartner = normalizeForMatching(session.partnerName)
 	let normJID = session.contactJID.lowercased()
 	let normIdent = (session.contactIdentifier ?? "").lowercased()
+	let normUser = (session.username ?? "").lowercased()
 
 	if !normTarget.isEmpty {
-		if normPartner == normTarget || normJID == normTarget || normIdent == normTarget {
+		if normPartner == normTarget || normJID == normTarget || normIdent == normTarget || normUser == normTarget {
 			return true
 		}
-		if normPartner.contains(normTarget) || normJID.contains(normTarget) || normIdent.contains(normTarget) {
+		if normPartner.contains(normTarget) || normJID.contains(normTarget) || normIdent.contains(normTarget) || normUser.contains(normTarget) {
 			return true
 		}
 	}
@@ -467,7 +561,8 @@ func matchesTarget(session: SessionInfo, target: String) -> Bool {
 
 func findMatchingSessions(db: OpaquePointer, target: String) -> [SessionInfo] {
 	let all = getAllSessions(db: db)
-	let normTarget = normalizeForMatching(target)
+	let targetNoAt = cleanTargetUsername(target)
+	let normTarget = normalizeForMatching(targetNoAt)
 	let targetDigits = extractDigits(target)
 
 	var exactMatches: [SessionInfo] = []
@@ -475,10 +570,13 @@ func findMatchingSessions(db: OpaquePointer, target: String) -> [SessionInfo] {
 
 	for s in all {
 		let normPartner = normalizeForMatching(s.partnerName)
+		let normUser = (s.username ?? "").lowercased()
 		let identDigits = extractDigits(s.contactIdentifier ?? "")
 		let partnerDigits = extractDigits(s.partnerName)
 
-		if !normTarget.isEmpty && normPartner == normTarget {
+		if !normTarget.isEmpty && normUser == normTarget {
+			exactMatches.append(s)
+		} else if !normTarget.isEmpty && normPartner == normTarget {
 			exactMatches.append(s)
 		} else if targetDigits.count >= 7 && (identDigits == targetDigits || partnerDigits == targetDigits) {
 			exactMatches.append(s)
@@ -573,15 +671,19 @@ func listChats(limit: Int, unreadOnly: Bool, search: String?) {
 		let isFromMe = sqlite3_column_int(stmt, 8) == 1
 		let contactIdent = sqlite3_column_text(stmt, 9).flatMap { String(cString: $0) }
 
+		let user = resolveUsername(forJID: contactJID, identifier: contactIdent)
 		if let searchTerm = search, !searchTerm.isEmpty {
-			let sInfo = SessionInfo(pk: pk, partnerName: rawPartner, contactJID: contactJID, contactIdentifier: contactIdent)
+			let sInfo = SessionInfo(pk: pk, partnerName: rawPartner, contactJID: contactJID, contactIdentifier: contactIdent, username: user)
 			if !matchesTarget(session: sInfo, target: searchTerm) {
 				continue
 			}
 		}
 
 		let cleanPartner = cleanUnicode(rawPartner).replacingOccurrences(of: "\u{00A0}", with: " ")
-		let partner = cleanPartner.isEmpty ? "Unknown" : cleanPartner
+		var partner = cleanPartner.isEmpty ? "Unknown" : cleanPartner
+		if let u = user, !u.isEmpty {
+			partner = "\(partner) (@\(u))"
+		}
 
 		let dateSec: Double
 		if sessionDateSec > 2000000000.0 {
@@ -796,7 +898,8 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 	let contactJID = session.contactJID
 
 	let isGroup = contactJID.hasSuffix("@g.us")
-	print("Conversation: \(partnerName) [\(contactJID)] (showing up to \(limit) messages)")
+	let userSuffix = (session.username != nil && !session.username!.isEmpty) ? " (@\(session.username!))" : ""
+	print("Conversation: \(partnerName)\(userSuffix) [\(contactJID)] (showing up to \(limit) messages)")
 	print(String(repeating: "-", count: 80))
 
 	let lookupSQL = """
@@ -1358,7 +1461,15 @@ func draftMessage(target: String, message: String) {
 	}
 
 	NSWorkspace.shared.open(url)
-	print("Opened WhatsApp with draft composed for \(target) (\(phone)).")
+	let targetDesc: String
+	if let session = matchingSession {
+		let cleanPartner = cleanUnicode(session.partnerName).replacingOccurrences(of: "\u{00A0}", with: " ")
+		let userSuffix = (session.username != nil && !session.username!.isEmpty) ? " (@\(session.username!))" : ""
+		targetDesc = "\(cleanPartner)\(userSuffix)"
+	} else {
+		targetDesc = target
+	}
+	print("Opened WhatsApp with draft composed for \(targetDesc) (\(phone)).")
 	print("Review the draft in WhatsApp and press Enter to send.")
 }
 
