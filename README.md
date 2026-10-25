@@ -15,7 +15,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 
 | Tool | Type | Integration | What Your Agent Can Do |
 | :--- | :--- | :--- | :--- |
-| [`whatsapp`](src/whatsapp.swift) | CLI | Local SQLite + AppleScript UI | List recent/unread chats, full-text search messages, read threads, list/extract attachments & documents, and stage drafts. |
+| [`whatsapp`](src/whatsapp.swift) | CLI | Local SQLite + AppleScript UI | List recent/unread chats, full-text search messages, read threads (by contact, phone, or @username), list/extract attachments & documents, and stage drafts. |
 | [`imessage`](bin/imessage) | CLI | macOS `~/Library/Messages/chat.db` | Search and read local iMessage / SMS conversation history and recent threads. |
 | [`cal-event`](src/cal-event.swift) | CLI | macOS `EventKit` | Create, query, and manage Apple Calendar events and Apple Reminders (`--reminder`) with native iCloud sync. |
 | [`outlook`](bin/outlook) | CLI | Microsoft Graph API | Read, search, draft, and send Outlook emails from the terminal. |
@@ -96,11 +96,12 @@ Add to your agent's MCP configuration (`~/.gemini/config/mcp_config.json`, `~/.c
 # Usage Examples
 
 ```sh
-# WhatsApp: check unread messages, search history, or stage a draft
+# WhatsApp: check unread messages, search history, read threads, or stage a draft
 whatsapp unread
 whatsapp search "flight confirmation"
 whatsapp read "Alex"
-whatsapp draft --to "Alex" --message "On my way!"
+whatsapp read "@username"
+whatsapp draft --to "@username" --message "On my way!"
 
 # Calendar & Reminders: schedule an event or native Apple Reminder
 cal-event add "Dentist Appointment" --start "2026-10-20 14:00"

@@ -491,7 +491,7 @@ func resolveUsername(forJID jid: String, identifier: String?) -> String? {
 
 func cleanTargetUsername(_ target: String) -> String {
 	var t = target.trimmingCharacters(in: .whitespacesAndNewlines)
-	if t.hasPrefix("@") {
+	while t.hasPrefix("@") {
 		t.removeFirst()
 	}
 	return t
@@ -682,7 +682,12 @@ func listChats(limit: Int, unreadOnly: Bool, search: String?) {
 		let cleanPartner = cleanUnicode(rawPartner).replacingOccurrences(of: "\u{00A0}", with: " ")
 		var partner = cleanPartner.isEmpty ? "Unknown" : cleanPartner
 		if let u = user, !u.isEmpty {
-			partner = "\(partner) (@\(u))"
+			let normPartner = cleanPartner.trimmingCharacters(in: .whitespaces).lowercased()
+			if normPartner != "@\(u.lowercased())" && normPartner != u.lowercased() {
+				partner = "\(partner) (@\(u))"
+			} else if !partner.hasPrefix("@") {
+				partner = "@\(u)"
+			}
 		}
 
 		let dateSec: Double
@@ -898,7 +903,17 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 	let contactJID = session.contactJID
 
 	let isGroup = contactJID.hasSuffix("@g.us")
-	let userSuffix = (session.username != nil && !session.username!.isEmpty) ? " (@\(session.username!))" : ""
+	let userSuffix: String
+	if let u = session.username, !u.isEmpty {
+		let normPartner = partnerName.trimmingCharacters(in: .whitespaces).lowercased()
+		if normPartner != "@\(u.lowercased())" && normPartner != u.lowercased() {
+			userSuffix = " (@\(u))"
+		} else {
+			userSuffix = ""
+		}
+	} else {
+		userSuffix = ""
+	}
 	print("Conversation: \(partnerName)\(userSuffix) [\(contactJID)] (showing up to \(limit) messages)")
 	print(String(repeating: "-", count: 80))
 
@@ -1449,8 +1464,8 @@ func draftMessage(target: String, message: String) {
 	}
 
 	guard let phone = resolvedPhone, !phone.isEmpty else {
-		fputs("Error: Could not resolve '\(target)' to a valid contact, group, or phone number.\n", stderr)
-		fputs("Tip: Provide the phone number in international digits (e.g. +1234567890), a contact name, or a group name.\n", stderr)
+		fputs("Error: Could not resolve '\(target)' to a valid contact, group, @username, or phone number.\n", stderr)
+		fputs("Tip: Provide the phone number in international digits (e.g. +1234567890), a contact name, @username, or a group name.\n", stderr)
 		exit(1)
 	}
 
@@ -1464,7 +1479,17 @@ func draftMessage(target: String, message: String) {
 	let targetDesc: String
 	if let session = matchingSession {
 		let cleanPartner = cleanUnicode(session.partnerName).replacingOccurrences(of: "\u{00A0}", with: " ")
-		let userSuffix = (session.username != nil && !session.username!.isEmpty) ? " (@\(session.username!))" : ""
+		let userSuffix: String
+		if let u = session.username, !u.isEmpty {
+			let normPartner = cleanPartner.trimmingCharacters(in: .whitespaces).lowercased()
+			if normPartner != "@\(u.lowercased())" && normPartner != u.lowercased() {
+				userSuffix = " (@\(u))"
+			} else {
+				userSuffix = ""
+			}
+		} else {
+			userSuffix = ""
+		}
 		targetDesc = "\(cleanPartner)\(userSuffix)"
 	} else {
 		targetDesc = target
@@ -1895,14 +1920,14 @@ func printUsage() {
 
 	COMMANDS:
 		chats        List recent chat conversations, unread badges, and preview snippets
-		read         Read conversation history from a specific contact or group chat
+		read         Read conversation history from a specific contact, group chat, or @username
 		documents    List or search documents and media attachments (PDFs, docs, images, etc.)
 		voice-notes  List voice notes in a chat with duration, transcripts, and audio paths
 		transcribe   Batch transcribe voice notes in a chat locally and cache them
 		play         Play a voice note from a chat via native macOS audio player (afplay)
 		search       Search all messages across all chats (including voice note transcripts)
 		unread       Quickly list only chats that have unread messages
-		draft        Open WhatsApp with a draft message pre-filled to a contact or phone number
+		draft        Open WhatsApp with a draft message pre-filled to a contact, phone number, or @username
 		help         Show this help message
 
 	SUBCOMMAND OPTIONS:
@@ -1911,11 +1936,11 @@ func printUsage() {
 		whatsapp chats [--limit <N>] [--unread] [--search <term>]
 		  --limit <N>      Maximum number of chats to display (default: 20)
 		  --unread         Filter to only chats with unread messages > 0
-		  --search <term>  Filter chats by contact name or group title
+		  --search <term>  Filter chats by contact name, group title, or @username
 
 	  read:
-		whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]
-		  <contact/phone>  Contact name, group name, or phone number to read
+		whatsapp read <contact/phone/username> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]
+		  <contact/phone/username> Contact name, group name, phone number, or @username to read
 		  --limit <N>      Number of messages to retrieve (default: 25)
 		  --all            Display full multiline message content without truncating
 		  --transcribe, -t Transcribe any un-cached voice notes on-the-fly and display them
@@ -1923,9 +1948,9 @@ func printUsage() {
 		  --lang, -l <code> Language code or name for speech recognition (e.g. es, en, fr; default: en-US)
 
 	  documents:
-		whatsapp documents [<contact/phone>] [--type <doc|image|video|audio|all>] [--min-size <MB>] [--ext <ext>] [--search <term>] [--limit <N>]
+		whatsapp documents [<contact/phone/username>] [--type <doc|image|video|audio|all>] [--min-size <MB>] [--ext <ext>] [--search <term>] [--limit <N>]
 		  (Aliases: docs, files, attachments)
-		  <contact/phone>  Optional: filter to a specific contact or group
+		  <contact/phone/username> Optional: filter to a specific contact, group, or @username
 		  --type <type>    Filter media: doc (default), image, video, audio, all
 		  --min-size <MB>  Filter to files larger than N megabytes
 		  --ext <ext>      Filter by file extension (e.g. --ext pdf)
@@ -1933,29 +1958,29 @@ func printUsage() {
 		  --limit <N>      Number of items to retrieve (default: 25)
 
 	  voice-notes:
-		whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe] [--retranscribe] [--lang <code>]
-		  <contact/phone>  Contact name, group name, or phone number to list voice notes from
+		whatsapp voice-notes <contact/phone/username> [--limit <N>] [--transcribe] [--retranscribe] [--lang <code>]
+		  <contact/phone/username> Contact name, group name, phone number, or @username to list voice notes from
 		  --limit <N>      Number of voice notes to retrieve (default: 20)
 		  --transcribe, -t Transcribe any un-cached voice notes and show transcripts in table
 		  --retranscribe   Force re-transcribing voice notes even if cached
 		  --lang, -l <code> Language code or name for speech recognition (e.g. es, en; default: en-US)
 
 	  transcribe:
-		whatsapp transcribe <contact/phone> [--limit <N>] [--retranscribe] [--lang <code>]
-		  <contact/phone>  Contact name, group name, or phone number
+		whatsapp transcribe <contact/phone/username> [--limit <N>] [--retranscribe] [--lang <code>]
+		  <contact/phone/username> Contact name, group name, phone number, or @username
 		  --limit <N>      Number of voice notes to transcribe (default: 10)
 		  --retranscribe   Force re-transcribing voice notes even if cached
 		  --lang, -l <code> Language code or name for speech recognition (e.g. es, en; default: en-US)
 
 	  play:
-		whatsapp play <contact/phone> [--index <N>]
-		  <contact/phone>  Contact name, group name, or phone number
+		whatsapp play <contact/phone/username> [--index <N>]
+		  <contact/phone/username> Contact name, group name, phone number, or @username
 		  --index <N>      Voice note index (1 = latest, 2 = 2nd latest, etc. default: 1)
 
 	  search:
 		whatsapp search <query> [--contact <name>] [--days <N>] [--limit <N>]
 		  <query>          Search term in message text, attachment filenames, and voice note transcripts
-		  --contact <name> Scope search to a specific contact or group name
+		  --contact <name> Scope search to a specific contact, group name, or @username
 		  --days <N>       Only search messages from the past N days
 		  --limit <N>      Limit results (default: 25)
 
@@ -1964,9 +1989,9 @@ func printUsage() {
 		  Shows up to 50 chats with pending unread messages.
 
 	  draft:
-		whatsapp draft --to <contact/phone> --message <text>
-		  --to <target>    Recipient phone number (e.g. +1234567890) or contact name.
-		                   Contact names are automatically resolved from your local chat history.
+		whatsapp draft --to <contact/phone/username> --message <text>
+		  --to <target>    Recipient phone number (e.g. +1234567890), contact name, or @username.
+		                   Contact names and usernames are automatically resolved from your local chat history.
 		  --message <text> Message text to populate in the WhatsApp compose box.
 		  Note: This brings WhatsApp to the foreground with the chat opened and message pre-filled,
 		        allowing you to review before pressing Return to send.
@@ -1975,6 +2000,7 @@ func printUsage() {
 		whatsapp chats --limit 10
 		whatsapp unread
 		whatsapp read "Jane Doe" --limit 15
+		whatsapp read "@johndoe" --limit 15
 		whatsapp read "Family" --all
 		whatsapp documents --ext pdf
 		whatsapp documents "+1234567890"
@@ -1984,6 +2010,7 @@ func printUsage() {
 		whatsapp transcribe "Jane Doe" --limit 5
 		whatsapp play "Jane Doe" --index 1
 		whatsapp search "dinner" --days 14
+		whatsapp draft --to "@johndoe" --message "Hey, are we still on for lunch?"
 		whatsapp draft --to "Jane Doe" --message "Hey, are we still on for lunch?"
 		whatsapp draft --to "+1234567890" --message "Hello from my terminal!"
 	"""
@@ -2033,7 +2060,7 @@ func main() {
 
 	case "read":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp read <contact/phone> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]\n", stderr)
+			fputs("Usage: whatsapp read <contact/phone/username> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]\n", stderr)
 			return
 		}
 		let target = args[1]
@@ -2104,7 +2131,7 @@ func main() {
 
 	case "voice-notes", "voicenotes", "vn":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp voice-notes <contact/phone> [--limit <N>] [--transcribe] [--retranscribe] [--lang <code>]\n", stderr)
+			fputs("Usage: whatsapp voice-notes <contact/phone/username> [--limit <N>] [--transcribe] [--retranscribe] [--lang <code>]\n", stderr)
 			return
 		}
 		let target = args[1]
@@ -2135,7 +2162,7 @@ func main() {
 
 	case "transcribe":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp transcribe <contact/phone> [--limit <N>] [--retranscribe] [--lang <code>]\n", stderr)
+			fputs("Usage: whatsapp transcribe <contact/phone/username> [--limit <N>] [--retranscribe] [--lang <code>]\n", stderr)
 			return
 		}
 		let target = args[1]
@@ -2162,7 +2189,7 @@ func main() {
 
 	case "play", "listen":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp play <contact/phone> [--index <N>]\n", stderr)
+			fputs("Usage: whatsapp play <contact/phone/username> [--index <N>]\n", stderr)
 			return
 		}
 		let target = args[1]
@@ -2224,7 +2251,7 @@ func main() {
 		}
 
 		guard let target = to, let msg = message else {
-			fputs("Usage: whatsapp draft --to <contact/phone> --message <text>\n", stderr)
+			fputs("Usage: whatsapp draft --to <contact/phone/username> --message <text>\n", stderr)
 			return
 		}
 		draftMessage(target: target, message: msg)
