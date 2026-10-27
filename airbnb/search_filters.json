@@ -1,0 +1,10 @@
+{
+	"defaults": {
+		"place_type": "Entire home/apt",
+		"currency": "CAD",
+		"language": "en",
+		"check_in": "2026-10-03",
+		"check_out": "2026-10-21",
+		"zoom_value": 10
+	}
+}

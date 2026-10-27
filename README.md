@@ -23,6 +23,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`brave-mcp`](bin/brave-mcp) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in Brave or standalone stealth Chromium. |
 | [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, auto-restore, and gracefully cull stale (>6h) `agy` sessions in iTerm2 while keeping tabs open. |
 | [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
+| [`airbnb`](airbnb/) | CLI | Airbnb API + Climate/Sentiment Engine | Search, score, and benchmark listings against nomad criteria (Wi-Fi, kitchen, climate/heating, noise, discounts). |
 
 # Quickstart
 
@@ -52,6 +53,7 @@ apple-pay --help
 brave-mcp --help
 agy-sessions --help
 antigravity-shipper --help
+airbnb --help
 ```
 
 # Stealth Browser MCP (`brave-mcp`)

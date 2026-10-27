@@ -1,0 +1,104 @@
+{
+	"metrics": {
+		"amenities": {
+			"weight": 0.4,
+			"function": "percentage_match",
+			"params": {
+				"bonus_amenities": [
+					"ac",
+					"dedicated_workspace",
+					"washer",
+					"dryer"
+				]
+			}
+		},
+		"value": {
+			"weight": 0.3,
+			"function": "market_relative",
+			"params": {
+				"target_ratio": 0.8,
+				"base_ratio": 1.0
+			}
+		},
+		"sentiment": {
+			"weight": 0.3,
+			"function": "keyword_analysis",
+			"params": {
+				"positive_keywords": [
+					"clean",
+					"quiet",
+					"comfortable",
+					"tranquilo",
+					"tranquila",
+					"silencioso",
+					"silenciosa",
+					"peaceful"
+				],
+				"negative_keywords": [
+					"loud",
+					"dirty",
+					"smell",
+					"ruido",
+					"ruidoso",
+					"ruidosa",
+					"bulla",
+					"tráfico",
+					"trafico",
+					"noisy",
+					"construcción",
+					"construccion"
+				]
+			}
+		}
+	},
+	"penalties": [
+		{
+			"id": "inadequate_kitchen",
+			"name": "Inadequate Kitchen (Kitchenette/No Stove)",
+			"type": "kitchen_tier",
+			"disallowed_tiers": [
+				"kitchenette",
+				"no_kitchen"
+			],
+			"multiplier": 0.65,
+			"flag": "[FLAG: Inadequate Kitchen]"
+		},
+		{
+			"id": "missing_ac",
+			"name": "Missing Air Conditioning",
+			"type": "missing_amenity",
+			"amenity": "ac",
+			"multiplier": 0.9,
+			"flag": "[FLAG: No AC]"
+		},
+		{
+			"name": "Low Review Count",
+			"condition": {
+				"field": "review_count",
+				"operator": "<",
+				"value": 10
+			},
+			"multiplier": 0.5
+		},
+		{
+			"name": "Low Review Score",
+			"condition": {
+				"field": "review_score",
+				"operator": "<",
+				"value": 4.5
+			},
+			"multiplier": 0.5
+		}
+	],
+	"hard_filters": {
+		"must_have_amenities": [
+			"wifi",
+			"kitchen"
+		]
+	},
+	"scoring_thresholds": {
+		"excellent": 80,
+		"good": 60,
+		"pass": 40
+	}
+}

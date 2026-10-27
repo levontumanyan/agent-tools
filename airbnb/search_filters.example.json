@@ -1,0 +1,26 @@
+{
+	"place_type": "Entire home/apt",
+	"check_in": "2026-05-01",
+	"check_out": "2026-05-05",
+	"ne_lat": 40.73061,
+	"ne_long": -73.935242,
+	"sw_lat": 40.712776,
+	"sw_long": -74.005974,
+	"zoom_value": 12,
+	"price_min": 0,
+	"price_max": 200,
+	"amenities": [
+		4,
+		7,
+		8
+	],
+	"free_cancellation": true,
+	"adults": 1,
+	"children": 0,
+	"infants": 0,
+	"min_bedrooms": 1,
+	"min_beds": 1,
+	"min_bathrooms": 1,
+	"currency": "CAD",
+	"language": "en"
+}

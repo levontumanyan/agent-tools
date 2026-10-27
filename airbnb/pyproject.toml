@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airbnb"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+	"pyairbnb>=0.0.12",
+	"geopy>=2.4.1",
+	"python-dotenv>=1.0.1",
+	"tqdm>=4.66.0",
+	"cryptography>=42.0.0",
+]
+
+[project.scripts]
+airbnb = "main:main"
+
+[tool.setuptools]
+py-modules = ["amenities", "auth", "climate", "config", "fetcher", "main", "reporter", "scorer", "utils"]
+package-dir = {"" = "src"}
+
+[tool.ruff]
+# Target version for your Python environment
+target-version = "py311"
+
+[tool.ruff.format]
+indent-style = "tab"
+quote-style = "double"
+
+[tool.ruff.lint]
+# Enable Pyflakes (F), Error (E), and Implicit String Concatenation (ISC)
+select = ["F", "E", "ISC", "I"]
+# E501 is the "Line too long" rule. Adding it here kills the warning.
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-implicit-str-concat]
+# Ensure it catches multi-line implicit concatenations
+allow-multiline = false
+
+[lint.isort]
+combine-as-imports = true
+
+[dependency-groups]
+dev = [
+	"pytest>=9.0.3",
+	"pytest-mock>=3.15.1",
+	"ruff>=0.15.11",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+pythonpath = ["src"]

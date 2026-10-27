@@ -1,0 +1,34 @@
+{
+	"essentials": {
+		"wifi": 4,
+		"kitchen": 8,
+		"washer": 33,
+		"dryer": 34,
+		"ac": 5,
+		"air_conditioning": 5,
+		"heating": 30,
+		"dedicated_workspace": 47,
+		"tv": 1,
+		"iron": 40
+	},
+	"features": {
+		"pool": 7,
+		"free_parking": 9,
+		"gym": 15,
+		"hot_tub": 25,
+		"elevator": 21,
+		"ev_charger": 41
+	},
+	"safety": {
+		"smoke_alarm": 35,
+		"carbon_monoxide_alarm": 36,
+		"fire_extinguisher": 39,
+		"first_aid_kit": 37
+	},
+	"services": {
+		"breakfast": 16,
+		"self_check_in": 51,
+		"luggage_drop_off": 73,
+		"long_term_stays": 85
+	}
+}
