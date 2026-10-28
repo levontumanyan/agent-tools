@@ -253,3 +253,29 @@ def test_generate_survey_report(tmp_path):
 		assert len(loaded) == 1
 		assert loaded[0]["city"] == "Buenos Aires, Argentina"
 		assert loaded[0]["median_total"] == 1500.0
+
+
+def test_format_calendar_view():
+	"""Verify format_calendar_view renders grid and open window summaries."""
+	from src.reporter import format_calendar_view
+
+	mock_months = [
+		{
+			"month": 11,
+			"year": 2026,
+			"days": [
+				{"calendarDate": "2026-11-01", "available": False},
+				{"calendarDate": "2026-11-02", "available": False},
+				{"calendarDate": "2026-11-03", "available": True, "price": {"localPriceFormatted": "$50"}},
+				{"calendarDate": "2026-11-04", "available": True, "price": {"localPriceFormatted": "$50"}},
+			],
+		}
+	]
+
+	rendered = format_calendar_view(mock_months, use_color=False)
+	assert "November 2026" in rendered
+	assert "Mo   Tu   We   Th   Fr   Sa   Su" in rendered
+	assert "2 available, 28 blocked" in rendered
+	assert "Open Window(s):" in rendered
+	assert "2026-11-03" in rendered
+

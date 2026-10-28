@@ -320,6 +320,19 @@ def main():
 		default=None,
 		help="Filter guest reviews by keyword or regex (implies --reviews)",
 	)
+	parser.add_argument(
+		"--calendar",
+		"--cal",
+		action="store_true",
+		help="Display availability calendar for a listing (requires --room)",
+	)
+	parser.add_argument(
+		"--calendar_months",
+		"--calendar-months",
+		type=int,
+		default=3,
+		help="Number of months to display for availability calendar (default: 3)",
+	)
 
 	args = parser.parse_args()
 
@@ -471,6 +484,28 @@ def main():
 		coords = details.get("coordinates") or {}
 		desc_text = (details.get("description") or "").strip()
 
+		cal_data = None
+		if args.calendar:
+			from fetcher import get_listing_calendar
+
+			start_month = None
+			start_year = None
+			if args.check_in:
+				try:
+					dt_ci = datetime.strptime(args.check_in, "%Y-%m-%d")
+					start_month = dt_ci.month
+					start_year = dt_ci.year
+				except Exception:
+					pass
+
+			cal_data = get_listing_calendar(
+				room_id,
+				month=start_month,
+				year=start_year,
+				count=args.calendar_months,
+				currency=args.currency,
+			)
+
 		payload = {
 			"id": room_id,
 			"name": title_str,
@@ -494,6 +529,7 @@ def main():
 			"reviews": filtered_reviews
 			if (args.reviews or args.search_reviews)
 			else [],
+			"calendar": cal_data if args.calendar else None,
 		}
 
 		if args.json:
@@ -612,9 +648,14 @@ def main():
 						if x
 					)
 					print(f"{idx}. [{meta}] {rev['comment']}")
-			else:
+			if args.calendar and cal_data:
+				from reporter import format_calendar_view
+
+				print("\n## Availability Calendar")
+				print(format_calendar_view(cal_data))
+			elif not (args.reviews or args.search_reviews):
 				print(
-					f'\n(Tip: pass --reviews to list all {len(raw_reviews)} reviews, or --search-reviews "<keyword>" to filter)'
+					f'\n(Tip: pass --calendar to view availability, --reviews to list all {len(raw_reviews)} reviews)'
 				)
 		return
 

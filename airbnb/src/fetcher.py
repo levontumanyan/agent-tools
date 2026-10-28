@@ -3,6 +3,7 @@ import logging
 import re
 import threading
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 import pyairbnb
 import pyairbnb.api
@@ -398,6 +399,65 @@ def search_listings(
 
 	except Exception as e:
 		logger.error(f"Error fetching listings: {e}")
+		return []
+
+
+def get_listing_calendar(room_id, month=None, year=None, count=3, currency="CAD"):
+	"""
+	Fetch availability calendar for a listing using Airbnb's PdpAvailabilityCalendar GraphQL endpoint.
+	Returns a list of month dicts, each containing month, year, and days with availability.
+	"""
+	now = datetime.now()
+	month = int(month) if month else now.month
+	year = int(year) if year else now.year
+	count = int(count) if count else 3
+
+	api_key = _robust_pyairbnb_api_get()
+	headers = {
+		"Accept": "application/json",
+		"Content-Type": "application/json",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"X-Airbnb-Api-Key": api_key,
+	}
+	if AIRBNB_COOKIE:
+		headers["Cookie"] = AIRBNB_COOKIE
+
+	variables = {
+		"request": {
+			"count": count,
+			"listingId": str(room_id),
+			"month": month,
+			"year": year,
+		}
+	}
+	extensions = {
+		"persistedQuery": {
+			"version": 1,
+			"sha256Hash": "8f08e03c7bd16fcad3c92a3592c19a8b559a0d0855a84028d1163d4733ed9ade",
+		}
+	}
+	params = {
+		"operationName": "PdpAvailabilityCalendar",
+		"locale": "en",
+		"currency": currency,
+		"variables": json.dumps(variables),
+		"extensions": json.dumps(extensions),
+	}
+	url = f"https://www.airbnb.ca/api/v3/PdpAvailabilityCalendar/8f08e03c7bd16fcad3c92a3592c19a8b559a0d0855a84028d1163d4733ed9ade/?{urlencode(params)}"
+
+	session = _get_session()
+	try:
+		response = session.get(url, headers=headers)
+		response.raise_for_status()
+		data = response.json()
+		return (
+			data.get("data", {})
+			.get("merlin", {})
+			.get("pdpAvailabilityCalendar", {})
+			.get("calendarMonths", [])
+		)
+	except Exception as e:
+		logger.error(f"Error fetching calendar for room {room_id}: {e}")
 		return []
 
 

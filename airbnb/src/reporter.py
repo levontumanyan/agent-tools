@@ -336,3 +336,109 @@ def generate_survey_report(survey_results, csv_path=None, json_path=None):
 			logger.info(f"Survey CSV report saved at {csv_path}")
 		except Exception as e:
 			logger.error(f"Failed to save survey CSV report: {e}")
+
+
+def format_calendar_view(calendar_months, use_color=True):
+	"""
+	Formats calendar month availability into a clean visual ASCII grid with range summaries.
+	"""
+	import calendar
+	from datetime import datetime
+
+	if not calendar_months:
+		return "No calendar availability data returned."
+
+	output = []
+	all_days = []
+
+	for m in calendar_months:
+		month = m.get("month")
+		year = m.get("year")
+		if not month or not year:
+			continue
+
+		month_name = calendar.month_name[month]
+		days_list = m.get("days", [])
+		days_map = {d.get("calendarDate"): d for d in days_list if d.get("calendarDate")}
+
+		cal = calendar.Calendar(firstweekday=0)  # Monday first
+		weeks = cal.monthdayscalendar(year, month)
+
+		avail_count = 0
+		blocked_count = 0
+
+		grid_lines = []
+		grid_lines.append(f"\n### {month_name} {year}")
+		grid_lines.append(" Mo   Tu   We   Th   Fr   Sa   Su")
+
+		for week in weeks:
+			row_str = []
+			for day in week:
+				if day == 0:
+					row_str.append("    ")
+				else:
+					date_str = f"{year:04d}-{month:02d}-{day:02d}"
+					d_info = days_map.get(date_str, {})
+					is_avail = d_info.get("available", False)
+					price_fmt = (
+						d_info.get("price", {}).get("localPriceFormatted")
+						if d_info.get("price")
+						else None
+					)
+					all_days.append((date_str, is_avail, price_fmt))
+					if is_avail:
+						avail_count += 1
+						if use_color:
+							row_str.append(f"\033[92m{day:>3} \033[0m")
+						else:
+							row_str.append(f"{day:>3} ")
+					else:
+						blocked_count += 1
+						if use_color:
+							row_str.append(f"\033[90m{day:>2}· \033[0m")
+						else:
+							row_str.append(f"{day:>2}· ")
+			grid_lines.append("".join(row_str).rstrip())
+
+		grid_lines.append(
+			f"Status: {avail_count} available, {blocked_count} blocked (· = blocked)"
+		)
+		output.append("\n".join(grid_lines))
+
+	# Compute open windows across the full range
+	open_windows = []
+	current_start = None
+	current_price = None
+
+	for dt_str, is_avail, p_fmt in all_days:
+		if is_avail:
+			if current_start is None:
+				current_start = dt_str
+				current_price = p_fmt
+		else:
+			if current_start is not None:
+				open_windows.append((current_start, dt_str, current_price))
+				current_start = None
+				current_price = None
+	if current_start is not None:
+		open_windows.append((current_start, all_days[-1][0], current_price))
+
+	summary_lines = ["\n## Availability Summary"]
+	if open_windows:
+		summary_lines.append("Open Window(s):")
+		for start_dt, end_dt, p_fmt in open_windows:
+			try:
+				d1 = datetime.strptime(start_dt, "%Y-%m-%d")
+				d2 = datetime.strptime(end_dt, "%Y-%m-%d")
+				nights = max(1, (d2 - d1).days)
+				pr_note = f", ~{p_fmt}/nt" if p_fmt else ""
+				summary_lines.append(f"  • {start_dt} → {end_dt} ({nights} nights{pr_note})")
+			except Exception:
+				summary_lines.append(f"  • {start_dt} → {end_dt}")
+	else:
+		summary_lines.append(
+			"No open dates found in the queried range (entire period blocked)."
+		)
+
+	return "\n".join(output) + "\n" + "\n".join(summary_lines)
+

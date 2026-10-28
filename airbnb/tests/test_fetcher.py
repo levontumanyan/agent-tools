@@ -74,3 +74,40 @@ def test_search_listings_params(mocker):
 	assert kwargs["ne_long"] == 2
 	assert kwargs["price_min"] == 100
 	assert kwargs["price_max"] == 200
+
+
+def test_get_listing_calendar(mocker):
+	"""Verify get_listing_calendar executes GraphQL query and returns calendar months."""
+	mock_session = mocker.MagicMock()
+	mock_response = mocker.MagicMock()
+	mock_response.json.return_value = {
+		"data": {
+			"merlin": {
+				"pdpAvailabilityCalendar": {
+					"calendarMonths": [
+						{
+							"month": 11,
+							"year": 2026,
+							"days": [
+								{"calendarDate": "2026-11-01", "available": False},
+								{"calendarDate": "2026-11-02", "available": True},
+							],
+						}
+					]
+				}
+			}
+		}
+	}
+	mock_session.get.return_value = mock_response
+	mocker.patch("src.fetcher._get_session", return_value=mock_session)
+	mocker.patch("src.fetcher._robust_pyairbnb_api_get", return_value="dummy_key")
+
+	from src.fetcher import get_listing_calendar
+
+	months = get_listing_calendar("12345", month=11, year=2026, count=1)
+	assert len(months) == 1
+	assert months[0]["month"] == 11
+	assert len(months[0]["days"]) == 2
+	assert months[0]["days"][1]["available"] is True
+	mock_session.get.assert_called_once()
+
