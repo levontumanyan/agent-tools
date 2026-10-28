@@ -16,7 +16,7 @@
 # Currency & Domain Standards
 
 - **Primary Currency**: **ALWAYS** evaluate, search, and report Airbnb prices in **CAD** unless the user explicitly requests otherwise.
-- **Listing URLs**: **ALWAYS** format Airbnb listing URLs using the Canadian domain: `https://www.airbnb.ca/rooms/<id>`. Never use `airbnb.com`.
+- **Listing URLs**: **ALWAYS** format Airbnb listing URLs using the Canadian domain: `https://www.airbnb.ca/rooms/<id>`. When dates are known or evaluated, **ALWAYS** attach `?check_in=YYYY-MM-DD&check_out=YYYY-MM-DD&adults=1` directly to the URL. Never use `airbnb.com`.
 - **Nightly Rate Requirement**: **ALWAYS** explicitly output and report the nightly rate (e.g. CAD $XX.XX/night or /nt) alongside total prices in CLI outputs and agent summaries, whether presenting a single listing or multiple listings.
 
 # Development Workflow Mandates
