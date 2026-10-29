@@ -3,6 +3,7 @@ import Foundation
 import SQLite3
 import AppKit
 import Speech
+import Vision
 
 // MARK: - Constants & Helpers
 
@@ -192,6 +193,11 @@ func getTranscriptDB() -> OpaquePointer? {
 		created_at TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_transcripts_partner ON transcripts(chat_partner);
+	CREATE TABLE IF NOT EXISTS sticker_cache (
+		media_path TEXT PRIMARY KEY,
+		info TEXT,
+		created_at TEXT
+	);
 	"""
 	sqlite3_exec(db, createSQL, nil, nil, nil)
 	return db
@@ -235,6 +241,155 @@ func saveCachedTranscript(messageId: String, mediaPath: String, chatPartner: Str
 	sqlite3_bind_int(stmt, 6, Int32(duration))
 	sqlite3_bind_text(stmt, 7, (transcript as NSString).utf8String, -1, nil)
 	sqlite3_step(stmt)
+}
+
+func getCachedSticker(mediaPath: String) -> String? {
+	guard let db = getTranscriptDB() else { return nil }
+	defer { sqlite3_close(db) }
+
+	let query = "SELECT info FROM sticker_cache WHERE media_path = ? LIMIT 1;"
+	var stmt: OpaquePointer?
+	guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else { return nil }
+	defer { sqlite3_finalize(stmt) }
+
+	sqlite3_bind_text(stmt, 1, (mediaPath as NSString).utf8String, -1, nil)
+	if sqlite3_step(stmt) == SQLITE_ROW {
+		if let text = sqlite3_column_text(stmt, 0).flatMap({ String(cString: $0) }) {
+			return text
+		}
+	}
+	return nil
+}
+
+func saveCachedSticker(mediaPath: String, info: String) {
+	guard let db = getTranscriptDB() else { return }
+	defer { sqlite3_close(db) }
+
+	let insertSQL = """
+	INSERT OR REPLACE INTO sticker_cache (media_path, info, created_at)
+	VALUES (?, ?, datetime('now'));
+	"""
+	var stmt: OpaquePointer?
+	guard sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nil) == SQLITE_OK else { return }
+	defer { sqlite3_finalize(stmt) }
+
+	sqlite3_bind_text(stmt, 1, (mediaPath as NSString).utf8String, -1, nil)
+	sqlite3_bind_text(stmt, 2, (info as NSString).utf8String, -1, nil)
+	sqlite3_step(stmt)
+}
+
+func extractWebPMetadata(from path: String) -> (pack: String?, emojis: [String]?) {
+	guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return (nil, nil) }
+
+	let markers = ["{\"sticker-pack", "{\"emojis", "\"sticker-pack-name\""]
+	var jsonStart: Data.Index? = nil
+	for m in markers {
+		if let r = data.range(of: Data(m.utf8)) {
+			var start = r.lowerBound
+			while start > data.startIndex && data[start] != UInt8(ascii: "{") && start > r.lowerBound - 100 {
+				start = data.index(before: start)
+			}
+			if data[start] == UInt8(ascii: "{") {
+				jsonStart = start
+				break
+			}
+		}
+	}
+
+	guard let start = jsonStart else { return (nil, nil) }
+
+	var depth = 0
+	var inString = false
+	var isEscaped = false
+	var end: Data.Index? = nil
+
+	for idx in start..<data.endIndex {
+		let byte = data[idx]
+		if isEscaped {
+			isEscaped = false
+			continue
+		}
+		if byte == UInt8(ascii: "\\") && inString {
+			isEscaped = true
+			continue
+		}
+		if byte == UInt8(ascii: "\"") {
+			inString = !inString
+			continue
+		}
+		if !inString {
+			if byte == UInt8(ascii: "{") {
+				depth += 1
+			} else if byte == UInt8(ascii: "}") {
+				depth -= 1
+				if depth == 0 {
+					end = idx
+					break
+				}
+			}
+		}
+	}
+
+	guard let finish = end else { return (nil, nil) }
+	let jsonSlice = data.subdata(in: start..<data.index(after: finish))
+	guard let dict = try? JSONSerialization.jsonObject(with: jsonSlice) as? [String: Any] else {
+		return (nil, nil)
+	}
+
+	var pack = (dict["sticker-pack-name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+	if pack?.isEmpty == true { pack = nil }
+
+	var emojis: [String]? = nil
+	if let emArr = dict["emojis"] as? [String], !emArr.isEmpty {
+		emojis = emArr
+	}
+
+	return (pack, emojis)
+}
+
+func ocrImage(filePath: String, lang: String? = nil) -> String? {
+	guard let image = NSImage(contentsOfFile: filePath),
+	      let tiffData = image.tiffRepresentation,
+	      let bitmap = NSBitmapImageRep(data: tiffData),
+	      let cgImage = bitmap.cgImage else {
+		return nil
+	}
+
+	let request = VNRecognizeTextRequest()
+	request.recognitionLevel = .accurate
+	request.usesLanguageCorrection = true
+	if let l = lang, !l.isEmpty {
+		request.recognitionLanguages = [l, "es-419", "es-ES", "en-US"]
+	} else {
+		request.recognitionLanguages = ["es-419", "es-ES", "en-US"]
+	}
+
+	let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+	try? handler.perform([request])
+
+	guard let results = request.results, !results.isEmpty else { return nil }
+	let lines = results.compactMap { $0.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines) }
+		.filter { !$0.isEmpty }
+	guard !lines.isEmpty else { return nil }
+	return lines.joined(separator: " ")
+}
+
+func inspectSticker(filePath: String, lang: String? = nil) -> String {
+	var parts: [String] = []
+
+	if let ocr = ocrImage(filePath: filePath, lang: lang), !ocr.isEmpty {
+		parts.append("\"\(ocr)\"")
+	}
+
+	let (pack, emojis) = extractWebPMetadata(from: filePath)
+	if let ems = emojis, !ems.isEmpty {
+		parts.append(ems.joined(separator: " "))
+	}
+	if let p = pack, !p.isEmpty {
+		parts.append("pack: \(p)")
+	}
+
+	return parts.joined(separator: " • ")
 }
 
 func resolveSpeechRecognizer(localeIdentifier: String?) -> SFSpeechRecognizer? {
@@ -887,7 +1042,7 @@ func parseContextInfo(data: Data) -> (stanzaId: String?, participant: String?, q
 
 // MARK: - Subcommand: Read
 
-func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, retranscribe: Bool = false, lang: String? = nil) {
+func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, retranscribe: Bool = false, lang: String? = nil, stickers: Bool = false) {
 	guard let db = getDB() else { return }
 	defer { sqlite3_close(db) }
 
@@ -926,7 +1081,7 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 	           NULLIF(gm.ZFIRSTNAME, '')
 	       ) AS SENDERNAME,
 	       m.ZTEXT, m.ZMESSAGETYPE, mi.ZTITLE, mi.ZVCARDNAME, mi.ZVCARDSTRING,
-	       gm.ZMEMBERJID
+	       gm.ZMEMBERJID, mi.ZMEDIALOCALPATH
 	FROM ZWAMESSAGE m
 	LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
 	LEFT JOIN ZWAPROFILEPUSHNAME ppn ON gm.ZMEMBERJID = ppn.ZJID
@@ -1137,7 +1292,24 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 			body = caption != nil ? "[View Once Media] \(caption!)" : "[View Once Media]"
 		case 15:
 			if let p = mediaPath, let full = resolveMediaPath(p), FileManager.default.fileExists(atPath: full) {
-				body = "[Sticker • \(full)]"
+				if stickers {
+					let cached = retranscribe ? nil : getCachedSticker(mediaPath: p)
+					let info: String
+					if let c = cached {
+						info = c
+					} else {
+						let extracted = inspectSticker(filePath: full, lang: lang)
+						saveCachedSticker(mediaPath: p, info: extracted)
+						info = extracted
+					}
+					if !info.isEmpty {
+						body = "[Sticker • \(info) • \(full)]"
+					} else {
+						body = "[Sticker • \(full)]"
+					}
+				} else {
+					body = "[Sticker • \(full)]"
+				}
 			} else {
 				body = "[Sticker]"
 			}
@@ -1195,7 +1367,14 @@ func readChat(target: String, limit: Int, full: Bool, transcribe: Bool = false, 
 										quotedText = cName != nil ? "[Contact: \(cName!)]" : "[Contact]"
 									case 5: quotedText = "[Location]"
 									case 8: quotedText = "[\(qTitle ?? "Document")]"
-									case 15: quotedText = "[Sticker]"
+									case 15:
+										if stickers, let qPath = sqlite3_column_text(lStmt, 8).flatMap({ String(cString: $0) }),
+										   let qFull = resolveMediaPath(qPath), FileManager.default.fileExists(atPath: qFull) {
+											let info = getCachedSticker(mediaPath: qPath) ?? inspectSticker(filePath: qFull, lang: lang)
+											quotedText = !info.isEmpty ? "[Sticker • \(info)]" : "[Sticker]"
+										} else {
+											quotedText = "[Sticker]"
+										}
 									case 19: quotedText = "[Poll]"
 									default: quotedText = "[Media]"
 									}
@@ -1939,13 +2118,14 @@ func printUsage() {
 		  --search <term>  Filter chats by contact name, group title, or @username
 
 	  read:
-		whatsapp read <contact/phone/username> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]
+		whatsapp read <contact/phone/username> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--stickers] [--lang <code>]
 		  <contact/phone/username> Contact name, group name, phone number, or @username to read
 		  --limit <N>      Number of messages to retrieve (default: 25)
 		  --all            Display full multiline message content without truncating
 		  --transcribe, -t Transcribe any un-cached voice notes on-the-fly and display them
-		  --retranscribe   Force re-transcribing voice notes even if cached
-		  --lang, -l <code> Language code or name for speech recognition (e.g. es, en, fr; default: en-US)
+		  --retranscribe   Force re-transcribing voice notes and stickers even if cached
+		  --stickers, -s   Inspect stickers (OCR meme text, emojis, pack name) on-the-fly
+		  --lang, -l <code> Language code or name for speech recognition and OCR (e.g. es, en, fr; default: en-US)
 
 	  documents:
 		whatsapp documents [<contact/phone/username>] [--type <doc|image|video|audio|all>] [--min-size <MB>] [--ext <ext>] [--search <term>] [--limit <N>]
@@ -2000,6 +2180,7 @@ func printUsage() {
 		whatsapp chats --limit 10
 		whatsapp unread
 		whatsapp read "Jane Doe" --limit 15
+		whatsapp read "Jane Doe" --stickers
 		whatsapp read "@johndoe" --limit 15
 		whatsapp read "Family" --all
 		whatsapp documents --ext pdf
@@ -2060,7 +2241,7 @@ func main() {
 
 	case "read":
 		guard args.count >= 2 else {
-			fputs("Usage: whatsapp read <contact/phone/username> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--lang <code>]\n", stderr)
+			fputs("Usage: whatsapp read <contact/phone/username> [--limit <N>] [--all] [--transcribe] [--retranscribe] [--stickers] [--lang <code>]\n", stderr)
 			return
 		}
 		let target = args[1]
@@ -2068,6 +2249,7 @@ func main() {
 		var full = false
 		var transcribe = false
 		var retranscribe = false
+		var stickers = false
 		var lang: String? = nil
 
 		var i = 2
@@ -2084,6 +2266,9 @@ func main() {
 			} else if args[i] == "--retranscribe" || args[i] == "--force" {
 				retranscribe = true
 				i += 1
+			} else if args[i] == "--stickers" || args[i] == "-s" {
+				stickers = true
+				i += 1
 			} else if (args[i] == "--lang" || args[i] == "-l" || args[i] == "--locale"), i + 1 < args.count {
 				lang = args[i + 1]
 				i += 2
@@ -2091,7 +2276,7 @@ func main() {
 				i += 1
 			}
 		}
-		readChat(target: target, limit: limit, full: full, transcribe: transcribe, retranscribe: retranscribe, lang: lang)
+		readChat(target: target, limit: limit, full: full, transcribe: transcribe, retranscribe: retranscribe, lang: lang, stickers: stickers)
 
 	case "documents", "document", "docs", "files", "attachments", "attachment":
 		var target: String? = nil
