@@ -33,7 +33,7 @@ class BraveSessionManager:
 		self._playwright = None
 		self._browser: Optional[Browser] = None
 		self._context: Optional[BrowserContext] = None
-		self._active_tab_index: int = 0
+		self._active_page: Optional[Page] = None
 		self._idle_task: Optional[asyncio.Task] = None
 
 	def _touch_activity(self):
@@ -65,6 +65,7 @@ class BraveSessionManager:
 		self._idle_task = None
 		self._context = None
 		self._browser = None
+		self._active_page = None
 		if self._playwright is not None:
 			try:
 				await self._playwright.stop()
@@ -102,7 +103,7 @@ class BraveSessionManager:
 		try:
 			self._browser = await self._playwright.chromium.connect_over_cdp(
 				self.cdp_url,
-				timeout=1000,
+				timeout=1500,
 			)
 			if self._browser.contexts:
 				self._context = self._browser.contexts[0]
@@ -110,16 +111,34 @@ class BraveSessionManager:
 		except Exception:
 			self._browser = None
 
-		# 2. Launch dedicated standalone stealth Chromium (avoids macOS Mach port collisions)
+		# 2. Launch dedicated standalone stealth Chromium with CDP remote debugging port enabled
 		os.makedirs(PROFILE_DIR, exist_ok=True)
+		browser_args = [
+			"--disable-blink-features=AutomationControlled",
+			f"--remote-debugging-port={CDP_PORT}",
+		]
 		try:
 			self._context = await self._playwright.chromium.launch_persistent_context(
 				user_data_dir=PROFILE_DIR,
 				headless=False,
-				args=["--disable-blink-features=AutomationControlled"],
+				args=browser_args,
 			)
 		except Exception as exc:
 			if "Opening in existing browser session" in str(exc) or "already in use" in str(exc):
+				# The browser might be in the middle of launching; retry connecting over CDP
+				for _ in range(3):
+					await asyncio.sleep(0.5)
+					try:
+						self._browser = await self._playwright.chromium.connect_over_cdp(
+							self.cdp_url,
+							timeout=1500,
+						)
+						if self._browser.contexts:
+							self._context = self._browser.contexts[0]
+							return self._context
+					except Exception:
+						pass
+
 				fallback_dir = f"{PROFILE_DIR}-{os.getpid()}"
 				os.makedirs(fallback_dir, exist_ok=True)
 				self._context = await self._playwright.chromium.launch_persistent_context(
@@ -133,24 +152,33 @@ class BraveSessionManager:
 
 	async def get_pages(self) -> list[Page]:
 		context = await self.get_context()
-		return context.pages
+		return [p for p in context.pages if not p.is_closed()]
 
 	async def get_active_page(self) -> Page:
+		context = await self.get_context()
+		if self._active_page is not None and not self._active_page.is_closed():
+			return self._active_page
+
 		pages = await self.get_pages()
-		if not pages:
-			context = await self.get_context()
-			page = await context.new_page()
-			self._active_tab_index = 0
-			return page
+		# If this session attached via CDP to an already-active browser session that already has pages
+		if self._browser is not None:
+			for p in pages:
+				if p.url in ("about:blank", ""):
+					self._active_page = p
+					return p
+			# Otherwise open a new tab for this session so we do not hijack other sessions
+			self._active_page = await context.new_page()
+			return self._active_page
 
-		if self._active_tab_index >= len(pages):
-			self._active_tab_index = max(0, len(pages) - 1)
+		# Primary launcher session
+		if pages:
+			self._active_page = pages[0]
+		else:
+			self._active_page = await context.new_page()
+		return self._active_page
 
-		page = pages[self._active_tab_index]
-		return page
-
-	def set_active_tab(self, index: int):
-		self._active_tab_index = index
+	def set_active_page(self, page: Page):
+		self._active_page = page
 
 
 session = BraveSessionManager(CDP_URL)
@@ -161,10 +189,11 @@ async def brave_status() -> str:
 	"""Check connection status to Brave Browser and list all open tabs."""
 	try:
 		pages = await session.get_pages()
+		active_page = await session.get_active_page()
 		lines = [f"Connected to browser session at {CDP_URL}"]
 		lines.append(f"Total open tabs: {len(pages)}")
 		for idx, page in enumerate(pages):
-			active_marker = " (ACTIVE)" if idx == session._active_tab_index else ""
+			active_marker = " (ACTIVE in this session)" if page == active_page else ""
 			title = await page.title()
 			lines.append(f"\t[{idx}] {title} - {page.url}{active_marker}")
 		return "\n".join(lines)
@@ -176,11 +205,10 @@ async def brave_status() -> str:
 async def brave_navigate(url: str, new_tab: bool = False, timeout_ms: int = 30000) -> str:
 	"""Navigate the active Brave tab to a specific URL, or open in a new tab."""
 	try:
+		context = await session.get_context()
 		if new_tab:
-			context = await session.get_context()
 			page = await context.new_page()
-			pages = await session.get_pages()
-			session.set_active_tab(len(pages) - 1)
+			session.set_active_page(page)
 		else:
 			page = await session.get_active_page()
 
