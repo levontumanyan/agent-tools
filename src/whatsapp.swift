@@ -1631,14 +1631,33 @@ func draftMessage(target: String, message: String) {
 	let letters = target.filter { $0.isLetter }
 	let isRawPhone = digitsOnly.count >= 7 && letters.isEmpty
 
-	if !isRawPhone, let session = matchingSession, session.contactJID.hasSuffix("@g.us") {
+	if !isRawPhone, let session = matchingSession, resolvedPhone == nil {
 		let cleanPartner = cleanUnicode(session.partnerName).replacingOccurrences(of: "\u{00A0}", with: " ")
+		let userSuffix: String
+		if let u = session.username, !u.isEmpty {
+			let normPartner = cleanPartner.trimmingCharacters(in: .whitespaces).lowercased()
+			if normPartner != "@\(u.lowercased())" && normPartner != u.lowercased() {
+				userSuffix = " (@\(u))"
+			} else {
+				userSuffix = ""
+			}
+		} else {
+			userSuffix = ""
+		}
+		let targetDesc = "\(cleanPartner)\(userSuffix)"
+
 		let urlString = "whatsapp://send?text=\(encodedText)"
 		if let url = URL(string: urlString) {
 			NSWorkspace.shared.open(url)
 		}
-		print("Opened WhatsApp with pre-filled draft for group '\(cleanPartner)'.")
-		print("Draft is also copied to your clipboard (Cmd+V).")
+		if session.contactJID.hasSuffix("@g.us") {
+			print("Opened WhatsApp with pre-filled draft for group '\(cleanPartner)'.")
+		} else {
+			print("Opened WhatsApp with draft composed for \(targetDesc).")
+			print("Note: Contact is connected via username/LID without a phone number.")
+		}
+		print("Draft is pre-filled in WhatsApp and copied to your clipboard (Cmd+V).")
+		print("Review the draft in WhatsApp and press Enter to send.")
 		return
 	}
 
