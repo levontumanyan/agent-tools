@@ -38,6 +38,7 @@ struct Config {
 	var searchQuery: String?
 	var showDetails: Bool = false
 	var isReminder: Bool = false
+	var includeAll: Bool = false
 }
 
 func printUsage() {
@@ -60,6 +61,7 @@ func printUsage() {
 
 	List & Search Options:
 	  --reminder, -r           Filter or operate on Apple Reminders instead of Calendar events
+	  --all                    Include completed reminders (for list/search/delete/edit)
 	  --from "<date/time>"     Start of range (default: start of today)
 	  --to "<date/time>"       End of range (default: end of today, +N days, or +30 days for search)
 	  --days <N>               Range in days from --from
@@ -91,6 +93,7 @@ func printUsage() {
 	  cal-event list --days 7
 	  cal-event list --from "2026-09-12" --to "2026-09-15"
 	  cal-event search "flight"
+	  cal-event search "eggs" --reminder --all
 	  cal-event search "LATAM" --details
 	  cal-event add "Doctor Appointment" --start "2026-09-15 14:00" --duration 60 --alarm 60,1440
 	  cal-event add "Take day off" --reminder --due "2026-10-14 08:00"
@@ -560,7 +563,12 @@ func handleListReminders(config: Config, store: EKEventStore, allCalendars: [EKC
 		if !matched.isEmpty { targetCalendars = matched }
 	}
 
-	let predicate = store.predicateForIncompleteReminders(withDueDateStarting: config.rangeStart, ending: config.rangeEnd, calendars: targetCalendars)
+	let predicate: NSPredicate
+	if config.includeAll {
+		predicate = store.predicateForReminders(in: targetCalendars)
+	} else {
+		predicate = store.predicateForIncompleteReminders(withDueDateStarting: config.rangeStart, ending: config.rangeEnd, calendars: targetCalendars)
+	}
 	store.fetchReminders(matching: predicate) { reminders in
 		defer { sem.signal() }
 		guard var list = reminders, !list.isEmpty else {
@@ -600,7 +608,8 @@ func handleListReminders(config: Config, store: EKEventStore, allCalendars: [EKC
 			}
 			let secName = sectionsCache[calTitle.lowercased()]?.reminderToSection[r.calendarItemIdentifier]
 			let cardTag = secName != nil ? " [Card: \(secName!)]" : ""
-			print("  • [\(calTitle)] Due: \(dueStr) - \(r.title ?? "")\(cardTag)")
+			let statusTag = r.isCompleted ? " [Completed]" : ""
+			print("  • [\(calTitle)] Due: \(dueStr) - \(r.title ?? "")\(cardTag)\(statusTag)")
 			if config.showDetails, let notes = r.notes, !notes.isEmpty {
 				print("    Notes: \(notes)")
 			}
@@ -622,7 +631,12 @@ func handleDeleteReminder(config: Config, store: EKEventStore, allCalendars: [EK
 		if !matched.isEmpty { targetCalendars = matched }
 	}
 
-	let predicate = store.predicateForIncompleteReminders(withDueDateStarting: config.rangeStart, ending: config.rangeEnd, calendars: targetCalendars)
+	let predicate: NSPredicate
+	if config.includeAll {
+		predicate = store.predicateForReminders(in: targetCalendars)
+	} else {
+		predicate = store.predicateForIncompleteReminders(withDueDateStarting: config.rangeStart, ending: config.rangeEnd, calendars: targetCalendars)
+	}
 	store.fetchReminders(matching: predicate) { reminders in
 		defer { sem.signal() }
 		guard var list = reminders, !list.isEmpty else {
@@ -680,7 +694,12 @@ func handleEditReminder(config: Config, store: EKEventStore, allCalendars: [EKCa
 		if !matched.isEmpty { targetCalendars = matched }
 	}
 
-	let predicate = store.predicateForIncompleteReminders(withDueDateStarting: config.rangeStart, ending: config.rangeEnd, calendars: targetCalendars)
+	let predicate: NSPredicate
+	if config.includeAll {
+		predicate = store.predicateForReminders(in: targetCalendars)
+	} else {
+		predicate = store.predicateForIncompleteReminders(withDueDateStarting: config.rangeStart, ending: config.rangeEnd, calendars: targetCalendars)
+	}
 	store.fetchReminders(matching: predicate) { reminders in
 		defer { sem.signal() }
 		guard var list = reminders, !list.isEmpty else {
@@ -1229,6 +1248,8 @@ func main() {
 					}
 				}
 			}
+		case "--all":
+			config.includeAll = true
 		case "--reminder", "-r":
 			config.isReminder = true
 		case "--due":

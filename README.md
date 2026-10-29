@@ -95,6 +95,60 @@ Add to your agent's MCP configuration (`~/.gemini/config/mcp_config.json`, `~/.c
 - `brave_evaluate_js`: Execute JavaScript in the active page context.
 - `brave_switch_tab` / `brave_new_tab` / `brave_close_tab`: Full multi-tab management.
 
+# Microsoft Outlook Setup (Azure App Registration)
+
+The `outlook` CLI uses the Microsoft Graph API with OAuth 2.0 Device Code flow. You do not need a paid Azure subscription. A free personal Microsoft account (@outlook.com, @hotmail.com) or a work/school account is sufficient.
+
+## Step 1: Register Application in Azure Portal
+1. Open [Azure Portal App registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) or the [Microsoft Entra admin center](https://entra.microsoft.com).
+2. Click **New registration**.
+3. Set **Name** (for example: `outlook-cli`).
+4. Under **Supported account types**, select:
+	* **Personal Microsoft accounts only** (for personal @outlook.com / @hotmail.com accounts), or
+	* **Accounts in any organizational directory and personal Microsoft accounts** (for both personal and work/school accounts).
+5. Under **Redirect URI**:
+	* Select platform: **Mobile and desktop applications**.
+	* Enter URI: `https://login.microsoftonline.com/common/oauth2/nativeclient`.
+6. Click **Register**.
+
+## Step 2: Enable Public Client Flows
+1. In the left navigation menu, select **Authentication**.
+2. Scroll down to **Advanced settings**.
+3. Under **Allow public client flows**, set **Enable the following mobile and desktop flows** to **Yes**.
+4. Click **Save**.
+
+## Step 3: Add API Permissions
+1. In the left navigation menu, select **API permissions**.
+2. Click **Add a permission**.
+3. Select **Microsoft Graph**.
+4. Select **Delegated permissions** (do not select Application permissions).
+5. Search for and select each of the following permissions:
+	* `Mail.ReadWrite` (read, compose, move, and delete emails)
+	* `Mail.Send` (send emails)
+	* `User.Read` (read user profile)
+	* `MailboxSettings.ReadWrite` (manage folders and inbox rules)
+	* `offline_access` (receive refresh tokens for background access)
+6. Click **Add permissions**.
+
+## Step 4: Configure Local Client ID
+1. In the left navigation menu, select **Overview**.
+2. Copy the **Application (client) ID**. This identifier is public and safe to share.
+3. Save the identifier to `~/.local/bin/.env` or export it in your shell configuration:
+```sh
+echo 'MSGRAPH_CLIENT_ID="<your-application-client-id>"' >> ~/.local/bin/.env
+chmod 600 ~/.local/bin/.env
+```
+Keys can also be stored directly in the macOS Keychain (`msgraph-client-id`).
+
+## Step 5: Authenticate CLI
+1. Run the authentication command:
+```sh
+outlook auth
+```
+2. The CLI prints a login URL (`https://microsoft.com/devicelogin`) and a one-time device code.
+3. Open the URL in your web browser, enter the code, and approve the permissions.
+4. The CLI saves credentials to `~/.local/share/outlook/token_cache.bin` with file permissions `0600`. Tokens refresh automatically.
+
 # Usage Examples
 
 ```sh
@@ -104,6 +158,12 @@ whatsapp search "flight confirmation"
 whatsapp read "Alex"
 whatsapp read "@username"
 whatsapp draft --to "@username" --message "On my way!"
+
+# Outlook: list unread emails, search, read, and draft
+outlook unread
+outlook search "invoice"
+outlook read <message-id>
+outlook draft --to "person@example.com" --subject "Status update" --body "Task complete."
 
 # Calendar & Reminders: schedule an event or native Apple Reminder
 cal-event add "Dentist Appointment" --start "2026-10-20 14:00"

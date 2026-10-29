@@ -21,7 +21,7 @@ mcp = FastMCP("brave-browser")
 
 CDP_PORT = int(os.environ.get("BRAVE_CDP_PORT", "9222"))
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
-PROFILE_DIR = os.path.expanduser("~/.agent-chromium-profile")
+PROFILE_DIR = os.path.expanduser(os.environ.get("BRAVE_PROFILE_DIR", "~/.agent-chromium-profile"))
 IDLE_TIMEOUT_SECONDS = int(os.environ.get("BRAVE_MCP_IDLE_TIMEOUT", "300"))
 
 
@@ -112,11 +112,23 @@ class BraveSessionManager:
 
 		# 2. Launch dedicated standalone stealth Chromium (avoids macOS Mach port collisions)
 		os.makedirs(PROFILE_DIR, exist_ok=True)
-		self._context = await self._playwright.chromium.launch_persistent_context(
-			user_data_dir=PROFILE_DIR,
-			headless=False,
-			args=["--disable-blink-features=AutomationControlled"],
-		)
+		try:
+			self._context = await self._playwright.chromium.launch_persistent_context(
+				user_data_dir=PROFILE_DIR,
+				headless=False,
+				args=["--disable-blink-features=AutomationControlled"],
+			)
+		except Exception as exc:
+			if "Opening in existing browser session" in str(exc) or "already in use" in str(exc):
+				fallback_dir = f"{PROFILE_DIR}-{os.getpid()}"
+				os.makedirs(fallback_dir, exist_ok=True)
+				self._context = await self._playwright.chromium.launch_persistent_context(
+					user_data_dir=fallback_dir,
+					headless=False,
+					args=["--disable-blink-features=AutomationControlled"],
+				)
+			else:
+				raise
 		return self._context
 
 	async def get_pages(self) -> list[Page]:

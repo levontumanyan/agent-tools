@@ -12,6 +12,7 @@ import os
 import sys
 import argparse
 import email.utils
+import subprocess
 from pathlib import Path
 import requests
 import msal
@@ -23,7 +24,25 @@ if local_bin_env.exists():
 	load_dotenv(local_bin_env)
 load_dotenv()
 
-CLIENT_ID = os.getenv("MSGRAPH_CLIENT_ID", "c55069b9-a83a-4355-85fc-24925fbb072b")
+
+def resolve_client_id() -> str:
+	if env_id := os.getenv("MSGRAPH_CLIENT_ID"):
+		return env_id
+	if sys.platform == "darwin":
+		try:
+			out = subprocess.check_output(
+				["security", "find-generic-password", "-s", "msgraph-client-id", "-w"],
+				stderr=subprocess.DEVNULL,
+				text=True,
+			).strip()
+			if out:
+				return out
+		except Exception:
+			pass
+	return "c55069b9-a83a-4355-85fc-24925fbb072b"
+
+
+CLIENT_ID = resolve_client_id()
 AUTHORITY = "https://login.microsoftonline.com/consumers"
 SCOPES = [
 	"Mail.ReadWrite",
