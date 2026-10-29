@@ -332,8 +332,8 @@ async def brave_switch_tab(index: int) -> str:
 		if index < 0 or index >= len(pages):
 			return f"Invalid tab index {index}. Total open tabs: {len(pages)}"
 
-		session.set_active_tab(index)
 		page = pages[index]
+		session.set_active_page(page)
 		await page.bring_to_front()
 		title = await page.title()
 		return f"Switched to tab [{index}]: '{title}' ({page.url})"
@@ -349,23 +349,28 @@ async def brave_new_tab(url: str = "about:blank") -> str:
 
 @mcp.tool()
 async def brave_close_tab(index: int = -1) -> str:
-	"""Close a tab by index (-1 closes the active tab)."""
+	"""Close a tab by index (-1 closes the active tab in this session)."""
 	try:
 		pages = await session.get_pages()
 		if not pages:
 			return "No tabs to close."
 
-		target_index = session._active_tab_index if index == -1 else index
-		if target_index < 0 or target_index >= len(pages):
-			return f"Invalid tab index {target_index}."
+		if index == -1:
+			page = await session.get_active_page()
+			target_index = pages.index(page) if page in pages else -1
+		else:
+			if index < 0 or index >= len(pages):
+				return f"Invalid tab index {index}. Total open tabs: {len(pages)}"
+			page = pages[index]
+			target_index = index
 
-		page = pages[target_index]
 		url = page.url
 		await page.close()
+		if page == session._active_page:
+			session._active_page = None
 
-		pages = await session.get_pages()
-		session.set_active_tab(max(0, len(pages) - 1))
-		return f"Closed tab [{target_index}] ({url}). Remaining open tabs: {len(pages)}"
+		remaining = await session.get_pages()
+		return f"Closed tab [{target_index}] ({url}). Remaining open tabs: {len(remaining)}"
 	except Exception as exc:
 		return f"Error closing tab: {exc}"
 
