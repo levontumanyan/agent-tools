@@ -160,13 +160,9 @@ class BraveSessionManager:
 			return self._active_page
 
 		pages = await self.get_pages()
-		# If this session attached via CDP to an already-active browser session that already has pages
+		# If this session attached via CDP to an already-active browser session
 		if self._browser is not None:
-			for p in pages:
-				if p.url in ("about:blank", ""):
-					self._active_page = p
-					return p
-			# Otherwise open a new tab for this session so we do not hijack other sessions
+			# Always open a new dedicated tab for this session so we do not hijack other sessions
 			self._active_page = await context.new_page()
 			return self._active_page
 
@@ -179,6 +175,14 @@ class BraveSessionManager:
 
 	def set_active_page(self, page: Page):
 		self._active_page = page
+
+	async def resolve_page(self, tab: int = -1) -> Page:
+		pages = await self.get_pages()
+		if tab >= 0:
+			if tab >= len(pages):
+				raise ValueError(f"Invalid tab index {tab}. Total open tabs: {len(pages)}")
+			return pages[tab]
+		return await self.get_active_page()
 
 
 session = BraveSessionManager(CDP_URL)
@@ -202,15 +206,15 @@ async def brave_status() -> str:
 
 
 @mcp.tool()
-async def brave_navigate(url: str, new_tab: bool = False, timeout_ms: int = 30000) -> str:
-	"""Navigate the active Brave tab to a specific URL, or open in a new tab."""
+async def brave_navigate(url: str, new_tab: bool = False, tab: int = -1, timeout_ms: int = 30000) -> str:
+	"""Navigate a Brave tab to a specific URL. If new_tab=True, opens a new tab. Use tab index (e.g. tab=0, tab=1) to target a specific tab."""
 	try:
 		context = await session.get_context()
 		if new_tab:
 			page = await context.new_page()
 			session.set_active_page(page)
 		else:
-			page = await session.get_active_page()
+			page = await session.resolve_page(tab)
 
 		# Ensure URL has protocol
 		if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("about:"):
@@ -219,16 +223,24 @@ async def brave_navigate(url: str, new_tab: bool = False, timeout_ms: int = 3000
 		response = await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
 		status = response.status if response else "loaded"
 		title = await page.title()
-		return f"Navigated to '{url}' [HTTP {status}] - Title: '{title}'"
+		pages = await session.get_pages()
+		target_idx = pages.index(page) if page in pages else -1
+		return f"Navigated tab [{target_idx}] to '{url}' [HTTP {status}] - Title: '{title}'"
 	except Exception as exc:
 		return f"Navigation error: {exc}"
 
 
 @mcp.tool()
-async def brave_get_content(selector: str = "body", max_length: int = 4000) -> str:
-	"""Extract visible text content from the active tab or a specific selector (default: 'body')."""
+async def brave_new_tab(url: str = "about:blank") -> str:
+	"""Open a new browser tab and navigate to url (default 'about:blank'). Returns the new tab index."""
+	return await brave_navigate(url=url, new_tab=True)
+
+
+@mcp.tool()
+async def brave_get_content(selector: str = "body", max_length: int = 4000, tab: int = -1) -> str:
+	"""Extract visible text content from the active tab or a specific selector (default: 'body'). Optional tab index to target specific tab."""
 	try:
-		page = await session.get_active_page()
+		page = await session.resolve_page(tab)
 		element = page.locator(selector).first
 		if await element.count() == 0:
 			return f"Element '{selector}' not found on page {page.url}"
@@ -244,10 +256,10 @@ async def brave_get_content(selector: str = "body", max_length: int = 4000) -> s
 
 
 @mcp.tool()
-async def brave_click(selector: str, timeout_ms: int = 5000) -> str:
-	"""Click an element on the active page by CSS selector, text (e.g. text='Sign In'), or XPath."""
+async def brave_click(selector: str, tab: int = -1, timeout_ms: int = 5000) -> str:
+	"""Click an element on the active page or specified tab index by CSS selector, text, or XPath."""
 	try:
-		page = await session.get_active_page()
+		page = await session.resolve_page(tab)
 		locator = page.locator(selector).first
 		await locator.click(timeout=timeout_ms)
 		return f"Clicked element matching '{selector}' on {page.url}"
@@ -256,10 +268,10 @@ async def brave_click(selector: str, timeout_ms: int = 5000) -> str:
 
 
 @mcp.tool()
-async def brave_type(selector: str, text: str, clear_first: bool = True, press_enter: bool = False, timeout_ms: int = 5000) -> str:
-	"""Type text into an input field or textarea on the active page."""
+async def brave_type(selector: str, text: str, clear_first: bool = True, press_enter: bool = False, tab: int = -1, timeout_ms: int = 5000) -> str:
+	"""Type text into an input field or textarea on the active page or specified tab index."""
 	try:
-		page = await session.get_active_page()
+		page = await session.resolve_page(tab)
 		locator = page.locator(selector).first
 		if clear_first:
 			await locator.fill(text, timeout=timeout_ms)
@@ -275,10 +287,10 @@ async def brave_type(selector: str, text: str, clear_first: bool = True, press_e
 
 
 @mcp.tool()
-async def brave_press_key(key: str) -> str:
-	"""Press a keyboard key on the active page (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown')."""
+async def brave_press_key(key: str, tab: int = -1) -> str:
+	"""Press a keyboard key on the active page or specified tab index (e.g., 'Enter', 'Tab', 'Escape')."""
 	try:
-		page = await session.get_active_page()
+		page = await session.resolve_page(tab)
 		await page.keyboard.press(key)
 		return f"Pressed key '{key}' on {page.url}"
 	except Exception as exc:
@@ -286,10 +298,10 @@ async def brave_press_key(key: str) -> str:
 
 
 @mcp.tool()
-async def brave_scroll(direction: str = "down", amount: int = 600) -> str:
-	"""Scroll the active page up or down (direction: 'up' or 'down', amount in pixels)."""
+async def brave_scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> str:
+	"""Scroll the active page or specified tab index up or down (direction: 'up' or 'down', amount in pixels)."""
 	try:
-		page = await session.get_active_page()
+		page = await session.resolve_page(tab)
 		delta = amount if direction.lower() == "down" else -amount
 		await page.mouse.wheel(0, delta)
 		return f"Scrolled {direction} by {amount}px"
@@ -298,10 +310,10 @@ async def brave_scroll(direction: str = "down", amount: int = 600) -> str:
 
 
 @mcp.tool()
-async def brave_screenshot(save_path: str = "") -> str:
-	"""Capture a screenshot of the active page view and return the file path for inspection."""
+async def brave_screenshot(save_path: str = "", tab: int = -1) -> str:
+	"""Capture a screenshot of the active page view or specified tab index and return the file path."""
 	try:
-		page = await session.get_active_page()
+		page = await session.resolve_page(tab)
 		if not save_path:
 			timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 			save_path = f"/tmp/brave_screenshot_{timestamp}.png"
@@ -314,10 +326,10 @@ async def brave_screenshot(save_path: str = "") -> str:
 
 
 @mcp.tool()
-async def brave_evaluate_js(expression: str) -> str:
-	"""Evaluate a JavaScript expression in the active page context and return the result."""
+async def brave_evaluate_js(expression: str, tab: int = -1) -> str:
+	"""Evaluate a JavaScript expression in the active page or specified tab index and return the result."""
 	try:
-		page = await session.get_active_page()
+		page = await session.resolve_page(tab)
 		result = await page.evaluate(expression)
 		return f"Result: {result}"
 	except Exception as exc:
@@ -339,12 +351,6 @@ async def brave_switch_tab(index: int) -> str:
 		return f"Switched to tab [{index}]: '{title}' ({page.url})"
 	except Exception as exc:
 		return f"Error switching tab: {exc}"
-
-
-@mcp.tool()
-async def brave_new_tab(url: str = "about:blank") -> str:
-	"""Open a new browser tab and switch to it."""
-	return await brave_navigate(url=url, new_tab=True)
 
 
 @mcp.tool()
