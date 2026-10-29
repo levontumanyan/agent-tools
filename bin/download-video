@@ -7,7 +7,7 @@
 # 	"gnureadline",
 # ]
 # ///
-"""Download videos with rich metadata to Google Drive. Instagram → H.264/AAC MP4 (WhatsApp-native). Others → AV1/VP9 MKV."""
+"""Download videos with rich metadata. Instagram → H.264/AAC MP4 (WhatsApp-native). Others → AV1/VP9 MKV."""
 
 import sys
 import os
@@ -18,18 +18,44 @@ import tempfile
 import glob
 
 
+def load_env_files():
+	"""Loads environment variables from gitignored .env in repo root and ~/.local/bin/.env."""
+	repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+	candidates = [
+		os.path.join(repo_root, ".env"),
+		os.path.expanduser("~/.local/bin/.env"),
+	]
+	for env_path in candidates:
+		if os.path.isfile(env_path):
+			try:
+				with open(env_path, "r", encoding="utf-8") as f:
+					for line in f:
+						line = line.strip()
+						if line and not line.startswith("#") and "=" in line:
+							k, v = line.split("=", 1)
+							k = k.strip()
+							v = v.strip().strip("'\"")
+							if k not in os.environ:
+								os.environ[k] = v
+			except Exception:
+				pass
+
+
 def get_default_media_dir():
-	"""Resolves the active Google Drive memes directory on macOS."""
-	cloud_storage = glob.glob(os.path.expanduser("~/Library/CloudStorage/GoogleDrive-*/My Drive/media/memes"))
-	if cloud_storage and os.path.isdir(cloud_storage[0]):
-		return cloud_storage[0]
-	legacy_path = os.path.expanduser("~/Google Drive/My Drive/media/memes")
-	if os.path.isdir(legacy_path):
-		return legacy_path
-	gdrive_roots = glob.glob(os.path.expanduser("~/Library/CloudStorage/GoogleDrive-*/My Drive"))
-	if gdrive_roots and os.path.isdir(gdrive_roots[0]):
-		return os.path.join(gdrive_roots[0], "media", "memes")
-	return legacy_path
+	"""Resolves the default output directory for downloaded videos.
+
+	Checks in order:
+	1. DOWNLOAD_DIR or DOWNLOAD_VIDEO_DIR in environment / gitignored .env
+	2. Fallback to ~/Downloads or ~/Movies
+	"""
+	load_env_files()
+	env_dir = os.environ.get("DOWNLOAD_DIR") or os.environ.get("DOWNLOAD_VIDEO_DIR") or os.environ.get("VIDEO_DOWNLOAD_DIR")
+	if env_dir:
+		return os.path.abspath(os.path.expanduser(env_dir))
+	downloads = os.path.expanduser("~/Downloads")
+	if os.path.isdir(downloads):
+		return downloads
+	return os.path.expanduser("~/Movies")
 
 
 DEFAULT_DIR = get_default_media_dir()

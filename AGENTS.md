@@ -8,7 +8,7 @@
 - **Browser Automation MCP**: Use the dedicated Patchright stealth Chromium instance via MCP (`brave-mcp` / `uv run --script`) for agent browsing; see `brave-mcp --help` for options. Never launch a second Brave binary alongside an active one on macOS because shared Mach port rendezvous (`com.brave.Browser.MachPortRendezvousServer`) freezes tab opening and IPC in the primary browser.
 - **Antigravity Telemetry Shipper**: Use `antigravity-shipper` (runs as a launchd daemon or one-shot via `antigravity-shipper --once`); tails local conversation transcripts, redacts secrets, and ships telemetry to PostgreSQL; see `antigravity-shipper --help`.
 - **Airbnb CLI**: Use `airbnb` for listing search, scoring, and inspection (see `airbnb --help`). Always explicitly report the nightly rate (e.g. CAD $XX/night) whether presenting a single listing or multiple listings. Detailed agent instructions and development standards are centralized in [airbnb/AGENTS.md](airbnb/AGENTS.md).
-- **Video Downloader CLI**: Use `download-video "<url>"` (or bare `download-video` to grab URL from clipboard) to download reels, stories, and videos to Google Drive (`~/Library/CloudStorage/GoogleDrive-*/My Drive/media/memes`) with Apple Vision OCR frame analysis, WhatsApp-compatible H.264/AAC transcoding, and metadata tagging; see `download-video --help`.
+- **Video Downloader CLI**: Use `download-video "<url>"` (or bare `download-video` to grab URL from clipboard) to download reels, stories, and videos (defaults to `$DOWNLOAD_VIDEO_DIR` or `~/Downloads`) with Apple Vision OCR frame analysis, WhatsApp-compatible H.264/AAC transcoding, and metadata tagging; see `download-video --help`.
 
 # Development
 
