@@ -1,12 +1,12 @@
 # agent-tools
 
-Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **Apple Pay**, **Microsoft Outlook**, **video & reel downloads to Google Drive**, and **stealth browser automation**.
+Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **Apple Pay**, **Microsoft Outlook**, **Airbnb search & scoring**, **Antigravity session recovery & telemetry**, **stealth browser automation**, and **automated reel & video downloading**.
 
 Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` or compiled native helper) with auto-generated `--help`, zero global Python pollution, and instant startup.
 
 # Why agent-tools?
 
-- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `apple-pay`, `outlook`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas. Stateful browser sessions use `brave-mcp`.
+- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `apple-pay`, `outlook`, `download-video`, `airbnb`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas. Stateful browser sessions use `brave-mcp`.
 - **100% Local & Private**: Reads directly from local macOS SQLite databases (`ChatStorage.sqlite`, `chat.db`, Wallet passes) and native `EventKit` APIs — no third-party cloud relays.
 - **Zero Dependency Hell**: Powered by `uv` inline script metadata (`#!/usr/bin/env -S uv run --script`). Clone once, add `bin/` to `$PATH`, and every tool manages its own isolated environment automatically.
 - **macOS Browser Hang Prevention**: `brave-mcp` solves the notorious macOS Chromium/Brave `com.brave.Browser.MachPortRendezvousServer` IPC freeze by attaching over CDP or launching an isolated Patchright stealth Chromium profile with automatic idle driver teardown.
