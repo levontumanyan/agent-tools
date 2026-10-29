@@ -379,7 +379,7 @@ def cmd_zsh_hook(args: argparse.Namespace) -> int:
 				data["recreate_triggered"] = True
 				save_data(data)
 				subprocess.Popen(
-					[str(Path.home() / ".local" / "bin" / "agy-sessions"), "restore"],
+					[str(Path(__file__).resolve()), "restore"],
 					stdout=subprocess.DEVNULL,
 					stderr=subprocess.DEVNULL,
 				)
@@ -750,6 +750,59 @@ def get_current_cid() -> str:
 	return ""
 
 
+def parse_etime(s: str) -> float:
+	"""Parse POSIX etime [[dd-]hh:]mm:ss into total seconds."""
+	parts = s.strip().split("-")
+	if len(parts) == 2:
+		days = int(parts[0])
+		time_str = parts[1]
+	else:
+		days = 0
+		time_str = parts[0]
+	t_parts = [int(p) for p in time_str.split(":")]
+	if len(t_parts) == 3:
+		h, m, sec = t_parts
+	elif len(t_parts) == 2:
+		h = 0
+		m, sec = t_parts
+	else:
+		h, m, sec = 0, 0, t_parts[0]
+	return days * 86400.0 + h * 3600.0 + m * 60.0 + sec
+
+
+def get_pids_elapsed_sec(pids: list[str]) -> dict[str, float]:
+	"""Return mapping of pid -> elapsed running time in seconds via ps etime."""
+	if not pids:
+		return {}
+	try:
+		out = subprocess.check_output(
+			["ps", "-o", "pid=,etime=", "-p", ",".join(pids)],
+			text=True,
+			stderr=subprocess.DEVNULL,
+		)
+		res = {}
+		for line in out.splitlines():
+			parts = line.strip().split()
+			if len(parts) == 2:
+				res[parts[0]] = parse_etime(parts[1])
+		return res
+	except Exception:
+		return {}
+
+
+def get_tty_idle_sec(tty: str) -> float:
+	"""Return seconds since the TTY was last active (user keystroke or terminal output)."""
+	if not tty or not os.path.exists(tty):
+		return float("inf")
+	try:
+		st = os.stat(tty)
+		now = time.time()
+		last_active = max(st.st_atime, st.st_mtime)
+		return max(0.0, now - last_active)
+	except Exception:
+		return float("inf")
+
+
 def cmd_cull(args: argparse.Namespace) -> int:
 	"""
 	Gracefully close agy sessions that have been idle for more than --hours (default: 6h).
@@ -757,6 +810,11 @@ def cmd_cull(args: argparse.Namespace) -> int:
 	- Ensures session state is safely persisted in iterm-sessions.json before closing.
 	- agy flushes its DB, releases locks, and prints the resume command in the tab.
 	- Excludes the current active conversation session so pair programming is never interrupted.
+	- True idle time is measured as min(conversation_idle, process_elapsed, tty_idle):
+	  * conversation_idle: time since last assistant turn in SQLite
+	  * process_elapsed: time since this specific agy process was launched
+	  * tty_idle: time since last keystroke / output in the terminal tab
+	  A session is only culled if ALL THREE indicate inactivity for > --hours.
 	"""
 	tty_to_agy, _, _, pid_to_cid = get_live_processes()
 	if not pid_to_cid:
@@ -768,11 +826,15 @@ def cmd_cull(args: argparse.Namespace) -> int:
 	now = datetime.now(timezone.utc)
 	threshold_sec = args.hours * 3600.0
 
+	pid_to_tty = {pid_str: tty for tty, (pid_str, _) in tty_to_agy.items()}
+	pids_elapsed = get_pids_elapsed_sec(list(pid_to_cid.keys()))
+
 	conn = sqlite3.connect(str(SUMMARIES_DB)) if SUMMARIES_DB.exists() else None
 	cur = conn.cursor() if conn else None
 
 	culled_count = 0
 	candidates = []
+	stats = []
 
 	for pid_str, cid in pid_to_cid.items():
 		if cid == current_cid:
@@ -780,7 +842,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		pid = int(pid_str)
 
 		title = ""
-		idle_sec = 0.0
+		conv_idle_sec = float("inf")
 		not_idle = 0
 
 		if cur:
@@ -790,19 +852,36 @@ def cmd_cull(args: argparse.Namespace) -> int:
 				title, lmod_str, not_idle = row
 				try:
 					lmod = datetime.fromisoformat(lmod_str)
-					idle_sec = (now - lmod).total_seconds()
+					conv_idle_sec = max(0.0, (now - lmod).total_seconds())
 				except Exception:
-					idle_sec = 0.0
+					conv_idle_sec = float("inf")
 
 		if not_idle:
 			continue
 
+		proc_elapsed_sec = pids_elapsed.get(pid_str, float("inf"))
+		tty = pid_to_tty.get(pid_str, "")
+		tty_idle_sec = get_tty_idle_sec(tty)
+
+		idle_sec = min(conv_idle_sec, proc_elapsed_sec, tty_idle_sec)
+		idle_hr = idle_sec / 3600.0
+		stats.append((pid, cid, title, conv_idle_sec / 3600.0, proc_elapsed_sec / 3600.0, tty_idle_sec / 3600.0, idle_hr))
+
 		if idle_sec >= threshold_sec:
-			idle_hr = idle_sec / 3600.0
 			candidates.append((pid, cid, title, idle_hr))
 
 	if conn:
 		conn.close()
+
+	if getattr(args, "verbose", False) and not args.quiet:
+		print(f"{'PID':<7} | {'Conv Idle':<10} | {'Proc Age':<9} | {'TTY Idle':<9} | {'Effective':<10} | Title")
+		print("-" * 80)
+		for pid, cid, title, c_hr, p_hr, t_hr, eff_hr in stats:
+			c_disp = f"{c_hr:5.1f}h" if c_hr != float("inf") else "inf"
+			p_disp = f"{p_hr:5.1f}h" if p_hr != float("inf") else "inf"
+			t_disp = f"{t_hr:5.1f}h" if t_hr != float("inf") else "inf"
+			print(f"{pid:<7} | {c_disp:<10} | {p_disp:<9} | {t_disp:<9} | {eff_hr:5.1f}h     | {title or cid}")
+		print()
 
 	if not candidates:
 		if not args.quiet:
@@ -829,7 +908,18 @@ def cmd_cull(args: argparse.Namespace) -> int:
 				print(f"  \033[1;31m[ERROR]\033[0m Failed to signal PID {pid}: {e}", file=sys.stderr)
 
 	if not args.dry_run and culled_count > 0:
-		time.sleep(0.5)
+		for _ in range(15):
+			time.sleep(0.1)
+			still_running = False
+			for pid, _, _, _ in candidates:
+				try:
+					os.kill(pid, 0)
+					still_running = True
+					break
+				except ProcessLookupError:
+					continue
+			if not still_running:
+				break
 		cmd_save(argparse.Namespace(quiet=True))
 		print(f"\nSuccessfully culled {culled_count} idle session(s). Tabs remain open with resume command ready.")
 	return 0
@@ -875,6 +965,7 @@ def build_parser() -> argparse.ArgumentParser:
 	p_cull = sub.add_parser("cull", help="Gracefully close agy sessions that have been idle for more than --hours (default: 6)")
 	p_cull.add_argument("--hours", type=float, default=6.0, help="Idle hour threshold to trigger culling (default: 6.0)")
 	p_cull.add_argument("-n", "--dry-run", action="store_true", help="Preview which sessions would be culled without terminating")
+	p_cull.add_argument("-v", "--verbose", action="store_true", help="Show detailed breakdown of idle timers across all live sessions")
 	p_cull.add_argument("-q", "--quiet", action="store_true", help="Suppress output")
 	p_cull.set_defaults(func=cmd_cull)
 
