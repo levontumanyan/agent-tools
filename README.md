@@ -1,6 +1,6 @@
 # agent-tools
 
-Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **Apple Pay**, **Microsoft Outlook**, and **stealth browser automation**.
+Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **Apple Pay**, **Microsoft Outlook**, **video & reel downloads to Google Drive**, and **stealth browser automation**.
 
 Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` or compiled native helper) with auto-generated `--help`, zero global Python pollution, and instant startup.
 
@@ -24,6 +24,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, auto-restore, and gracefully cull stale (>6h) `agy` sessions in iTerm2 while keeping tabs open. |
 | [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
 | [`airbnb`](airbnb/) | CLI | Airbnb API + Climate/Sentiment Engine | Search, score, and benchmark listings against nomad criteria (Wi-Fi, kitchen, climate/heating, noise, discounts). |
+| [`download-video`](bin/download-video) | CLI | yt-dlp + gallery-dl + Apple Vision OCR | Download Instagram reels/stories and YouTube videos/shorts to Google Drive, transcode to WhatsApp-native H.264/AAC MP4, extract frame OCR/hashtags, and embed metadata. |
 
 # Quickstart
 
@@ -50,6 +51,7 @@ imessage --help
 cal-event --help
 outlook --help
 apple-pay --help
+download-video --help
 brave-mcp --help
 agy-sessions --help
 antigravity-shipper --help
@@ -149,9 +151,32 @@ outlook auth
 3. Open the URL in your web browser, enter the code, and approve the permissions.
 4. The CLI saves credentials to `~/.local/share/outlook/token_cache.bin` with file permissions `0600`. Tokens refresh automatically.
 
+# Video Downloader CLI (`download-video`)
+
+Downloads videos, Instagram Reels/stories, and YouTube videos/shorts directly into your Google Drive meme archive (`~/Library/CloudStorage/GoogleDrive-*/My Drive/media/memes`) with automated Apple Vision OCR frame indexing, WhatsApp-friendly H.264/AAC transcoding, and duplicate prevention.
+
+## Highlights
+
+- **Zero-Setup PEP 723 Executable**: Runs with `uv run --script` using self-contained dependencies (`pyobjc-framework-Vision`, `pyobjc-framework-Cocoa`, `gnureadline`).
+- **Clipboard Auto-Detection**: Running `download-video` with no arguments automatically pulls the video URL from your macOS clipboard (`pbpaste`).
+- **Dynamic Google Drive Discovery**: Automatically resolves modern macOS CloudStorage paths (`~/Library/CloudStorage/GoogleDrive-*/My Drive/media/memes`) or classic `~/Google Drive` mounts.
+- **WhatsApp Playback Optimization**: Transcodes Instagram reels into H.264/AAC MP4 with a 1-frame preview offset at `t=0.5s` to eliminate black thumbnail previews on WhatsApp.
+- **Apple Vision OCR & Frame Tagging**: Scans video keyframes using macOS native `VNRecognizeTextRequest` and `VNClassifyImageRequest` to auto-suggest filename slugs and hashtags.
+- **Carousel & Photo Fallback**: Seamlessly falls back to `gallery-dl` if `yt-dlp` fails on Instagram photo/carousel posts.
+- **Archive & Metadata Management**: Tracks downloaded items in `.yt-dlp-archive` to prevent re-downloads and embeds personal notes (`--note`) directly into container metadata.
+- **Audio & Clip Cutting**: Supports audio extraction (`-a` / `--audio-only`) as MP3 and YouTube timestamp cuts (`-s` / `--section "MM:SS-MM:SS"`).
+
 # Usage Examples
 
 ```sh
+# Video Downloader: grab from clipboard or download Instagram Reels / YouTube videos to Google Drive
+download-video
+download-video "https://www.instagram.com/reel/Cxxxxxxx/"
+download-video "https://www.instagram.com/reel/Cxxxxxxx/" -n "funny-cat" --note "sent by alex"
+download-video "https://www.youtube.com/watch?v=xxxxxxx" --section "01:30-02:15"
+download-video -m "funny-cat"
+download-video -d "funny-cat"
+
 # WhatsApp: check unread messages, search history, read threads, or stage a draft
 whatsapp unread
 whatsapp search "flight confirmation"
