@@ -775,16 +775,20 @@ def get_pids_elapsed_sec(pids: list[str]) -> dict[str, float]:
 	if not pids:
 		return {}
 	try:
-		out = subprocess.check_output(
+		# Use capture_output so partial stdout can be parsed even if one PID exited (non-zero return code)
+		res_proc = subprocess.run(
 			["ps", "-o", "pid=,etime=", "-p", ",".join(pids)],
+			capture_output=True,
 			text=True,
-			stderr=subprocess.DEVNULL,
 		)
 		res = {}
-		for line in out.splitlines():
+		for line in res_proc.stdout.splitlines():
 			parts = line.strip().split()
 			if len(parts) == 2:
-				res[parts[0]] = parse_etime(parts[1])
+				try:
+					res[parts[0]] = parse_etime(parts[1])
+				except Exception:
+					pass
 		return res
 	except Exception:
 		return {}
@@ -834,6 +838,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 
 	culled_count = 0
 	candidates = []
+	signaled_pids = set()
 	stats = []
 
 	for pid_str, cid in pid_to_cid.items():
@@ -902,6 +907,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 				os.kill(pid, signal.SIGINT)
 				print(f"  \033[1;33m[CULLED]\033[0m Closed idle agy (PID {pid}, idle {idle_hr:.1f}h): {title_disp} (tab remains open)")
 				culled_count += 1
+				signaled_pids.add(pid)
 			except ProcessLookupError:
 				pass
 			except Exception as e:
@@ -911,7 +917,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		for _ in range(15):
 			time.sleep(0.1)
 			still_running = False
-			for pid, _, _, _ in candidates:
+			for pid in signaled_pids:
 				try:
 					os.kill(pid, 0)
 					still_running = True
