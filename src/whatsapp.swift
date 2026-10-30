@@ -756,12 +756,22 @@ func resolveContactPhone(db: OpaquePointer, contact: String) -> String? {
 		if session.contactJID.hasSuffix("@g.us") {
 			continue
 		}
-		if let ident = session.contactIdentifier {
+		// 1. Prefer actual international phone number from JID (@s.whatsapp.net)
+		if session.contactJID.hasSuffix("@s.whatsapp.net") {
+			let jidNum = session.contactJID.components(separatedBy: "@").first ?? ""
+			let jidDigits = extractDigits(jidNum)
+			if jidDigits.count >= 7 {
+				return jidDigits
+			}
+		}
+		// 2. Check contactIdentifier only if it's NOT a WhatsApp internal LID (@lid)
+		if let ident = session.contactIdentifier, !ident.hasSuffix("@lid") {
 			let identDigits = extractDigits(ident)
 			if identDigits.count >= 7 {
 				return identDigits
 			}
 		}
+		// 3. Any other non-LID JID
 		if !session.contactJID.hasSuffix("@lid") {
 			let jidNum = session.contactJID.components(separatedBy: "@").first ?? ""
 			let jidDigits = extractDigits(jidNum)
@@ -769,6 +779,7 @@ func resolveContactPhone(db: OpaquePointer, contact: String) -> String? {
 				return jidDigits
 			}
 		}
+		// 4. Partner name if it contains phone digits
 		let partnerDigits = extractDigits(session.partnerName)
 		if partnerDigits.count >= 7 {
 			return partnerDigits
