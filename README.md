@@ -16,8 +16,9 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | Tool | Type | Integration | What Your Agent Can Do |
 | :--- | :--- | :--- | :--- |
 | [`whatsapp`](src/whatsapp.swift) | CLI | Local SQLite + AppleScript UI | List recent/unread chats, full-text search messages, read threads (by contact, phone, or @username), list/extract attachments & documents, and stage drafts. |
-| [`imessage`](bin/imessage) | CLI | macOS `~/Library/Messages/chat.db` | Search and read local iMessage / SMS conversation history and recent threads. |
+| [`imessage`](bin/imessage) | CLI | macOS `~/Library/Messages/chat.db` | Search and read local iMessage / SMS conversations and inspect/extract attachments (`-a` / `--attachments`). |
 | [`cal-event`](src/cal-event.swift) | CLI | macOS `EventKit` | Create, query, and manage Apple Calendar events and Apple Reminders (`--reminder`) with native iCloud sync. |
+| [`call-recordings`](src/call-recordings.swift) | CLI | Apple Notes SQLite + `Speech` | Access, transcribe on-device, search, and export iPhone call recordings synced via Apple Notes. |
 | [`outlook`](bin/outlook) | CLI | Microsoft Graph API | Read, search, draft, and send Outlook emails from the terminal. |
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
 | [`brave-mcp`](bin/brave-mcp) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in Brave or standalone stealth Chromium. |
@@ -190,12 +191,21 @@ outlook search "invoice"
 outlook read <message-id>
 outlook draft --to "person@example.com" --subject "Status update" --body "Task complete."
 
+# Call Recordings: list, read, transcribe on-device, or export iPhone calls
+call-recordings list
+call-recordings read <id>
+call-recordings transcribe <id>
+call-recordings search "tax form"
+call-recordings export <id> --out ~/Downloads
+
 # Calendar & Reminders: schedule an event or native Apple Reminder
 cal-event add "Dentist Appointment" --start "2026-10-20 14:00"
 cal-event add "Submit expense report" --reminder --due "2026-10-18 09:00"
 
-# iMessage & Apple Pay: search messages and recent card transactions
-imessage --help
+# iMessage: search threads or inspect attachments
+imessage -q "invoice"
+imessage -c "+16471234567" -a
+imessage -q "IMG_6503" -a
 apple-pay --help
 ```
 
