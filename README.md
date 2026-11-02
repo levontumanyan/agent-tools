@@ -96,7 +96,8 @@ Add to your agent's MCP configuration (`~/.gemini/config/mcp_config.json`, `~/.c
 - `brave_click` / `brave_type` / `brave_press_key` / `brave_scroll`: Interact with page elements.
 - `brave_screenshot`: Capture a viewport screenshot for multimodal agent inspection.
 - `brave_evaluate_js`: Execute JavaScript in the active page context.
-- `brave_switch_tab` / `brave_new_tab` / `brave_close_tab`: Full multi-tab management.
+- `brave_switch_tab` / `brave_new_tab` / `brave_close_tab`: Full multi-tab management (closing the last tab automatically closes the browser).
+- `brave_close_browser`: Completely close the browser window, terminate the browser process, and release all resources.
 
 # Microsoft Outlook Setup (Azure App Registration)
 
