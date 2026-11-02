@@ -39,6 +39,11 @@ struct Config {
 	var showDetails: Bool = false
 	var isReminder: Bool = false
 	var includeAll: Bool = false
+	var repeatFrequency: EKRecurrenceFrequency?
+	var clearRecurrence: Bool = false
+	var repeatInterval: Int = 1
+	var repeatCount: Int?
+	var repeatUntil: Date?
 }
 
 func printUsage() {
@@ -78,6 +83,9 @@ func printUsage() {
 	  --end "<date/time>"       End date (optional)
 	  --duration <minutes>      Duration in minutes (default: 30 for add)
 	  --all-day                 Mark event or reminder as all-day
+	  --repeat, -R "<freq>"    Repeat schedule: daily, weekly, monthly, yearly, "every 2 days", 2w, etc. (or none)
+	  --count <N>              Number of repeat occurrences (e.g. --count 7)
+	  --until "<date/time>"    End date for repetition
 	  --calendar "<name>"       Target calendar or reminder list (for add; filter for search/edit/delete)
 	  --account "<name>"        Target account/source (for add; filter for search/edit/delete)
 	  --notes "<text>"          Event/reminder notes / description
@@ -96,8 +104,11 @@ func printUsage() {
 	  cal-event search "eggs" --reminder --all
 	  cal-event search "LATAM" --details
 	  cal-event add "Doctor Appointment" --start "2026-09-15 14:00" --duration 60 --alarm 60,1440
+	  cal-event add "Daily Standup" --start "2026-09-15 09:30" --repeat daily
+	  cal-event add "Team Sync" --start "2026-09-15 10:00" --repeat "every 2 weeks" --until "2026-12-31"
 	  cal-event add "Take day off" --reminder --due "2026-10-14 08:00"
 	  cal-event add "Buy bus ticket" --reminder --due "2026-10-13 09:00" --notes "Via WhatsApp +1234567890"
+	  cal-event add "Apply Cream" --reminder --due "2026-11-01 16:00" --repeat daily --count 7
 	  cal-event add "Groceries" --reminder --calendar "Grocery"
 	  cal-event list-reminders
 	  cal-event list --reminder
@@ -110,6 +121,105 @@ func printUsage() {
 	  cal-event delete "Buy bus ticket" --reminder
 	"""
 	print(usage)
+}
+
+func parseRepeat(_ str: String) -> (frequency: EKRecurrenceFrequency?, interval: Int, clear: Bool)? {
+	let lower = str.lowercased().trimmingCharacters(in: .whitespaces)
+	if ["none", "never", "clear", "off"].contains(lower) {
+		return (nil, 1, true)
+	}
+
+	var cleaned = lower
+	if cleaned.hasPrefix("every ") {
+		cleaned = String(cleaned.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+	}
+
+	switch cleaned {
+	case "day", "daily", "everyday":
+		return (.daily, 1, false)
+	case "week", "weekly":
+		return (.weekly, 1, false)
+	case "month", "monthly":
+		return (.monthly, 1, false)
+	case "year", "yearly", "annual", "annually":
+		return (.yearly, 1, false)
+	default:
+		break
+	}
+
+	let regexShort = try? NSRegularExpression(pattern: "^(\\d+)\\s*([dwmy])$")
+	if let match = regexShort?.firstMatch(in: cleaned, range: NSRange(cleaned.startIndex..., in: cleaned)) {
+		if let numRange = Range(match.range(at: 1), in: cleaned),
+		   let unitRange = Range(match.range(at: 2), in: cleaned),
+		   let interval = Int(cleaned[numRange]), interval > 0 {
+			let unit = String(cleaned[unitRange])
+			switch unit {
+			case "d": return (.daily, interval, false)
+			case "w": return (.weekly, interval, false)
+			case "m": return (.monthly, interval, false)
+			case "y": return (.yearly, interval, false)
+			default: break
+			}
+		}
+	}
+
+	let parts = cleaned.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+	if parts.count == 2, let interval = Int(parts[0]), interval > 0 {
+		let unit = parts[1]
+		if unit.hasPrefix("day") {
+			return (.daily, interval, false)
+		} else if unit.hasPrefix("week") {
+			return (.weekly, interval, false)
+		} else if unit.hasPrefix("month") {
+			return (.monthly, interval, false)
+		} else if unit.hasPrefix("year") {
+			return (.yearly, interval, false)
+		}
+	}
+
+	return nil
+}
+
+func buildRecurrenceRule(config: Config) -> EKRecurrenceRule? {
+	guard let freq = config.repeatFrequency else { return nil }
+	var recEnd: EKRecurrenceEnd? = nil
+	if let count = config.repeatCount, count > 0 {
+		recEnd = EKRecurrenceEnd(occurrenceCount: count)
+	} else if let until = config.repeatUntil {
+		recEnd = EKRecurrenceEnd(end: until)
+	}
+	return EKRecurrenceRule(
+		recurrenceWith: freq,
+		interval: max(1, config.repeatInterval),
+		end: recEnd
+	)
+}
+
+func formatRecurrenceRule(_ rule: EKRecurrenceRule) -> String {
+	var freqStr = ""
+	switch rule.frequency {
+	case .daily:
+		freqStr = rule.interval == 1 ? "Daily" : "Every \(rule.interval) days"
+	case .weekly:
+		freqStr = rule.interval == 1 ? "Weekly" : "Every \(rule.interval) weeks"
+	case .monthly:
+		freqStr = rule.interval == 1 ? "Monthly" : "Every \(rule.interval) months"
+	case .yearly:
+		freqStr = rule.interval == 1 ? "Yearly" : "Every \(rule.interval) years"
+	@unknown default:
+		freqStr = "Recurring"
+	}
+	if let end = rule.recurrenceEnd {
+		if end.occurrenceCount > 0 {
+			freqStr += " (\(end.occurrenceCount) times)"
+		} else if let endDate = end.endDate {
+			let df = DateFormatter()
+			df.dateStyle = .medium
+			df.timeStyle = .none
+			freqStr += " until \(df.string(from: endDate))"
+		}
+	}
+	return freqStr
 }
 
 func parseDate(_ str: String, isEndOfDay: Bool = false) -> Date? {
@@ -213,8 +323,13 @@ func handleAdd(config: Config, store: EKEventStore, allCalendars: [EKCalendar]) 
 		event.addAlarm(alarm)
 	}
 
+	if let rule = buildRecurrenceRule(config: config) {
+		event.addRecurrenceRule(rule)
+	}
+
 	do {
-		try store.save(event, span: .thisEvent)
+		let span: EKSpan = event.hasRecurrenceRules ? .futureEvents : .thisEvent
+		try store.save(event, span: span)
 		let df = DateFormatter()
 		df.dateStyle = .medium
 		df.timeStyle = isAllDay ? .none : .short
@@ -222,6 +337,9 @@ func handleAdd(config: Config, store: EKEventStore, allCalendars: [EKCalendar]) 
 		print("   • Title:    \(event.title ?? "")")
 		print("   • When:     \(df.string(from: start)) - \(df.string(from: end))")
 		print("   • Calendar: [\(targetCalendar.source.title)] -> \(targetCalendar.title)")
+		if let rule = event.recurrenceRules?.first {
+			print("   • Repeat:   \(formatRecurrenceRule(rule))")
+		}
 		if let loc = event.location, !loc.isEmpty {
 			print("   • Location: \(loc)")
 		}
@@ -364,6 +482,10 @@ func handleAddReminder(config: Config, store: EKEventStore, allCalendars: [EKCal
 		}
 	}
 
+	if let rule = buildRecurrenceRule(config: config) {
+		reminder.addRecurrenceRule(rule)
+	}
+
 	do {
 		try store.save(reminder, commit: true)
 		let df = DateFormatter()
@@ -377,6 +499,9 @@ func handleAddReminder(config: Config, store: EKEventStore, allCalendars: [EKCal
 		print("   • Title:    \(reminder.title ?? "")")
 		if let due = config.startDate {
 			print("   • Due Date: \(df.string(from: due))")
+		}
+		if let rule = reminder.recurrenceRules?.first {
+			print("   • Repeat:   \(formatRecurrenceRule(rule))")
 		}
 		print("   • List:     [\(targetCalendar.source.title)] -> \(targetCalendar.title)")
 		if let notes = reminder.notes, !notes.isEmpty {
@@ -609,7 +734,8 @@ func handleListReminders(config: Config, store: EKEventStore, allCalendars: [EKC
 			let secName = sectionsCache[calTitle.lowercased()]?.reminderToSection[r.calendarItemIdentifier]
 			let cardTag = secName != nil ? " [Card: \(secName!)]" : ""
 			let statusTag = r.isCompleted ? " [Completed]" : ""
-			print("  • [\(calTitle)] Due: \(dueStr) - \(r.title ?? "")\(cardTag)\(statusTag)")
+			let repTag = (r.recurrenceRules?.first != nil) ? " [\(formatRecurrenceRule(r.recurrenceRules!.first!))]" : ""
+			print("  • [\(calTitle)] Due: \(dueStr) - \(r.title ?? "")\(repTag)\(cardTag)\(statusTag)")
 			if config.showDetails, let notes = r.notes, !notes.isEmpty {
 				print("    Notes: \(notes)")
 			}
@@ -749,11 +875,20 @@ func handleEditReminder(config: Config, store: EKEventStore, allCalendars: [EKCa
 			}
 		}
 
+		if config.clearRecurrence {
+			reminder.recurrenceRules = nil
+		} else if let rule = buildRecurrenceRule(config: config) {
+			reminder.recurrenceRules = [rule]
+		}
+
 		do {
 			try store.save(reminder, commit: true)
 			print("✅ Reminder updated successfully:")
-			print("   • Title: \(reminder.title ?? "")")
-			print("   • List:  [\(reminder.calendar.source.title)] -> \(reminder.calendar.title)")
+			print("   • Title:  \(reminder.title ?? "")")
+			print("   • List:   [\(reminder.calendar.source.title)] -> \(reminder.calendar.title)")
+			if let rule = reminder.recurrenceRules?.first {
+				print("   • Repeat: \(formatRecurrenceRule(rule))")
+			}
 		} catch {
 			fputs("Error updating reminder: \(error.localizedDescription)\n", stderr)
 			exit(1)
