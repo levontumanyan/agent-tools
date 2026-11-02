@@ -1153,8 +1153,15 @@ func handleEdit(config: Config, store: EKEventStore, allCalendars: [EKCalendar])
 		}
 	}
 
+	if config.clearRecurrence {
+		event.recurrenceRules = nil
+	} else if let rule = buildRecurrenceRule(config: config) {
+		event.recurrenceRules = [rule]
+	}
+
 	do {
-		try store.save(event, span: .thisEvent)
+		let span: EKSpan = event.hasRecurrenceRules ? .futureEvents : .thisEvent
+		try store.save(event, span: span)
 		let df = DateFormatter()
 		df.dateStyle = .medium
 		df.timeStyle = event.isAllDay ? .none : .short
@@ -1162,6 +1169,9 @@ func handleEdit(config: Config, store: EKEventStore, allCalendars: [EKCalendar])
 		print("   • Title:    \(event.title ?? "")")
 		print("   • When:     \(df.string(from: event.startDate)) - \(df.string(from: event.endDate))")
 		print("   • Calendar: [\(event.calendar.source.title)] -> \(event.calendar.title)")
+		if let rule = event.recurrenceRules?.first {
+			print("   • Repeat:   \(formatRecurrenceRule(rule))")
+		}
 		if let loc = event.location, !loc.isEmpty {
 			print("   • Location: \(loc)")
 		}
@@ -1395,6 +1405,36 @@ func main() {
 					exit(1)
 				}
 				config.startDate = d
+			}
+		case "--repeat", "--recurrence", "-R":
+			if idx + 1 < args.count {
+				idx += 1
+				guard let parsed = parseRepeat(args[idx]) else {
+					fputs("Error: Invalid repeat value '\(args[idx])'. Use daily, weekly, monthly, yearly, 'every 2 days', 2w, or none.\n", stderr)
+					exit(1)
+				}
+				config.repeatFrequency = parsed.frequency
+				config.repeatInterval = parsed.interval
+				config.clearRecurrence = parsed.clear
+			}
+		case "--count":
+			if idx + 1 < args.count {
+				idx += 1
+				if let val = Int(args[idx]), val > 0 {
+					config.repeatCount = val
+				} else {
+					fputs("Error: Invalid count '\(args[idx])'. Must be a positive integer.\n", stderr)
+					exit(1)
+				}
+			}
+		case "--until":
+			if idx + 1 < args.count {
+				idx += 1
+				guard let d = parseDate(args[idx], isEndOfDay: true) else {
+					fputs("Error: Could not parse date '\(args[idx])'.\n", stderr)
+					exit(1)
+				}
+				config.repeatUntil = d
 			}
 		default:
 			break

@@ -94,10 +94,17 @@ class BraveSessionManager:
 		# Check if an existing context is still alive
 		if self._context is not None:
 			try:
-				_ = self._context.pages
-				return self._context
+				if self._browser is not None and not self._browser.is_connected():
+					self._browser = None
+					self._context = None
+				elif hasattr(self._context, "is_closed") and self._context.is_closed():
+					self._context = None
+				else:
+					_ = self._context.pages
+					return self._context
 			except Exception:
 				self._context = None
+				self._browser = None
 
 		# 1. Try attaching to existing CDP session (e.g., if launched on port 9222)
 		try:
@@ -155,23 +162,36 @@ class BraveSessionManager:
 		return [p for p in context.pages if not p.is_closed()]
 
 	async def get_active_page(self) -> Page:
-		context = await self.get_context()
-		if self._active_page is not None and not self._active_page.is_closed():
-			return self._active_page
+		try:
+			context = await self.get_context()
+			if self._active_page is not None and not self._active_page.is_closed():
+				return self._active_page
 
-		pages = await self.get_pages()
-		# If this session attached via CDP to an already-active browser session
-		if self._browser is not None:
-			# Always open a new dedicated tab for this session so we do not hijack other sessions
-			self._active_page = await context.new_page()
-			return self._active_page
+			pages = await self.get_pages()
+			# If this session attached via CDP to an already-active browser session
+			if self._browser is not None:
+				# Always open a new dedicated tab for this session so we do not hijack other sessions
+				self._active_page = await context.new_page()
+				return self._active_page
 
-		# Primary launcher session
-		if pages:
-			self._active_page = pages[0]
-		else:
-			self._active_page = await context.new_page()
-		return self._active_page
+			# Primary launcher session
+			if pages:
+				self._active_page = pages[0]
+			else:
+				self._active_page = await context.new_page()
+			return self._active_page
+		except Exception as exc:
+			if "closed" in str(exc).lower():
+				# Browser window was killed externally; reset and relaunch
+				await self.close()
+				context = await self.get_context()
+				pages = await self.get_pages()
+				if pages:
+					self._active_page = pages[0]
+				else:
+					self._active_page = await context.new_page()
+				return self._active_page
+			raise
 
 	def set_active_page(self, page: Page):
 		self._active_page = page
@@ -355,11 +375,14 @@ async def brave_switch_tab(index: int) -> str:
 
 @mcp.tool()
 async def brave_close_tab(index: int = -1) -> str:
-	"""Close a tab by index (-1 closes the active tab in this session)."""
+	"""Close a tab by index (-1 closes active tab, -99 or closing last tab terminates the browser window)."""
 	try:
+		if index == -99:
+			return await brave_close_browser()
+
 		pages = await session.get_pages()
 		if not pages:
-			return "No tabs to close."
+			return await brave_close_browser()
 
 		if index == -1:
 			page = await session.get_active_page()
@@ -376,9 +399,32 @@ async def brave_close_tab(index: int = -1) -> str:
 			session._active_page = None
 
 		remaining = await session.get_pages()
+		if not remaining:
+			await brave_close_browser()
+			return f"Closed last tab [{target_index}] ({url}). Browser window completely closed."
 		return f"Closed tab [{target_index}] ({url}). Remaining open tabs: {len(remaining)}"
 	except Exception as exc:
 		return f"Error closing tab: {exc}"
+
+
+@mcp.tool()
+async def brave_close_browser() -> str:
+	"""Completely close the browser window, terminate the browser process, and release all resources."""
+	try:
+		if session._context is not None:
+			try:
+				await session._context.close()
+			except Exception:
+				pass
+		if session._browser is not None:
+			try:
+				await session._browser.close()
+			except Exception:
+				pass
+		await session.close()
+		return "Browser completely closed and all resources released."
+	except Exception as exc:
+		return f"Error closing browser: {exc}"
 
 
 def main():
