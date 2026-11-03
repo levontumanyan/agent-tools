@@ -198,9 +198,20 @@ def cmd_read(args):
 		print(f"Date:    {format_date(msg.date)}")
 		print(f"Folder:  {folder} (UID: {msg.uid})")
 		if msg.attachments:
-			att_names = [att.filename or "unnamed" for att in msg.attachments]
+			att_names = [f"{att.filename or 'unnamed'} ({len(att.payload)} bytes)" for att in msg.attachments]
 			print(f"Attach:  {', '.join(att_names)}")
 		print("-" * 60)
+
+		if getattr(args, "attachments", False) and msg.attachments:
+			out_dir = Path(getattr(args, "output_dir", None) or ".").resolve()
+			out_dir.mkdir(parents=True, exist_ok=True)
+			print(f"Downloading {len(msg.attachments)} attachment(s) to {out_dir}:")
+			for att in msg.attachments:
+				fname = att.filename or "attachment"
+				target = out_dir / fname
+				target.write_bytes(att.payload)
+				print(f"  ✓ Saved: {target.name} ({len(att.payload)} bytes) -> {target}")
+			print("-" * 60)
 
 		if getattr(args, "raw", False):
 			body = msg.html or msg.text or "(Empty message)"
@@ -361,6 +372,8 @@ def main():
 	p_read = subparsers.add_parser("read", help="Read a specific email by UID")
 	p_read.add_argument("message_id", help="Message UID")
 	p_read.add_argument("-f", "--folder", default="INBOX", help="Mail folder name (default: INBOX)")
+	p_read.add_argument("-a", "--attachments", action="store_true", help="Download and save all email attachments")
+	p_read.add_argument("-d", "--output-dir", default=".", help="Directory to save attachments (default: current directory)")
 	p_read.add_argument("--raw", action="store_true", help="Show raw HTML/unprocessed body")
 	p_read.set_defaults(func=cmd_read)
 
