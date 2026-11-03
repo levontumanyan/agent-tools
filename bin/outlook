@@ -163,44 +163,152 @@ def cmd_auth(args):
 		print("Authenticated successfully.")
 
 
+WELL_KNOWN_FOLDERS = {
+	"inbox": "inbox",
+	"archive": "archive",
+	"drafts": "drafts",
+	"deleteditems": "deleteditems",
+	"deleted items": "deleteditems",
+	"junk": "junkemail",
+	"junkemail": "junkemail",
+	"junk email": "junkemail",
+	"sent": "sentitems",
+	"sentitems": "sentitems",
+	"sent items": "sentitems",
+	"outbox": "outbox",
+}
+
+_FOLDER_CACHE: tuple[dict[str, str], set[str]] | None = None
+
+
+def fetch_all_folders(headers: dict, parent_id: str | None = None) -> list[dict]:
+	url = f"{GRAPH_ENDPOINT}/me/mailFolders" if parent_id is None else f"{GRAPH_ENDPOINT}/me/mailFolders/{parent_id}/childFolders"
+	folders = []
+	next_link = f"{url}?$top=100"
+	while next_link:
+		resp = requests.get(next_link, headers=headers)
+		if resp.status_code != 200:
+			break
+		data = resp.json()
+		folders.extend(data.get("value", []))
+		next_link = data.get("@odata.nextLink")
+	return folders
+
+
+def get_all_folders_recursive(headers: dict) -> list[dict]:
+	result = []
+
+	def walk(parent_id: str | None = None):
+		folders = fetch_all_folders(headers, parent_id)
+		for f in folders:
+			result.append(f)
+			if f.get("childFolderCount", 0) > 0:
+				walk(f.get("id"))
+
+	walk()
+	return result
+
+
+def get_folder_info(headers: dict, force_refresh: bool = False) -> tuple[dict[str, str], set[str]]:
+	global _FOLDER_CACHE
+	if _FOLDER_CACHE is not None and not force_refresh:
+		return _FOLDER_CACHE
+
+	folders = get_all_folders_recursive(headers)
+	folder_map = {}
+	excluded_ids = set()
+
+	for f in folders:
+		fid = f.get("id")
+		if not fid:
+			continue
+		name = f.get("displayName", "Unknown")
+		folder_map[fid] = name
+		well_known = (f.get("wellKnownName") or "").lower()
+		display = name.lower()
+		if well_known in ("sentitems", "deleteditems", "drafts") or display in ("sent items", "deleted items", "drafts"):
+			excluded_ids.add(fid)
+
+	_FOLDER_CACHE = (folder_map, excluded_ids)
+	return _FOLDER_CACHE
+
+
+def resolve_folder_id(headers: dict, identifier: str) -> str:
+	lowered = identifier.lower().strip()
+	if lowered in WELL_KNOWN_FOLDERS:
+		return WELL_KNOWN_FOLDERS[lowered]
+
+	folder_map, _ = get_folder_info(headers)
+	for fid, name in folder_map.items():
+		if fid == identifier or name.lower() == lowered:
+			return fid
+	return identifier
+
+
+def print_message_table(messages: list[dict], folder_map: dict[str, str], verbose: bool = False):
+	print(f"{'#':<3} {'STATUS':<7} {'DATE':<19} {'FOLDER':<16} {'FROM':<28} {'SUBJECT'}")
+	print("-" * 110)
+	for idx, msg in enumerate(messages, 1):
+		status = "READ" if msg.get("isRead") else "UNREAD"
+		date_str = msg.get("receivedDateTime", "")[:19].replace("T", " ")
+		parent_id = msg.get("parentFolderId")
+		folder_name = folder_map.get(parent_id, "-")
+		if len(folder_name) > 15:
+			folder_name = folder_name[:13] + "..."
+		from_str = format_address(msg.get("from"))
+		if len(from_str) > 26:
+			from_str = from_str[:23] + "..."
+		subject = msg.get("subject") or "(No Subject)"
+		if len(subject) > 38:
+			subject = subject[:35] + "..."
+		msg_id = msg.get("id")
+		print(f"{idx:<3} {status:<7} {date_str:<19} {folder_name:<16} {from_str:<28} {subject}")
+		if verbose:
+			print(f"    ID: {msg_id}")
+
+
 def cmd_list(args):
 	token = get_access_token(interactive=True)
 	headers = get_headers(token)
 
 	params = {
 		"$top": str(args.limit),
-		"$select": "id,subject,receivedDateTime,from,isRead,hasAttachments",
+		"$select": "id,subject,receivedDateTime,from,isRead,hasAttachments,parentFolderId",
 		"$orderby": "receivedDateTime desc",
 	}
 
+	filters = []
 	if getattr(args, "unread_only", False):
-		params["$filter"] = "isRead eq false"
+		filters.append("isRead eq false")
 
-	resp = requests.get(f"{GRAPH_ENDPOINT}/me/mailFolders/inbox/messages", headers=headers, params=params)
+	target_folder = getattr(args, "folder", None)
+	folder_map, excluded_ids = get_folder_info(headers)
+
+	if target_folder:
+		folder_id = resolve_folder_id(headers, target_folder)
+		url = f"{GRAPH_ENDPOINT}/me/mailFolders/{folder_id}/messages"
+	else:
+		url = f"{GRAPH_ENDPOINT}/me/messages"
+		filters.append("isDraft eq false")
+		for fid in excluded_ids:
+			filters.append(f"parentFolderId ne '{fid}'")
+
+	if filters:
+		params["$filter"] = " and ".join(filters)
+
+	resp = requests.get(url, headers=headers, params=params)
 	if resp.status_code != 200:
 		sys.exit(f"Error fetching messages: {resp.status_code} {resp.text}")
 
 	data = resp.json()
 	messages = data.get("value", [])
 	if not messages:
-		print("No messages found in inbox.")
+		folder_label = f"in '{target_folder}'" if target_folder else "across all folders"
+		type_label = "unread messages" if getattr(args, "unread_only", False) else "messages"
+		print(f"No {type_label} found {folder_label}.")
 		return
 
-	print(f"{'#':<3} {'STATUS':<7} {'DATE':<19} {'FROM':<30} {'SUBJECT'}")
-	print("-" * 90)
-	for idx, msg in enumerate(messages, 1):
-		status = "READ" if msg.get("isRead") else "UNREAD"
-		date_str = msg.get("receivedDateTime", "")[:19].replace("T", " ")
-		from_str = format_address(msg.get("from"))
-		if len(from_str) > 28:
-			from_str = from_str[:25] + "..."
-		subject = msg.get("subject") or "(No Subject)"
-		if len(subject) > 40:
-			subject = subject[:37] + "..."
-		msg_id = msg.get("id")
-		print(f"{idx:<3} {status:<7} {date_str:<19} {from_str:<30} {subject}")
-		if args.verbose:
-			print(f"    ID: {msg_id}")
+	print_message_table(messages, folder_map, getattr(args, "verbose", False))
 
 
 def cmd_search(args):
@@ -209,35 +317,43 @@ def cmd_search(args):
 
 	params = {
 		"$top": str(args.limit),
-		"$select": "id,subject,receivedDateTime,from,isRead,hasAttachments",
+		"$select": "id,subject,receivedDateTime,from,isRead,hasAttachments,parentFolderId",
 		"$search": f'"{args.query}"',
 	}
 
-	resp = requests.get(f"{GRAPH_ENDPOINT}/me/messages", headers=headers, params=params)
-	if resp.status_code != 200:
-		sys.exit(f"Error searching messages: {resp.status_code} {resp.text}")
+	target_folder = getattr(args, "folder", None)
+	include_junk = getattr(args, "include_junk", False)
+	folder_map, _ = get_folder_info(headers)
 
-	data = resp.json()
-	messages = data.get("value", [])
+	if target_folder:
+		folder_id = resolve_folder_id(headers, target_folder)
+		resp = requests.get(f"{GRAPH_ENDPOINT}/me/mailFolders/{folder_id}/messages", headers=headers, params=params)
+		if resp.status_code != 200:
+			sys.exit(f"Error searching messages in '{target_folder}': {resp.status_code} {resp.text}")
+		messages = resp.json().get("value", [])
+	else:
+		resp = requests.get(f"{GRAPH_ENDPOINT}/me/messages", headers=headers, params=params)
+		if resp.status_code != 200:
+			sys.exit(f"Error searching messages: {resp.status_code} {resp.text}")
+		messages = resp.json().get("value", [])
+
+		if include_junk:
+			junk_resp = requests.get(f"{GRAPH_ENDPOINT}/me/mailFolders/junkemail/messages", headers=headers, params=params)
+			if junk_resp.status_code == 200:
+				junk_messages = junk_resp.json().get("value", [])
+				existing_ids = {m.get("id") for m in messages}
+				for jm in junk_messages:
+					if jm.get("id") not in existing_ids:
+						messages.append(jm)
+				messages.sort(key=lambda m: m.get("receivedDateTime", ""), reverse=True)
+				messages = messages[:args.limit]
+
 	if not messages:
-		print(f"No messages matching '{args.query}'.")
+		folder_label = f" in '{target_folder}'" if target_folder else ""
+		print(f"No messages matching '{args.query}'{folder_label}.")
 		return
 
-	print(f"{'#':<3} {'STATUS':<7} {'DATE':<19} {'FROM':<30} {'SUBJECT'}")
-	print("-" * 90)
-	for idx, msg in enumerate(messages, 1):
-		status = "READ" if msg.get("isRead") else "UNREAD"
-		date_str = msg.get("receivedDateTime", "")[:19].replace("T", " ")
-		from_str = format_address(msg.get("from"))
-		if len(from_str) > 28:
-			from_str = from_str[:25] + "..."
-		subject = msg.get("subject") or "(No Subject)"
-		if len(subject) > 40:
-			subject = subject[:37] + "..."
-		msg_id = msg.get("id")
-		print(f"{idx:<3} {status:<7} {date_str:<19} {from_str:<30} {subject}")
-		if args.verbose:
-			print(f"    ID: {msg_id}")
+	print_message_table(messages, folder_map, getattr(args, "verbose", False))
 
 
 def cmd_read(args):
@@ -331,55 +447,6 @@ def cmd_draft(args):
 		print("Email sent successfully!")
 
 
-WELL_KNOWN_FOLDERS = {
-	"inbox": "inbox",
-	"archive": "archive",
-	"drafts": "drafts",
-	"deleteditems": "deleteditems",
-	"deleted items": "deleteditems",
-	"junk": "junkemail",
-	"junkemail": "junkemail",
-	"junk email": "junkemail",
-	"sent": "sentitems",
-	"sentitems": "sentitems",
-	"sent items": "sentitems",
-	"outbox": "outbox",
-}
-
-
-def fetch_all_folders(headers: dict, parent_id: str | None = None) -> list[dict]:
-	url = f"{GRAPH_ENDPOINT}/me/mailFolders" if parent_id is None else f"{GRAPH_ENDPOINT}/me/mailFolders/{parent_id}/childFolders"
-	folders = []
-	next_link = f"{url}?$top=100"
-	while next_link:
-		resp = requests.get(next_link, headers=headers)
-		if resp.status_code != 200:
-			break
-		data = resp.json()
-		folders.extend(data.get("value", []))
-		next_link = data.get("@odata.nextLink")
-	return folders
-
-
-def resolve_folder_id(headers: dict, identifier: str) -> str:
-	lowered = identifier.lower().strip()
-	if lowered in WELL_KNOWN_FOLDERS:
-		return WELL_KNOWN_FOLDERS[lowered]
-
-	def search(parent_id: str | None = None) -> str | None:
-		for f in fetch_all_folders(headers, parent_id):
-			if f.get("id") == identifier or f.get("displayName", "").lower() == lowered:
-				return f.get("id")
-			if f.get("childFolderCount", 0) > 0:
-				found = search(f.get("id"))
-				if found:
-					return found
-		return None
-
-	match = search()
-	return match if match else identifier
-
-
 def cmd_folders(args):
 	token = get_access_token(interactive=True)
 	headers = get_headers(token)
@@ -388,6 +455,7 @@ def cmd_folders(args):
 		folder_name = args.create
 		resp = requests.post(f"{GRAPH_ENDPOINT}/me/mailFolders", headers=headers, json={"displayName": folder_name})
 		if resp.status_code in (200, 201):
+			get_folder_info(headers, force_refresh=True)
 			data = resp.json()
 			print(f"Created folder '{folder_name}' (ID: {data.get('id')})")
 		else:
@@ -399,6 +467,7 @@ def cmd_folders(args):
 		folder_id = resolve_folder_id(headers, target)
 		resp = requests.delete(f"{GRAPH_ENDPOINT}/me/mailFolders/{folder_id}", headers=headers)
 		if resp.status_code in (200, 204):
+			get_folder_info(headers, force_refresh=True)
 			print(f"Deleted folder '{target}'.")
 		else:
 			sys.exit(f"Error deleting folder: {resp.status_code} {resp.text}")
@@ -492,14 +561,16 @@ def main():
 	p_auth = subparsers.add_parser("auth", help="Authenticate with Microsoft Graph")
 	p_auth.set_defaults(func=cmd_auth)
 
-	# list / inbox
-	p_list = subparsers.add_parser("list", help="List recent emails in inbox")
+	# list
+	p_list = subparsers.add_parser("list", help="List recent emails across all folders or a specific folder")
+	p_list.add_argument("-f", "--folder", help="Specific folder to list (e.g. inbox, junk, financials)")
 	p_list.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
 	p_list.add_argument("-v", "--verbose", action="store_true", help="Show full message IDs")
 	p_list.set_defaults(func=cmd_list)
 
 	# unread
-	p_unread = subparsers.add_parser("unread", help="List unread emails in inbox")
+	p_unread = subparsers.add_parser("unread", help="List unread emails across all folders or a specific folder")
+	p_unread.add_argument("-f", "--folder", help="Specific folder to check (e.g. inbox, junk, financials)")
 	p_unread.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
 	p_unread.add_argument("-v", "--verbose", action="store_true", help="Show full message IDs")
 	p_unread.set_defaults(func=lambda args: (setattr(args, "unread_only", True), cmd_list(args)))
@@ -507,6 +578,8 @@ def main():
 	# search
 	p_search = subparsers.add_parser("search", help="Search emails")
 	p_search.add_argument("query", help="Search string")
+	p_search.add_argument("-f", "--folder", help="Search within a specific folder (e.g. junk, inbox, archive)")
+	p_search.add_argument("-j", "--include-junk", action="store_true", help="Include Junk folder in search")
 	p_search.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
 	p_search.add_argument("-v", "--verbose", action="store_true", help="Show full message IDs")
 	p_search.set_defaults(func=cmd_search)
@@ -563,10 +636,11 @@ def main():
 
 	args = parser.parse_args()
 	if not args.command:
-		# Default action if no subcommand is passed: list inbox
+		# Default action if no subcommand is passed: list all folders
 		args.limit = 10
 		args.verbose = False
 		args.unread_only = False
+		args.folder = None
 		cmd_list(args)
 	else:
 		args.func(args)
