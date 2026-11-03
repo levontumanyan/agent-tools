@@ -4,6 +4,7 @@
 - **Call Recordings CLI**: Access, search, transcribe, and export iPhone call recordings synced to Apple Notes via `call-recordings [list]`, `call-recordings read <id>`, `call-recordings transcribe <id|--all>`, `call-recordings search "<query>"`, `call-recordings export <id>`, or `call-recordings open <id>` (see `call-recordings --help`). Uses native on-device speech recognition via macOS `Speech` framework with local transcript caching.
 - **WhatsApp CLI**: Use `whatsapp chats` (list/recent), `whatsapp read "<contact/phone/username>"` (supports `@username`), `whatsapp documents` (list/search docs & attachments), `whatsapp search "<query>"`, `whatsapp unread`, or `whatsapp draft --to "<contact/phone/username>" --message "<text>"` (see `whatsapp --help`).
 - **Outlook CLI**: Reads, searches, and drafts Outlook emails via Microsoft Graph API; see `outlook --help` for options.
+- **Yahoo Mail CLI**: Reads, searches, and drafts Yahoo emails via IMAP/SMTP; see `yahoo --help` for options.
 - **Apple Pay CLI**: Queries and searches local Apple Pay transactions on macOS; see `apple-pay --help` for options.
 - **iMessage CLI**: Queries, searches, and inspects local iMessage chat history and attachments on macOS (supports `-a` / `--attachments`); see `imessage --help` for options.
 - **Browser Automation MCP**: Always use the stealth browser MCP (`brave-mcp`) for agent browsing; see `brave-mcp --help` for options. Never launch system browser binaries directly.

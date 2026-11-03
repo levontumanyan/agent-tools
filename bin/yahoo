@@ -1,0 +1,415 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+# 	"imap-tools",
+# 	"html2text",
+# 	"python-dotenv",
+# ]
+# ///
+
+import argparse
+import email.utils
+from email.message import EmailMessage
+import os
+from pathlib import Path
+import smtplib
+import subprocess
+import sys
+from dotenv import load_dotenv
+import html2text
+from imap_tools import AND, MailBox
+
+# Load .env from ~/.local/bin/.env first, then current working directory
+local_bin_env = Path.home() / ".local" / "bin" / ".env"
+if local_bin_env.exists():
+	load_dotenv(local_bin_env)
+load_dotenv()
+
+IMAP_SERVER = "imap.mail.yahoo.com"
+IMAP_PORT = 993
+SMTP_SERVER = "smtp.mail.yahoo.com"
+SMTP_PORT = 465
+
+
+def get_credentials() -> tuple[str, str]:
+	email_addr = os.getenv("YAHOO_EMAIL")
+	password = os.getenv("YAHOO_APP_PASSWORD") or os.getenv("YAHOO_PASSWORD")
+
+	if sys.platform == "darwin" and (not email_addr or not password):
+		# Try service "yahoo-app" first, then "yahoo-mail-password"
+		for service in ("yahoo-app", "yahoo-mail-password"):
+			try:
+				cmd = ["security", "find-generic-password", "-s", service]
+				if not email_addr:
+					out_acc = subprocess.check_output(
+						cmd,
+						stderr=subprocess.DEVNULL,
+						text=True,
+					)
+					for line in out_acc.splitlines():
+						if '"acct"<blob>=' in line:
+							email_addr = line.split('"acct"<blob>=', 1)[1].strip().strip('"')
+							break
+				if not password:
+					out_pw = subprocess.check_output(
+						cmd + ["-w"],
+						stderr=subprocess.DEVNULL,
+						text=True,
+					).strip()
+					if out_pw:
+						password = out_pw.replace(" ", "")
+				if email_addr and password:
+					break
+			except Exception:
+				continue
+
+	if not email_addr or not password:
+		sys.exit(
+			"Error: Yahoo credentials not found.\n"
+			"Store your credentials in macOS Keychain with:\n"
+			'  security add-generic-password -U -s "yahoo-app" -a "your-email@yahoo.com" -w\n'
+			"Or set YAHOO_EMAIL and YAHOO_APP_PASSWORD in ~/.local/bin/.env"
+		)
+
+	return email_addr, password
+
+
+def get_mailbox(folder: str = "INBOX") -> tuple[MailBox, str]:
+	email_addr, password = get_credentials()
+	try:
+		mb = MailBox(IMAP_SERVER, port=IMAP_PORT).login(email_addr, password, initial_folder=folder)
+		return mb, email_addr
+	except Exception as e:
+		sys.exit(f"Error connecting to Yahoo Mail (IMAP): {e}")
+
+
+def format_address(addr: str) -> str:
+	if not addr:
+		return "Unknown"
+	name, email_part = email.utils.parseaddr(addr)
+	if name and name != email_part:
+		return f"{name} <{email_part}>"
+	return email_part or addr
+
+
+def format_date(dt) -> str:
+	if not dt:
+		return "Unknown"
+	try:
+		return dt.strftime("%Y-%m-%d %H:%M:%S")
+	except Exception:
+		return str(dt)[:19]
+
+
+def cmd_auth(args):
+	email_addr, password = get_credentials()
+	print(f"Checking credentials for: {email_addr} ...")
+
+	# Test IMAP
+	try:
+		with MailBox(IMAP_SERVER, port=IMAP_PORT).login(email_addr, password, initial_folder="INBOX") as mb:
+			count = mb.folder.status("INBOX").get("MESSAGES", 0)
+			print(f"✓ IMAP connection successful ({IMAP_SERVER}:{IMAP_PORT}). Inbox messages: {count}")
+	except Exception as e:
+		sys.exit(f"✗ IMAP connection failed: {e}")
+
+	# Test SMTP
+	try:
+		with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+			server.login(email_addr, password)
+			print(f"✓ SMTP connection successful ({SMTP_SERVER}:{SMTP_PORT}). Ready to send/draft.")
+	except Exception as e:
+		sys.exit(f"✗ SMTP connection failed: {e}")
+
+	print(f"\nAuthenticated successfully as {email_addr}")
+
+
+def cmd_list(args):
+	folder = getattr(args, "folder", None) or "INBOX"
+	mb, _ = get_mailbox(folder)
+	with mb:
+		criteria = AND(seen=False) if getattr(args, "unread_only", False) else "ALL"
+		messages = list(mb.fetch(criteria, limit=args.limit, reverse=True))
+
+		if not messages:
+			folder_desc = f"in '{folder}'"
+			unread_desc = "unread " if getattr(args, "unread_only", False) else ""
+			print(f"No {unread_desc}messages found {folder_desc}.")
+			return
+
+		print(f"{'#':<3} {'STATUS':<7} {'DATE':<19} {'FROM':<30} {'SUBJECT'}")
+		print("-" * 90)
+		for idx, msg in enumerate(messages, 1):
+			status = "UNREAD" if "\\Seen" not in msg.flags else "READ"
+			date_str = format_date(msg.date)
+			from_str = format_address(msg.from_)
+			if len(from_str) > 28:
+				from_str = from_str[:25] + "..."
+			subject = msg.subject or "(No Subject)"
+			if len(subject) > 40:
+				subject = subject[:37] + "..."
+			print(f"{idx:<3} {status:<7} {date_str:<19} {from_str:<30} {subject}")
+			if args.verbose or True:  # Include UID for easy inspection/reading
+				print(f"    UID: {msg.uid}")
+
+
+def cmd_search(args):
+	folder = getattr(args, "folder", None) or "INBOX"
+	mb, _ = get_mailbox(folder)
+	with mb:
+		# Search by TEXT (searches headers and body)
+		messages = list(mb.fetch(AND(text=args.query), limit=args.limit, reverse=True))
+		if not messages:
+			print(f"No messages matching '{args.query}' in folder '{folder}'.")
+			return
+
+		print(f"{'#':<3} {'STATUS':<7} {'DATE':<19} {'FROM':<30} {'SUBJECT'}")
+		print("-" * 90)
+		for idx, msg in enumerate(messages, 1):
+			status = "UNREAD" if "\\Seen" not in msg.flags else "READ"
+			date_str = format_date(msg.date)
+			from_str = format_address(msg.from_)
+			if len(from_str) > 28:
+				from_str = from_str[:25] + "..."
+			subject = msg.subject or "(No Subject)"
+			if len(subject) > 40:
+				subject = subject[:37] + "..."
+			print(f"{idx:<3} {status:<7} {date_str:<19} {from_str:<30} {subject}")
+			print(f"    UID: {msg.uid}")
+
+
+def cmd_read(args):
+	folder = getattr(args, "folder", None) or "INBOX"
+	mb, _ = get_mailbox(folder)
+	with mb:
+		msgs = list(mb.fetch(AND(uid=str(args.message_id))))
+		if not msgs:
+			# If not found in current folder, search all folders or report error
+			sys.exit(f"Error: Message with UID '{args.message_id}' not found in folder '{folder}'.")
+
+		msg = msgs[0]
+		print("-" * 60)
+		print(f"Subject: {msg.subject or '(No Subject)'}")
+		print(f"From:    {format_address(msg.from_)}")
+		print(f"To:      {', '.join(format_address(t) for t in msg.to)}")
+		if msg.cc:
+			print(f"CC:      {', '.join(format_address(c) for c in msg.cc)}")
+		print(f"Date:    {format_date(msg.date)}")
+		print(f"Folder:  {folder} (UID: {msg.uid})")
+		if msg.attachments:
+			att_names = [att.filename or "unnamed" for att in msg.attachments]
+			print(f"Attach:  {', '.join(att_names)}")
+		print("-" * 60)
+
+		if getattr(args, "raw", False):
+			body = msg.html or msg.text or "(Empty message)"
+		elif msg.text and msg.text.strip():
+			body = msg.text.strip()
+		elif msg.html and msg.html.strip():
+			h = html2text.HTML2Text()
+			h.ignore_links = False
+			h.body_width = 0
+			body = h.handle(msg.html).strip()
+		else:
+			body = "(Empty message)"
+
+		print(body)
+		print("-" * 60)
+
+
+def build_email_message(args, from_addr: str) -> EmailMessage:
+	msg = EmailMessage()
+	msg["From"] = from_addr
+	msg["To"] = ", ".join(args.to) if isinstance(args.to, list) else args.to
+	if getattr(args, "cc", None):
+		msg["Cc"] = ", ".join(args.cc) if isinstance(args.cc, list) else args.cc
+	if getattr(args, "bcc", None):
+		msg["Bcc"] = ", ".join(args.bcc) if isinstance(args.bcc, list) else args.bcc
+	msg["Subject"] = args.subject or ""
+
+	body = ""
+	if getattr(args, "file", None):
+		if args.file == "-":
+			body = sys.stdin.read()
+		else:
+			fpath = Path(args.file)
+			if not fpath.exists():
+				sys.exit(f"Error: File not found: {args.file}")
+			body = fpath.read_text()
+	elif getattr(args, "body", None) is not None:
+		body = args.body
+	elif not sys.stdin.isatty():
+		body = sys.stdin.read()
+
+	if getattr(args, "html", False):
+		msg.set_content(body, subtype="html")
+	else:
+		msg.set_content(body)
+
+	return msg
+
+
+def cmd_draft(args):
+	email_addr, password = get_credentials()
+	msg = build_email_message(args, email_addr)
+
+	if getattr(args, "send", False):
+		# Send directly
+		try:
+			with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+				server.login(email_addr, password)
+				server.send_message(msg)
+			print("Email sent successfully!")
+		except Exception as e:
+			sys.exit(f"Error sending email: {e}")
+		return
+
+	# Append to Draft folder via IMAP
+	try:
+		with MailBox(IMAP_SERVER, port=IMAP_PORT).login(email_addr, password) as mb:
+			# Find draft folder name
+			draft_folder = "Draft"
+			for f in mb.folder.list():
+				if "\\Drafts" in f.flags or f.name.lower() in ("draft", "drafts"):
+					draft_folder = f.name
+					break
+			mb.append(draft_folder, msg.as_bytes(), flags=("\\Draft", "\\Seen"))
+			print(f"Draft saved successfully to '{draft_folder}' folder!")
+			print(f"Subject: {msg['Subject']}")
+			print(f"To:      {msg['To']}")
+	except Exception as e:
+		sys.exit(f"Error saving draft: {e}")
+
+
+def cmd_send(args):
+	email_addr, password = get_credentials()
+	msg = build_email_message(args, email_addr)
+
+	try:
+		with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+			server.login(email_addr, password)
+			server.send_message(msg)
+		print("Email sent successfully!")
+		print(f"To:      {msg['To']}")
+		print(f"Subject: {msg['Subject']}")
+	except Exception as e:
+		sys.exit(f"Error sending email: {e}")
+
+
+def cmd_folders(args):
+	mb, _ = get_mailbox()
+	with mb:
+		folders = mb.folder.list()
+		for f in sorted(folders, key=lambda x: x.name):
+			try:
+				status = mb.folder.status(f.name)
+				total = status.get("MESSAGES", 0)
+				unseen = status.get("UNSEEN", 0)
+				unread_info = f", Unread: {unseen}" if unseen > 0 else ""
+				flags_info = f" [{', '.join(f.flags)}]" if getattr(args, "verbose", False) else ""
+				print(f"- {f.name} ({total} items{unread_info}){flags_info}")
+			except Exception:
+				print(f"- {f.name}")
+
+
+def cmd_move(args):
+	folder = getattr(args, "folder", None) or "INBOX"
+	mb, _ = get_mailbox(folder)
+	with mb:
+		try:
+			mb.move([str(args.message_id)], args.destination)
+			print(f"Successfully moved message UID {args.message_id} from '{folder}' to '{args.destination}'.")
+		except Exception as e:
+			sys.exit(f"Error moving message: {e}")
+
+
+def main():
+	parser = argparse.ArgumentParser(
+		prog="yahoo",
+		description="CLI to read, search, draft, organize emails and folders via Yahoo Mail IMAP/SMTP",
+	)
+	subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+
+	# auth
+	p_auth = subparsers.add_parser("auth", help="Verify credentials and connectivity with Yahoo Mail")
+	p_auth.set_defaults(func=cmd_auth)
+
+	# list / inbox
+	p_list = subparsers.add_parser("list", help="List recent emails in inbox or folder")
+	p_list.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
+	p_list.add_argument("-f", "--folder", default="INBOX", help="Mail folder name (default: INBOX)")
+	p_list.add_argument("-v", "--verbose", action="store_true", help="Show full debug info")
+	p_list.set_defaults(func=cmd_list)
+
+	# unread
+	p_unread = subparsers.add_parser("unread", help="List unread emails in inbox or folder")
+	p_unread.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
+	p_unread.add_argument("-f", "--folder", default="INBOX", help="Mail folder name (default: INBOX)")
+	p_unread.add_argument("-v", "--verbose", action="store_true", help="Show full debug info")
+	p_unread.set_defaults(func=lambda args: (setattr(args, "unread_only", True), cmd_list(args)))
+
+	# search
+	p_search = subparsers.add_parser("search", help="Search emails")
+	p_search.add_argument("query", help="Search string")
+	p_search.add_argument("-l", "--limit", type=int, default=10, help="Number of emails to return (default: 10)")
+	p_search.add_argument("-f", "--folder", default="INBOX", help="Mail folder name (default: INBOX)")
+	p_search.add_argument("-v", "--verbose", action="store_true", help="Show full debug info")
+	p_search.set_defaults(func=cmd_search)
+
+	# read
+	p_read = subparsers.add_parser("read", help="Read a specific email by UID")
+	p_read.add_argument("message_id", help="Message UID")
+	p_read.add_argument("-f", "--folder", default="INBOX", help="Mail folder name (default: INBOX)")
+	p_read.add_argument("--raw", action="store_true", help="Show raw HTML/unprocessed body")
+	p_read.set_defaults(func=cmd_read)
+
+	# draft
+	p_draft = subparsers.add_parser("draft", help="Create a draft email in Yahoo Mail")
+	p_draft.add_argument("-t", "--to", nargs="+", action="extend", help="Recipient email address(es)")
+	p_draft.add_argument("-c", "--cc", nargs="+", action="extend", help="CC recipient email address(es)")
+	p_draft.add_argument("-b", "--bcc", nargs="+", action="extend", help="BCC recipient email address(es)")
+	p_draft.add_argument("-s", "--subject", default="", help="Draft subject line")
+	p_draft.add_argument("--body", help="Email body text")
+	p_draft.add_argument("-f", "--file", help="Path to file containing email body (use '-' for stdin)")
+	p_draft.add_argument("--html", action="store_true", help="Treat body as HTML (default: plain text)")
+	p_draft.add_argument("--send", action="store_true", help="Send the email immediately after creating the draft")
+	p_draft.set_defaults(func=cmd_draft)
+
+	# send
+	p_send = subparsers.add_parser("send", help="Send an email via Yahoo Mail SMTP")
+	p_send.add_argument("-t", "--to", nargs="+", action="extend", required=True, help="Recipient email address(es)")
+	p_send.add_argument("-c", "--cc", nargs="+", action="extend", help="CC recipient email address(es)")
+	p_send.add_argument("-b", "--bcc", nargs="+", action="extend", help="BCC recipient email address(es)")
+	p_send.add_argument("-s", "--subject", default="", help="Email subject line")
+	p_send.add_argument("--body", help="Email body text")
+	p_send.add_argument("-f", "--file", help="Path to file containing email body (use '-' for stdin)")
+	p_send.add_argument("--html", action="store_true", help="Treat body as HTML (default: plain text)")
+	p_send.set_defaults(func=cmd_send)
+
+	# folders
+	p_folders = subparsers.add_parser("folders", help="List mail folders")
+	p_folders.add_argument("-v", "--verbose", action="store_true", help="Show folder IMAP flags")
+	p_folders.set_defaults(func=cmd_folders)
+
+	# move
+	p_move = subparsers.add_parser("move", help="Move an email to another folder")
+	p_move.add_argument("message_id", help="Message UID to move")
+	p_move.add_argument("destination", help="Destination folder name (e.g. Archive, Trash, etc.)")
+	p_move.add_argument("-f", "--folder", default="INBOX", help="Source folder name (default: INBOX)")
+	p_move.set_defaults(func=cmd_move)
+
+	args = parser.parse_args()
+	if not args.command:
+		# Default action if no subcommand is passed: list inbox
+		args.limit = 10
+		args.verbose = False
+		args.unread_only = False
+		args.folder = "INBOX"
+		cmd_list(args)
+	else:
+		args.func(args)
+
+
+if __name__ == "__main__":
+	main()

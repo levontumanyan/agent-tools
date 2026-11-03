@@ -1,12 +1,12 @@
 # agent-tools
 
-Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **Apple Pay**, **Microsoft Outlook**, **Airbnb search & scoring**, **Antigravity session recovery & telemetry**, **stealth browser automation**, and **automated reel & video downloading**.
+Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **Apple Pay**, **Microsoft Outlook**, **Yahoo Mail**, **Airbnb search & scoring**, **Antigravity session recovery & telemetry**, **stealth browser automation**, and **automated reel & video downloading**.
 
 Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` or compiled native helper) with auto-generated `--help`, zero global Python pollution, and instant startup.
 
 # Why agent-tools?
 
-- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `apple-pay`, `outlook`, `download-video`, `airbnb`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas. Stateful browser sessions use `brave-mcp`.
+- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `apple-pay`, `outlook`, `yahoo`, `download-video`, `airbnb`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas. Stateful browser sessions use `brave-mcp`.
 - **100% Local & Private**: Reads directly from local macOS SQLite databases (`ChatStorage.sqlite`, `chat.db`, Wallet passes) and native `EventKit` APIs — no third-party cloud relays.
 - **Zero Dependency Hell**: Powered by `uv` inline script metadata (`#!/usr/bin/env -S uv run --script`). Clone once, add `bin/` to `$PATH`, and every tool manages its own isolated environment automatically.
 - **macOS Browser Hang Prevention**: `brave-mcp` solves the notorious macOS Chromium/Brave `com.brave.Browser.MachPortRendezvousServer` IPC freeze by attaching over CDP or launching an isolated Patchright stealth Chromium profile with automatic idle driver teardown.
@@ -20,6 +20,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`cal-event`](src/cal-event.swift) | CLI | macOS `EventKit` | Create, query, and manage Apple Calendar events and Apple Reminders (`--reminder`) with native iCloud sync. |
 | [`call-recordings`](src/call-recordings.swift) | CLI | Apple Notes SQLite + `Speech` | Access, transcribe on-device, search, and export iPhone call recordings synced via Apple Notes. |
 | [`outlook`](bin/outlook) | CLI | Microsoft Graph API | Read, search, draft, and send Outlook emails from the terminal. |
+| [`yahoo`](bin/yahoo) | CLI | IMAP / SMTP (SSL) | Read, search, draft, and send Yahoo emails from the terminal. |
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
 | [`brave-mcp`](bin/brave-mcp) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in Brave or standalone stealth Chromium. |
 | [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, auto-restore, and gracefully cull stale (>6h) `agy` sessions in iTerm2 while keeping tabs open. |
@@ -51,6 +52,7 @@ whatsapp --help
 imessage --help
 cal-event --help
 outlook --help
+yahoo --help
 apple-pay --help
 download-video --help
 brave-mcp --help
@@ -153,6 +155,22 @@ outlook auth
 3. Open the URL in your web browser, enter the code, and approve the permissions.
 4. The CLI saves credentials to `~/.local/share/outlook/token_cache.bin` with file permissions `0600`. Tokens refresh automatically.
 
+# Yahoo Mail Setup
+
+The `yahoo` CLI connects directly via IMAP and SMTP over SSL using a Yahoo App Password.
+
+1. Go to [Yahoo Account Security](https://login.yahoo.com/account/security) > **External connections** > **App passwords**.
+2. Click **Generate app password**, name it `agent-cli`, and copy the 16-character code.
+3. Save it to macOS Keychain (recommended):
+```sh
+security add-generic-password -U -s "yahoo-app" -a "your-email@yahoo.com" -w
+```
+Alternatively, export `YAHOO_EMAIL` and `YAHOO_APP_PASSWORD` in `~/.local/bin/.env`.
+4. Verify connection:
+```sh
+yahoo auth
+```
+
 # Video Downloader CLI (`download-video`)
 
 Downloads videos, Instagram Reels/stories, and YouTube videos/shorts directly into your Google Drive meme archive (`~/Library/CloudStorage/GoogleDrive-*/My Drive/media/memes`) with automated Apple Vision OCR frame indexing, WhatsApp-friendly H.264/AAC transcoding, and duplicate prevention.
@@ -191,6 +209,13 @@ outlook unread
 outlook search "invoice"
 outlook read <message-id>
 outlook draft --to "person@example.com" --subject "Status update" --body "Task complete."
+
+# Yahoo Mail: list unread emails, search, read, folders, and draft
+yahoo unread
+yahoo search "tax"
+yahoo read <uid>
+yahoo folders
+yahoo draft --to "person@example.com" --subject "Hello" --body "Draft message"
 
 # Call Recordings: list, read, transcribe on-device, or export iPhone calls
 call-recordings list
