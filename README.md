@@ -27,6 +27,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
 | [`airbnb`](airbnb/) | CLI | Airbnb API + Climate/Sentiment Engine | Search, score, and benchmark listings against nomad criteria (Wi-Fi, kitchen, climate/heating, noise, discounts). |
 | [`download-video`](bin/download-video) | CLI | yt-dlp + gallery-dl + Apple Vision OCR | Download Instagram reels/stories and YouTube videos/shorts to Google Drive, transcode to WhatsApp-native H.264/AAC MP4, extract frame OCR/hashtags, and embed metadata. |
+| [`wifi-check`](src/wifi-check.swift) | CLI | macOS `CoreWLAN` + `networkQuality` | Comprehensive Wi-Fi link health, VPN stealth audit (Toronto homebase IP match), traceroute hop latency map, and network capacity benchmark. |
 
 # Quickstart
 
@@ -59,6 +60,7 @@ brave-mcp --help
 agy-sessions --help
 antigravity-shipper --help
 airbnb --help
+wifi-check --help
 ```
 
 # Stealth Browser MCP (`brave-mcp`)
@@ -233,6 +235,12 @@ imessage -q "invoice"
 imessage -c "+16471234567" -a
 imessage -q "IMG_6503" -a
 apple-pay --help
+
+# Wi-Fi & Network Diagnostic: link health, VPN stealth, route hops, and speed test
+wifi-check
+wifi-check --quick
+wifi-check --quick --json
+wifi-check --scan
 ```
 
 # Agent Instructions (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)

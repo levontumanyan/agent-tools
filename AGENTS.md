@@ -11,6 +11,7 @@
 - **Antigravity Telemetry Shipper**: Use `antigravity-shipper` (runs as a launchd daemon or one-shot via `antigravity-shipper --once`); tails local conversation transcripts, redacts secrets, and ships telemetry to PostgreSQL; see `antigravity-shipper --help`.
 - **Airbnb CLI**: Use `airbnb` for listing search, scoring, and inspection (see `airbnb --help`). Always explicitly report the nightly rate (e.g. CAD $XX/night) whether presenting a single listing or multiple listings. Detailed agent instructions and development standards are centralized in [airbnb/AGENTS.md](airbnb/AGENTS.md).
 - **Video Downloader CLI**: Use `download-video "<url>"` (or bare `download-video` to grab URL from clipboard) to download reels, stories, and videos (defaults to `$DOWNLOAD_VIDEO_DIR` or `~/Downloads`) with Apple Vision OCR frame analysis, WhatsApp-compatible H.264/AAC transcoding, and metadata tagging; see `download-video --help`.
+- **Wi-Fi & Network Diagnostic CLI**: Inspect Wi-Fi link health, audit VPN stealth and residential IP match, map hop-by-hop latency, and evaluate network capacity via `wifi-check` (see `wifi-check --help`). For fast, non-blocking agent diagnostic queries, use `wifi-check -q -j` (quick mode, JSON output).
 
 # Development
 
