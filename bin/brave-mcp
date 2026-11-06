@@ -10,6 +10,7 @@
 import argparse
 import asyncio
 import datetime
+import json
 import os
 import signal
 import sys
@@ -158,55 +159,111 @@ class BraveSessionManager:
 				raise
 		return self._context
 
+	def _register_page_listeners(self, page: Page):
+		"""Attach lifecycle event listeners to auto-invalidate cached pointer on tab close or renderer crash."""
+		if getattr(page, "_agent_listeners_attached", False):
+			return
+		setattr(page, "_agent_listeners_attached", True)
+
+		def _on_closed_or_crashed(_=None):
+			if self._active_page is page:
+				self._active_page = None
+
+		page.on("close", _on_closed_or_crashed)
+		page.on("crash", _on_closed_or_crashed)
+
+	def set_active_page(self, page: Page):
+		self._active_page = page
+		if page is not None and not page.is_closed():
+			self._register_page_listeners(page)
+
 	async def get_pages(self) -> list[Page]:
 		context = await self.get_context()
 		return [p for p in context.pages if not p.is_closed()]
 
 	async def get_active_page(self) -> Page:
+		self._touch_activity()
+		if (
+			self._active_page is not None
+			and not self._active_page.is_closed()
+			and (self._browser is None or self._browser.is_connected())
+		):
+			return self._active_page
+
 		try:
 			context = await self.get_context()
-			if self._active_page is not None and not self._active_page.is_closed():
-				return self._active_page
-
 			pages = await self.get_pages()
 			# If this session attached via CDP to an already-active browser session
 			if self._browser is not None:
 				# Always open a new dedicated tab for this session so we do not hijack other sessions
-				self._active_page = await context.new_page()
-				return self._active_page
-
-			# Primary launcher session
-			if pages:
-				self._active_page = pages[0]
+				page = await context.new_page()
+			elif pages:
+				page = pages[0]
 			else:
-				self._active_page = await context.new_page()
-			return self._active_page
+				page = await context.new_page()
+
+			self.set_active_page(page)
+			return page
 		except Exception as exc:
 			if "closed" in str(exc).lower():
 				# Browser window was killed externally; reset and relaunch
 				await self.close()
 				context = await self.get_context()
 				pages = await self.get_pages()
-				if pages:
-					self._active_page = pages[0]
-				else:
-					self._active_page = await context.new_page()
-				return self._active_page
+				page = pages[0] if pages else await context.new_page()
+				self.set_active_page(page)
+				return page
 			raise
 
-	def set_active_page(self, page: Page):
-		self._active_page = page
-
 	async def resolve_page(self, tab: int = -1) -> Page:
+		self._touch_activity()
+		if tab < 0:
+			# Fast path: instant in-memory pointer resolution (< 0.01ms)
+			if (
+				self._active_page is not None
+				and not self._active_page.is_closed()
+				and (self._browser is None or self._browser.is_connected())
+			):
+				return self._active_page
+			return await self.get_active_page()
+
+		# Explicit tab index requested
 		pages = await self.get_pages()
-		if tab >= 0:
-			if tab >= len(pages):
-				raise ValueError(f"Invalid tab index {tab}. Total open tabs: {len(pages)}")
-			return pages[tab]
-		return await self.get_active_page()
+		if tab >= len(pages):
+			raise ValueError(f"Invalid tab index {tab}. Total open tabs: {len(pages)}")
+		return pages[tab]
 
 
 session = BraveSessionManager(CDP_URL)
+
+MEDIA_RESOURCE_TYPES = {"image", "media", "font"}
+MEDIA_FILE_EXTENSIONS = (
+	".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+	".mp4", ".webm", ".ogg", ".woff", ".woff2", ".ttf", ".otf"
+)
+
+
+async def _media_blocker_handler(route, request):
+	"""Intercepts and aborts heavy media (images, videos, custom web fonts) when media blocking is active."""
+	url_clean = request.url.split("?")[0].lower()
+	if request.resource_type in MEDIA_RESOURCE_TYPES or any(url_clean.endswith(ext) for ext in MEDIA_FILE_EXTENSIONS):
+		await route.abort()
+	else:
+		await route.continue_()
+
+
+async def set_page_media_state(page: Page, block_media: bool):
+	"""Enable or disable media blocking on a given page."""
+	is_currently_blocked = getattr(page, "_brave_media_blocked", False)
+	if block_media and not is_currently_blocked:
+		await page.route("**/*", _media_blocker_handler)
+		setattr(page, "_brave_media_blocked", True)
+	elif not block_media and is_currently_blocked:
+		try:
+			await page.unroute("**/*", _media_blocker_handler)
+		except Exception:
+			pass
+		setattr(page, "_brave_media_blocked", False)
 
 
 @mcp.tool()
@@ -219,8 +276,9 @@ async def brave_status() -> str:
 		lines.append(f"Total open tabs: {len(pages)}")
 		for idx, page in enumerate(pages):
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
+			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_brave_media_blocked", False) else ""
 			title = await page.title()
-			lines.append(f"\t[{idx}] {title} - {page.url}{active_marker}")
+			lines.append(f"\t[{idx}] {title} - {page.url}{media_status}{active_marker}")
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Disconnected: {exc}"
@@ -229,12 +287,22 @@ async def brave_status() -> str:
 @mcp.tool()
 async def brave_navigate(
 	url: str,
+	block_media: bool = False,
 	new_tab: bool = False,
 	tab: int = -1,
 	timeout_ms: int = 30000,
 	wait_until: str = "commit",
 ) -> str:
-	"""Navigate a Brave tab to a specific URL. Use wait_until='commit' for ultra-fast navigation (default), or 'domcontentloaded'/'load'."""
+	"""Navigate a Brave tab to a specific URL with optional media blocking and fast execution.
+
+	Parameters:
+	- url: Destination web address (http, https, or about:).
+	- block_media: If True, blocks heavy media (images, videos, custom web fonts) for maximum loading speed (up to 3x faster). Leave False (default) if visual rendering, charts, or screenshots of images are needed.
+	- new_tab: If True, opens in a brand new tab.
+	- tab: Target tab index (-1 for active tab).
+	- timeout_ms: Maximum navigation timeout in milliseconds (default 30000).
+	- wait_until: Navigation wait condition: 'commit' for ultra-fast response headers (default), or 'domcontentloaded'/'load'.
+	"""
 	t0 = time.perf_counter()
 	try:
 		context = await session.get_context()
@@ -243,6 +311,9 @@ async def brave_navigate(
 			session.set_active_page(page)
 		else:
 			page = await session.resolve_page(tab)
+
+		# Apply media blocking state
+		await set_page_media_state(page, block_media=block_media)
 
 		# Ensure URL has protocol
 		if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("about:"):
@@ -257,15 +328,35 @@ async def brave_navigate(
 		pages = await session.get_pages()
 		target_idx = pages.index(page) if page in pages else -1
 		elapsed = int((time.perf_counter() - t0) * 1000)
-		return f"Navigated tab [{target_idx}] to '{url}' [HTTP {status}] ({elapsed}ms, wait_until={wait_mode}) - Title: '{title}'"
+		media_tag = " (media blocked)" if block_media else ""
+		return f"Navigated tab [{target_idx}] to '{url}' [HTTP {status}]{media_tag} ({elapsed}ms, wait_until={wait_mode}) - Title: '{title}'"
 	except Exception as exc:
 		return f"Navigation error: {exc}"
 
 
 @mcp.tool()
-async def brave_new_tab(url: str = "about:blank") -> str:
-	"""Open a new browser tab and navigate to url (default 'about:blank'). Returns the new tab index."""
-	return await brave_navigate(url=url, new_tab=True)
+async def brave_new_tab(url: str = "about:blank", block_media: bool = False) -> str:
+	"""Open a new browser tab and navigate to url (default 'about:blank'). Set block_media=True for high-speed text-only browsing."""
+	return await brave_navigate(url=url, block_media=block_media, new_tab=True)
+
+
+@mcp.tool()
+async def brave_set_media(enable_media: bool = True, tab: int = -1) -> str:
+	"""Toggle media loading (images, videos, web fonts) on the current or specified tab.
+
+	Parameters:
+	- enable_media: Set to True (default) to allow full image and media loading. Set to False to block images and fonts for blazing-fast text-only scraping.
+	- tab: Target tab index (-1 for active tab).
+	"""
+	try:
+		page = await session.resolve_page(tab)
+		await set_page_media_state(page, block_media=not enable_media)
+		pages = await session.get_pages()
+		target_idx = pages.index(page) if page in pages else -1
+		state_str = "ENABLED (images, charts, and media will load)" if enable_media else "BLOCKED (high-speed text-only mode)"
+		return f"Media loading is now {state_str} on tab [{target_idx}] ({page.url})"
+	except Exception as exc:
+		return f"Error updating media state: {exc}"
 
 
 @mcp.tool()
@@ -502,6 +593,314 @@ async def brave_screenshot(save_path: str = "", tab: int = -1) -> str:
 		return f"Screenshot saved to: {save_path}\nPage Title: {title}\nURL: {page.url}"
 	except Exception as exc:
 		return f"Error taking screenshot: {exc}"
+
+
+@mcp.tool()
+async def brave_fetch(
+	url: str,
+	method: str = "GET",
+	headers: Optional[dict] = None,
+	body: Optional[str] = None,
+	response_type: str = "auto",
+	tab: int = -1,
+) -> str:
+	"""Execute an in-browser HTTP request in the active tab origin using authenticated cookies and session state.
+
+	Parameters:
+	- url: Target URL or endpoint path (can be relative e.g. '/api/accounts' or absolute).
+	- method: HTTP method ('GET', 'POST', 'PUT', 'DELETE', etc. Default 'GET').
+	- headers: Optional dictionary of HTTP request headers.
+	- body: Optional request payload string (e.g. JSON string or form data).
+	- response_type: Expected format: 'auto' (parses JSON if possible, else text), 'json', or 'text'.
+	- tab: Target tab index (-1 for active tab).
+	"""
+	t0 = time.perf_counter()
+	try:
+		page = await session.resolve_page(tab)
+		js_script = """async ({ url, method, headers, body, responseType }) => {
+			const options = {
+				method: (method || 'GET').toUpperCase(),
+				credentials: 'include',
+				headers: headers || {}
+			};
+			if (body && !['GET', 'HEAD'].includes(options.method)) {
+				options.body = body;
+			}
+			const tStart = performance.now();
+			try {
+				const res = await window.fetch(url, options);
+				const duration = Math.round(performance.now() - tStart);
+				const resHeaders = {};
+				res.headers.forEach((v, k) => { resHeaders[k] = v; });
+
+				const text = await res.text();
+				let parsed = null;
+				let isJson = false;
+				if (responseType === 'json' || responseType === 'auto') {
+					try {
+						parsed = JSON.parse(text);
+						isJson = true;
+					} catch (_) {}
+				}
+				return {
+					ok: res.ok,
+					status: res.status,
+					statusText: res.statusText,
+					url: res.url,
+					duration,
+					headers: resHeaders,
+					isJson,
+					data: isJson ? parsed : text
+				};
+			} catch (err) {
+				return {
+					error: err.toString(),
+					duration: Math.round(performance.now() - tStart)
+				};
+			}
+		}"""
+		result = await page.evaluate(js_script, {
+			"url": url,
+			"method": method,
+			"headers": headers or {},
+			"body": body,
+			"responseType": response_type,
+		})
+		elapsed_total = int((time.perf_counter() - t0) * 1000)
+
+		if "error" in result:
+			return f"Fetch error ({result.get('duration', elapsed_total)}ms): {result['error']}"
+
+		status_str = f"HTTP {result['status']} {result['statusText']} ({result['duration']}ms)"
+		data = result.get("data")
+		if result.get("isJson") and data is not None:
+			dumped = json.dumps(data, indent=2)
+			if len(dumped) > 60000:
+				dumped = dumped[:60000] + f"\n... [Truncated: {len(dumped)} total characters]"
+			return f"{status_str} [JSON] from {result['url']}:\n\n{dumped}"
+		else:
+			text = str(data or "")
+			if len(text) > 60000:
+				text = text[:60000] + f"\n... [Truncated: {len(text)} total characters]"
+			return f"{status_str} [TEXT] from {result['url']}:\n\n{text}"
+	except Exception as exc:
+		return f"Error executing brave_fetch: {exc}"
+
+
+@mcp.tool()
+async def brave_state(
+	framework: str = "auto",
+	selector: str = "",
+	tab: int = -1,
+) -> str:
+	"""Inspect and extract in-memory client-side application state (Next.js, Redux, React Fiber, Vue, Apollo, React Query).
+
+	Parameters:
+	- framework: Target framework to probe ('auto', 'next', 'redux', 'react', 'vue', 'apollo', 'query').
+	- selector: Optional DOM selector to inspect a specific component's React Fiber props/state (e.g. '#root', '.portfolio-table').
+	- tab: Target tab index (-1 for active tab).
+	"""
+	t0 = time.perf_counter()
+	try:
+		page = await session.resolve_page(tab)
+		js_script = """({ targetFramework, selector }) => {
+			function safeSerialize(obj, maxDepth = 4, maxKeys = 80) {
+				const seen = new WeakSet();
+				function helper(val, depth) {
+					if (val === null || typeof val !== 'object') {
+						if (typeof val === 'function') return '[Function]';
+						if (typeof val === 'symbol') return val.toString();
+						return val;
+					}
+					if (val instanceof Element || val instanceof Node) {
+						return `<${val.tagName ? val.tagName.toLowerCase() : 'Node'}${val.id ? '#' + val.id : ''}>`;
+					}
+					if (seen.has(val)) return '[Circular]';
+					if (depth >= maxDepth) return Array.isArray(val) ? `[Array(${val.length})]` : '[Object]';
+					seen.add(val);
+
+					if (Array.isArray(val)) {
+						const res = [];
+						const len = Math.min(val.length, 60);
+						for (let i = 0; i < len; i++) {
+							res.push(helper(val[i], depth + 1));
+						}
+						if (val.length > len) res.push(`... ${val.length - len} more items`);
+						return res;
+					}
+
+					const res = {};
+					const keys = Object.keys(val).slice(0, maxKeys);
+					for (const k of keys) {
+						try {
+							res[k] = helper(val[k], depth + 1);
+						} catch (_) {
+							res[k] = '[Unserializable]';
+						}
+					}
+					return res;
+				}
+				return helper(obj, 0);
+			}
+
+			const results = [];
+			const fw = (targetFramework || 'auto').toLowerCase();
+
+			// 1. Next.js Hydration Data
+			if ((fw === 'auto' || fw === 'next') && window.__NEXT_DATA__) {
+				results.push({
+					source: 'Next.js (__NEXT_DATA__)',
+					keys: Object.keys(window.__NEXT_DATA__),
+					data: safeSerialize(window.__NEXT_DATA__)
+				});
+			}
+
+			// 2. Nuxt / SSR Initial State
+			if ((fw === 'auto' || fw === 'vue') && window.__NUXT__) {
+				results.push({
+					source: 'Nuxt (__NUXT__)',
+					keys: Object.keys(window.__NUXT__),
+					data: safeSerialize(window.__NUXT__)
+				});
+			}
+			if ((fw === 'auto') && window.__INITIAL_STATE__) {
+				results.push({
+					source: 'Window Initial State (__INITIAL_STATE__)',
+					keys: Object.keys(window.__INITIAL_STATE__),
+					data: safeSerialize(window.__INITIAL_STATE__)
+				});
+			}
+
+			// 3. Global Redux Store
+			if ((fw === 'auto' || fw === 'redux') && window.store && typeof window.store.getState === 'function') {
+				const state = window.store.getState();
+				results.push({
+					source: 'Redux (window.store)',
+					keys: Object.keys(state || {}),
+					data: safeSerialize(state)
+				});
+			}
+
+			// 4. Apollo GraphQL Cache
+			if ((fw === 'auto' || fw === 'apollo') && window.__APOLLO_CLIENT__ && typeof window.__APOLLO_CLIENT__.extract === 'function') {
+				const cache = window.__APOLLO_CLIENT__.extract();
+				results.push({
+					source: 'Apollo GraphQL Cache',
+					keys: Object.keys(cache || {}),
+					data: safeSerialize(cache)
+				});
+			}
+
+			// 5. TanStack / React Query Client
+			if ((fw === 'auto' || fw === 'query') && window.queryClient && typeof window.queryClient.getQueryCache === 'function') {
+				const queries = window.queryClient.getQueryCache().getAll().map(q => ({
+					queryKey: q.queryKey,
+					status: q.state?.status,
+					data: q.state?.data
+				}));
+				results.push({
+					source: 'React Query (window.queryClient)',
+					keys: queries.map(q => JSON.stringify(q.queryKey)),
+					data: safeSerialize(queries)
+				});
+			}
+
+			// 6. Vue Component Tree
+			if (fw === 'auto' || fw === 'vue') {
+				const vueEl = document.querySelector(selector || '#app, [data-v-app], #root');
+				if (vueEl) {
+					if (vueEl.__vue_app__) {
+						const appState = vueEl.__vue_app__._instance?.data || vueEl.__vue_app__._context?.provides;
+						if (appState) {
+							results.push({
+								source: 'Vue 3 (__vue_app__)',
+								keys: Object.keys(appState),
+								data: safeSerialize(appState)
+							});
+						}
+					} else if (vueEl.__vue__) {
+						results.push({
+							source: 'Vue 2 (__vue__)',
+							keys: Object.keys(vueEl.__vue__.$data || {}),
+							data: safeSerialize(vueEl.__vue__.$data)
+						});
+					}
+				}
+			}
+
+			// 7. React Fiber Traversal (Redux Provider or Component Props/State)
+			if (fw === 'auto' || fw === 'react' || fw === 'redux') {
+				const targetEl = selector ? document.querySelector(selector) : (document.querySelector('#root') || document.querySelector('#app') || document.body);
+				if (targetEl) {
+					const fiberKey = Object.keys(targetEl).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+					if (fiberKey) {
+						let current = targetEl[fiberKey];
+						let foundStore = false;
+
+						// Walk up fiber tree to check for Redux context or QueryClient context
+						let ancestor = current;
+						let steps = 0;
+						while (ancestor && steps < 50) {
+							// Redux context check
+							if (!foundStore && ancestor.memoizedProps?.store?.getState) {
+								const state = ancestor.memoizedProps.store.getState();
+								results.push({
+									source: 'Redux Store (via React Fiber Context)',
+									keys: Object.keys(state || {}),
+									data: safeSerialize(state)
+								});
+								foundStore = true;
+							}
+							ancestor = ancestor.return;
+							steps++;
+						}
+
+						// Specific component fiber props & state
+						if (selector || (!results.length && targetEl !== document.body)) {
+							results.push({
+								source: `React Fiber Node (${targetEl.tagName.toLowerCase()}${targetEl.id ? '#' + targetEl.id : ''})`,
+								keys: current.memoizedProps ? Object.keys(current.memoizedProps) : [],
+								props: safeSerialize(current.memoizedProps),
+								state: safeSerialize(current.memoizedState)
+							});
+						}
+					}
+				}
+			}
+
+			return results;
+		}"""
+		results = await page.evaluate(js_script, {
+			"targetFramework": framework,
+			"selector": selector,
+		})
+		elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+		if not results:
+			return (
+				f"No in-memory state stores (Next.js, Redux, React Fiber, Vue, Apollo, React Query) detected "
+				f"on {page.url} ({elapsed_ms}ms). The page may be server-rendered or state is privately scoped in closures."
+			)
+
+		lines = [f"In-Memory State Detective Results for {page.url} ({elapsed_ms}ms):", ""]
+		for idx, item in enumerate(results):
+			lines.append(f"### [{idx + 1}] Source: {item['source']}")
+			if "keys" in item and item["keys"]:
+				key_preview = ", ".join(f"`{k}`" for k in item["keys"][:20])
+				if len(item["keys"]) > 20:
+					key_preview += f" ... (+{len(item['keys']) - 20} more)"
+				lines.append(f"- **Top-Level Keys ({len(item['keys'])} total)**: {key_preview}")
+
+			dumped = json.dumps(item.get("data") or {"props": item.get("props"), "state": item.get("state")}, indent=2)
+			if len(dumped) > 40000:
+				dumped = dumped[:40000] + f"\n... [Truncated: {len(dumped)} total characters]"
+			lines.append("```json")
+			lines.append(dumped)
+			lines.append("```\n")
+
+		return "\n".join(lines)
+	except Exception as exc:
+		return f"Error detecting state: {exc}"
 
 
 @mcp.tool()
