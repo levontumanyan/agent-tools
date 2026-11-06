@@ -219,11 +219,15 @@ yahoo read <uid>
 yahoo folders
 yahoo draft --to "person@example.com" --subject "Hello" --body "Draft message"
 
-# Call Recordings: list, read, transcribe on-device, or export iPhone calls
-call-recordings list
-call-recordings read <id>
-call-recordings transcribe <id>
-call-recordings search "tax form"
+# Call Recordings: list, read, search, play, clip, and backup iPhone calls to Google Drive
+call-recordings list --today
+call-recordings list --since 7d
+call-recordings read <id> -t
+call-recordings search "Amex" -t
+call-recordings clip <id> --match "disclaimer" --pad 8
+call-recordings clip <id> --start 01:15 --end 02:30
+call-recordings play <id>
+call-recordings sync
 call-recordings export <id> --out ~/Downloads
 
 # Calendar & Reminders: schedule an event or native Apple Reminder
