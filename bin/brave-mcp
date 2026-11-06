@@ -13,6 +13,7 @@ import datetime
 import os
 import signal
 import sys
+import time
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -226,8 +227,15 @@ async def brave_status() -> str:
 
 
 @mcp.tool()
-async def brave_navigate(url: str, new_tab: bool = False, tab: int = -1, timeout_ms: int = 30000) -> str:
-	"""Navigate a Brave tab to a specific URL. If new_tab=True, opens a new tab. Use tab index (e.g. tab=0, tab=1) to target a specific tab."""
+async def brave_navigate(
+	url: str,
+	new_tab: bool = False,
+	tab: int = -1,
+	timeout_ms: int = 30000,
+	wait_until: str = "commit",
+) -> str:
+	"""Navigate a Brave tab to a specific URL. Use wait_until='commit' for ultra-fast navigation (default), or 'domcontentloaded'/'load'."""
+	t0 = time.perf_counter()
 	try:
 		context = await session.get_context()
 		if new_tab:
@@ -240,12 +248,16 @@ async def brave_navigate(url: str, new_tab: bool = False, tab: int = -1, timeout
 		if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("about:"):
 			url = "https://" + url
 
-		response = await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+		valid_waits = {"commit", "domcontentloaded", "load", "networkidle"}
+		wait_mode = wait_until if wait_until in valid_waits else "domcontentloaded"
+
+		response = await page.goto(url, timeout=timeout_ms, wait_until=wait_mode)
 		status = response.status if response else "loaded"
 		title = await page.title()
 		pages = await session.get_pages()
 		target_idx = pages.index(page) if page in pages else -1
-		return f"Navigated tab [{target_idx}] to '{url}' [HTTP {status}] - Title: '{title}'"
+		elapsed = int((time.perf_counter() - t0) * 1000)
+		return f"Navigated tab [{target_idx}] to '{url}' [HTTP {status}] ({elapsed}ms, wait_until={wait_mode}) - Title: '{title}'"
 	except Exception as exc:
 		return f"Navigation error: {exc}"
 
@@ -257,9 +269,156 @@ async def brave_new_tab(url: str = "about:blank") -> str:
 
 
 @mcp.tool()
-async def brave_get_content(selector: str = "body", max_length: int = 4000, tab: int = -1) -> str:
-	"""Extract visible text content from the active tab or a specific selector (default: 'body'). Optional tab index to target specific tab."""
+async def brave_snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1) -> str:
+	"""Extract interactive elements (buttons, inputs, links, selects, dropdowns) with exact selectors and values in a single high-speed call."""
+	t0 = time.perf_counter()
 	try:
+		page = await session.resolve_page(tab)
+		js_code = """() => {
+			const isVisible = (el) => {
+				const style = window.getComputedStyle(el);
+				return style && style.visibility !== 'hidden' && style.display !== 'none' && el.offsetWidth > 0 && el.offsetHeight > 0;
+			};
+			const nodes = Array.from(document.querySelectorAll(
+				'button, input, select, textarea, a[href], [role="button"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"]'
+			)).filter(isVisible);
+
+			return nodes.slice(0, 100).map((el, i) => {
+				const tag = el.tagName.toLowerCase();
+				const id = el.id ? `#${el.id}` : '';
+				const name = el.name ? `[name="${el.name}"]` : '';
+				const type = el.type ? `[type="${el.type}"]` : '';
+				const role = el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]` : '';
+				const aria = el.getAttribute('aria-label') ? `aria-label="${el.getAttribute('aria-label')}"` : '';
+				const val = el.value !== undefined && el.value !== '' ? `val="${el.value}"` : '';
+				const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
+
+				let selector = el.id ? `#${el.id}` : (el.name ? `${tag}[name="${el.name}"]` : (el.getAttribute('data-testid') ? `[data-testid="${el.getAttribute('data-testid')}"]` : ''));
+				if (!selector && el.className && typeof el.className === 'string') {
+					const firstClass = el.className.split(' ').filter(c => c && !c.includes(':'))[0];
+					if (firstClass) selector = `${tag}.${firstClass}`;
+				}
+				if (!selector) selector = tag;
+
+				return {
+					index: i,
+					tag,
+					selector,
+					text,
+					attrs: [id, name, type, role, aria, val].filter(Boolean).join(' ')
+				};
+			});
+		}"""
+		elements = await page.evaluate(js_code)
+		elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+		if not elements:
+			return f"No interactive elements found on {page.url} ({elapsed_ms}ms)"
+
+		elements = elements[:max_elements]
+		lines = [f"Interactive elements snapshot for {page.url} ({elapsed_ms}ms, {len(elements)} items):", ""]
+		lines.append("| # | Tag | Selector | Text / Details |")
+		lines.append("|---|---|---|---|")
+		for el in elements:
+			desc = f"{el['text']} ({el['attrs']})" if el['attrs'] else el['text']
+			lines.append(f"| {el['index']} | `<{el['tag']}>` | `{el['selector']}` | {desc} |")
+		return "\n".join(lines)
+	except Exception as exc:
+		return f"Error capturing snapshot: {exc}"
+
+
+@mcp.tool()
+async def brave_batch(actions: list[dict], tab: int = -1) -> str:
+	"""Execute a pipeline of browser actions sequentially in a single turn for maximum speed (10-100x faster than roundtrips).
+
+	Supported action types in the dict:
+	- {"action": "click", "selector": "#btn", "timeout_ms": 3000}
+	- {"action": "fill", "selector": "#input", "text": "hello", "timeout_ms": 3000}
+	- {"action": "type", "selector": "#input", "text": "hello", "press_enter": True, "timeout_ms": 3000}
+	- {"action": "select", "selector": "select#country", "value": "CA", "timeout_ms": 3000}
+	- {"action": "press", "key": "Enter"}
+	- {"action": "wait_for", "selector": ".modal", "timeout_ms": 3000, "state": "visible"}
+	- {"action": "sleep", "ms": 500}
+	- {"action": "evaluate", "expression": "window.scrollTo(0, 500)"}
+	"""
+	t0 = time.perf_counter()
+	try:
+		page = await session.resolve_page(tab)
+		results = []
+		for idx, item in enumerate(actions):
+			act = item.get("action", "").lower()
+			timeout = item.get("timeout_ms", 4000)
+
+			if act == "click":
+				sel = item["selector"]
+				await page.locator(sel).first.click(timeout=timeout)
+				results.append(f"[{idx}] click '{sel}': OK")
+
+			elif act == "fill":
+				sel = item["selector"]
+				text = item.get("text", "")
+				await page.locator(sel).first.fill(text, timeout=timeout)
+				results.append(f"[{idx}] fill '{sel}': OK")
+
+			elif act == "type":
+				sel = item["selector"]
+				text = item.get("text", "")
+				press_enter = item.get("press_enter", False)
+				loc = page.locator(sel).first
+				await loc.type(text, timeout=timeout)
+				if press_enter:
+					await loc.press("Enter")
+				results.append(f"[{idx}] type '{sel}' ({'with Enter' if press_enter else ''}): OK")
+
+			elif act == "select":
+				sel = item["selector"]
+				val = item.get("value", "")
+				await page.locator(sel).first.select_option(val, timeout=timeout)
+				results.append(f"[{idx}] select '{sel}' option '{val}': OK")
+
+			elif act == "press":
+				key = item.get("key", "Enter")
+				await page.keyboard.press(key)
+				results.append(f"[{idx}] press '{key}': OK")
+
+			elif act == "wait_for":
+				sel = item["selector"]
+				state = item.get("state", "visible")
+				await page.locator(sel).first.wait_for(state=state, timeout=timeout)
+				results.append(f"[{idx}] wait_for '{sel}' ({state}): OK")
+
+			elif act == "sleep":
+				ms = item.get("ms", 200)
+				await asyncio.sleep(ms / 1000.0)
+				results.append(f"[{idx}] sleep {ms}ms: OK")
+
+			elif act == "evaluate":
+				expr = item.get("expression", "")
+				res = await page.evaluate(expr)
+				results.append(f"[{idx}] evaluate: {res}")
+
+			else:
+				results.append(f"[{idx}] Unknown action '{act}': SKIPPED")
+
+		elapsed = int((time.perf_counter() - t0) * 1000)
+		return f"Batch completed ({len(results)} steps in {elapsed}ms) on {page.url}:\n" + "\n".join(results)
+	except Exception as exc:
+		elapsed = int((time.perf_counter() - t0) * 1000)
+		return f"Batch failed after {elapsed}ms: {exc}"
+
+
+@mcp.tool()
+async def brave_get_content(
+	selector: str = "body",
+	max_length: int = 4000,
+	interactive_only: bool = False,
+	tab: int = -1,
+) -> str:
+	"""Extract visible text content or interactive elements from the active tab. Set interactive_only=True for compact semantic elements snapshot."""
+	try:
+		if interactive_only:
+			return await brave_snapshot(selector=selector, tab=tab)
+
 		page = await session.resolve_page(tab)
 		element = page.locator(selector).first
 		if await element.count() == 0:
