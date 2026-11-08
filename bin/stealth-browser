@@ -201,9 +201,12 @@ class BrowserSessionManager:
 		try:
 			context = await self.get_context()
 			pages = await self.get_pages()
-			# If this session attached via CDP to an already-active browser session
-			if self._browser is not None:
-				# Always open a new dedicated tab for this session so we do not hijack other sessions
+			# Check for an existing empty/blank tab to avoid tab proliferation
+			blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
+			if blank_pages:
+				page = blank_pages[0]
+			elif self._browser is not None:
+				# Connected via CDP with only active user pages open: open dedicated tab
 				page = await context.new_page()
 			elif pages:
 				page = pages[0]
@@ -218,7 +221,13 @@ class BrowserSessionManager:
 				await self.close()
 				context = await self.get_context()
 				pages = await self.get_pages()
-				page = pages[0] if pages else await context.new_page()
+				blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
+				if blank_pages:
+					page = blank_pages[0]
+				elif pages:
+					page = pages[0]
+				else:
+					page = await context.new_page()
 				self.set_active_page(page)
 				return page
 			raise
@@ -279,7 +288,7 @@ async def status() -> str:
 	"""Check connection status to Stealth Browser and list all open tabs."""
 	try:
 		pages = await session.get_pages()
-		active_page = await session.get_active_page()
+		active_page = session._active_page if (session._active_page is not None and not session._active_page.is_closed()) else None
 		lines = [f"Connected to browser session at {CDP_URL}"]
 		lines.append(f"Total open tabs: {len(pages)}")
 		for idx, page in enumerate(pages):
@@ -991,7 +1000,10 @@ async def close_tab(index: int = -1) -> str:
 			return await close_browser()
 
 		if index == -1:
-			page = await session.get_active_page()
+			if session._active_page is not None and not session._active_page.is_closed():
+				page = session._active_page
+			else:
+				page = pages[-1]
 			target_index = pages.index(page) if page in pages else -1
 		else:
 			if index < 0 or index >= len(pages):
