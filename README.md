@@ -6,10 +6,10 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 
 # Why agent-tools?
 
-- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `call-recordings`, `apple-pay`, `outlook`, `yahoo`, `download-video`, `airbnb`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas. Stateful browser sessions use `brave-mcp`.
+- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `call-recordings`, `apple-pay`, `outlook`, `yahoo`, `download-video`, `airbnb`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas. Stateful browser sessions use `stealth-browser`.
 - **100% Local & Private**: Reads directly from local macOS SQLite databases (`ChatStorage.sqlite`, `chat.db`, `NoteStore.sqlite`, Wallet passes) and native `EventKit` APIs — no third-party cloud relays.
 - **Zero Dependency Hell**: Powered by `uv` inline script metadata (`#!/usr/bin/env -S uv run --script`). Clone once, add `bin/` to `$PATH`, and every tool manages its own isolated environment automatically.
-- **macOS Browser Hang Prevention**: `brave-mcp` solves the notorious macOS Chromium/Brave `com.brave.Browser.MachPortRendezvousServer` IPC freeze by attaching over CDP or launching an isolated Patchright stealth Chromium profile with automatic idle driver teardown.
+- **macOS Browser Hang Prevention**: `stealth-browser` avoids macOS Chromium/Brave IPC freezes by attaching over CDP or launching an isolated Patchright stealth Chromium profile with automatic idle driver teardown.
 
 # Included Tools
 
@@ -22,7 +22,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`outlook`](bin/outlook) | CLI | Microsoft Graph API | Read, search, draft, and send Outlook emails from the terminal. |
 | [`yahoo`](bin/yahoo) | CLI | IMAP / SMTP (SSL) | Read, search, draft, and send Yahoo emails from the terminal. |
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
-| [`brave-mcp`](bin/brave-mcp) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in Brave or standalone stealth Chromium. |
+| [`stealth-browser`](bin/stealth-browser) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in standalone stealth Chromium or via CDP. |
 | [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, auto-restore, and gracefully cull stale (>6h) `agy` sessions in iTerm2 while keeping tabs open. |
 | [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
 | [`airbnb`](airbnb/) | CLI | Airbnb API + Climate/Sentiment Engine | Search, score, and benchmark listings against nomad criteria (Wi-Fi, kitchen, climate/heating, noise, discounts). |
@@ -56,22 +56,22 @@ outlook --help
 yahoo --help
 apple-pay --help
 download-video --help
-brave-mcp --help
+stealth-browser --help
 agy-sessions --help
 antigravity-shipper --help
 airbnb --help
 wifi-check --help
 ```
 
-# Stealth Browser MCP (`brave-mcp`)
+# Stealth Browser MCP (`stealth-browser`)
 
-Launching a second Brave binary alongside an active one on macOS corrupts shared Mach port rendezvous (`com.brave.Browser.MachPortRendezvousServer`), freezing tab creation and IPC in your main browser.
+Launching a second browser binary alongside an active one on macOS can corrupt shared IPC rendezvous ports, freezing tab creation and IPC in your main browser.
 
-`brave-mcp` avoids this completely:
+`stealth-browser` avoids this completely:
 
-1. **CDP First**: Attempts to attach to an existing browser session over `http://127.0.0.1:9222` (`BRAVE_CDP_PORT`).
+1. **CDP First**: Attempts to attach to an existing browser session over `http://127.0.0.1:9222` (`STEALTH_BROWSER_CDP_PORT`).
 2. **Standalone Stealth Fallback**: Falls back to launching a dedicated Patchright stealth Chromium instance (`~/.agent-chromium-profile`) with `AutomationControlled` disabled.
-3. **Clean Lifecycle & Idle Watchdog**: Automatically shuts down the background Patchright Node driver after 5 minutes of inactivity (`BRAVE_MCP_IDLE_TIMEOUT=300`) and guarantees immediate subprocess teardown on `SIGTERM`, `SIGHUP`, or `stdin` EOF.
+3. **Clean Lifecycle & Idle Watchdog**: Automatically shuts down the background Patchright Node driver after 5 minutes of inactivity (`STEALTH_BROWSER_IDLE_TIMEOUT=300`) and guarantees immediate subprocess teardown on `SIGTERM`, `SIGHUP`, or `stdin` EOF.
 
 ## MCP Configuration (`mcp_config.json`)
 
@@ -80,12 +80,12 @@ Add to your agent's MCP configuration (`~/.gemini/config/mcp_config.json`, `~/.c
 ```json
 {
 	"mcpServers": {
-		"brave-browser": {
+		"stealth-browser": {
 			"command": "uv",
 			"args": [
 				"run",
 				"--script",
-				"/Users/your-username/repos/agent-tools/bin/brave-mcp"
+				"/Users/your-username/repos/agent-tools/bin/stealth-browser"
 			]
 		}
 	}
@@ -94,14 +94,14 @@ Add to your agent's MCP configuration (`~/.gemini/config/mcp_config.json`, `~/.c
 
 ## Available MCP Tools
 
-- `brave_status`: Check connection status and list all open tabs with indices.
-- `brave_navigate`: Navigate the active tab or open a new tab (`new_tab=True`).
-- `brave_get_content`: Extract visible text from `body` or any CSS/XPath selector.
-- `brave_click` / `brave_type` / `brave_press_key` / `brave_scroll`: Interact with page elements.
-- `brave_screenshot`: Capture a viewport screenshot for multimodal agent inspection.
-- `brave_evaluate_js`: Execute JavaScript in the active page context.
-- `brave_switch_tab` / `brave_new_tab` / `brave_close_tab`: Full multi-tab management (closing the last tab automatically closes the browser).
-- `brave_close_browser`: Completely close the browser window, terminate the browser process, and release all resources.
+- `status`: Check connection status and list all open tabs with indices.
+- `navigate`: Navigate the active tab or open a new tab (`new_tab=True`).
+- `get_content`: Extract visible text from `body` or any CSS/XPath selector.
+- `click` / `type` / `press_key` / `scroll`: Interact with page elements.
+- `screenshot`: Capture a viewport screenshot for multimodal agent inspection.
+- `evaluate_js`: Execute JavaScript in the active page context.
+- `switch_tab` / `new_tab` / `close_tab`: Full multi-tab management (closing the last tab automatically closes the browser).
+- `close_browser`: Completely close the browser window, terminate the browser process, and release all resources.
 
 # Microsoft Outlook Setup (Azure App Registration)
 

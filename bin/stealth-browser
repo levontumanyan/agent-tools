@@ -12,22 +12,24 @@ import asyncio
 import datetime
 import json
 import os
+import random
+import re
 import signal
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional, Union
 from mcp.server.fastmcp import FastMCP
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 
-mcp = FastMCP("brave-browser")
+mcp = FastMCP("stealth-browser")
 
-CDP_PORT = int(os.environ.get("BRAVE_CDP_PORT", "9222"))
+CDP_PORT = int(os.environ.get("STEALTH_BROWSER_CDP_PORT", os.environ.get("CDP_PORT", "9222")))
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
-PROFILE_DIR = os.path.expanduser(os.environ.get("BRAVE_PROFILE_DIR", "~/.agent-chromium-profile"))
-IDLE_TIMEOUT_SECONDS = int(os.environ.get("BRAVE_MCP_IDLE_TIMEOUT", "300"))
+PROFILE_DIR = os.path.expanduser(os.environ.get("STEALTH_BROWSER_PROFILE_DIR", "~/.agent-chromium-profile"))
+IDLE_TIMEOUT_SECONDS = int(os.environ.get("STEALTH_BROWSER_IDLE_TIMEOUT", "300"))
 
 
-class BraveSessionManager:
+class BrowserSessionManager:
 	"""Manages dedicated stealth Chromium browser or CDP connection for AI agents."""
 
 	def __init__(self, cdp_url: str):
@@ -50,6 +52,10 @@ class BraveSessionManager:
 	async def _idle_watchdog(self):
 		try:
 			await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
+			# Do not auto-stop if keep-alive workers are active
+			if "keep_alive_mgr" in globals() and keep_alive_mgr.has_active():
+				self._touch_activity()
+				return
 			# Auto-stop the driver on idle if attached via CDP or if no persistent context is open
 			if self._browser is not None or self._context is None:
 				await self.close()
@@ -58,6 +64,8 @@ class BraveSessionManager:
 
 	async def close(self):
 		"""Cleanly stop the patchright node driver and release browser handles."""
+		if "keep_alive_mgr" in globals():
+			await keep_alive_mgr.stop_all()
 		if (
 			self._idle_task is not None
 			and not self._idle_task.done()
@@ -234,7 +242,7 @@ class BraveSessionManager:
 		return pages[tab]
 
 
-session = BraveSessionManager(CDP_URL)
+session = BrowserSessionManager(CDP_URL)
 
 MEDIA_RESOURCE_TYPES = {"image", "media", "font"}
 MEDIA_FILE_EXTENSIONS = (
@@ -254,21 +262,21 @@ async def _media_blocker_handler(route, request):
 
 async def set_page_media_state(page: Page, block_media: bool):
 	"""Enable or disable media blocking on a given page."""
-	is_currently_blocked = getattr(page, "_brave_media_blocked", False)
+	is_currently_blocked = getattr(page, "_media_blocked", False)
 	if block_media and not is_currently_blocked:
 		await page.route("**/*", _media_blocker_handler)
-		setattr(page, "_brave_media_blocked", True)
+		setattr(page, "_media_blocked", True)
 	elif not block_media and is_currently_blocked:
 		try:
 			await page.unroute("**/*", _media_blocker_handler)
 		except Exception:
 			pass
-		setattr(page, "_brave_media_blocked", False)
+		setattr(page, "_media_blocked", False)
 
 
 @mcp.tool()
-async def brave_status() -> str:
-	"""Check connection status to Brave Browser and list all open tabs."""
+async def status() -> str:
+	"""Check connection status to Stealth Browser and list all open tabs."""
 	try:
 		pages = await session.get_pages()
 		active_page = await session.get_active_page()
@@ -276,7 +284,7 @@ async def brave_status() -> str:
 		lines.append(f"Total open tabs: {len(pages)}")
 		for idx, page in enumerate(pages):
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
-			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_brave_media_blocked", False) else ""
+			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
 			title = await page.title()
 			lines.append(f"\t[{idx}] {title} - {page.url}{media_status}{active_marker}")
 		return "\n".join(lines)
@@ -285,23 +293,23 @@ async def brave_status() -> str:
 
 
 @mcp.tool()
-async def brave_navigate(
+async def navigate(
 	url: str,
-	block_media: bool = False,
+	block_media: Optional[bool] = None,
 	new_tab: bool = False,
 	tab: int = -1,
 	timeout_ms: int = 30000,
-	wait_until: str = "commit",
+	wait_until: str = "domcontentloaded",
 ) -> str:
-	"""Navigate a Brave tab to a specific URL with optional media blocking and fast execution.
+	"""Navigate a browser tab to a specific URL with optional media blocking and fast execution.
 
 	Parameters:
 	- url: Destination web address (http, https, or about:).
-	- block_media: If True, blocks heavy media (images, videos, custom web fonts) for maximum loading speed (up to 3x faster). Leave False (default) if visual rendering, charts, or screenshots of images are needed.
+	- block_media: Optional boolean. If True, blocks heavy media (images, videos, custom web fonts) for maximum loading speed (up to 3x faster). If False, enables media loading. If omitted (None), preserves current tab media state.
 	- new_tab: If True, opens in a brand new tab.
 	- tab: Target tab index (-1 for active tab).
 	- timeout_ms: Maximum navigation timeout in milliseconds (default 30000).
-	- wait_until: Navigation wait condition: 'commit' for ultra-fast response headers (default), or 'domcontentloaded'/'load'.
+	- wait_until: Navigation wait condition: 'domcontentloaded' for mounted DOM (default), 'commit' for ultra-fast response headers, or 'load'/'networkidle'.
 	"""
 	t0 = time.perf_counter()
 	try:
@@ -312,8 +320,9 @@ async def brave_navigate(
 		else:
 			page = await session.resolve_page(tab)
 
-		# Apply media blocking state
-		await set_page_media_state(page, block_media=block_media)
+		# Apply media blocking state if explicitly specified
+		if block_media is not None:
+			await set_page_media_state(page, block_media=block_media)
 
 		# Ensure URL has protocol
 		if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("about:"):
@@ -328,20 +337,21 @@ async def brave_navigate(
 		pages = await session.get_pages()
 		target_idx = pages.index(page) if page in pages else -1
 		elapsed = int((time.perf_counter() - t0) * 1000)
-		media_tag = " (media blocked)" if block_media else ""
+		is_media_blocked = getattr(page, "_media_blocked", False)
+		media_tag = " (media blocked)" if is_media_blocked else ""
 		return f"Navigated tab [{target_idx}] to '{url}' [HTTP {status}]{media_tag} ({elapsed}ms, wait_until={wait_mode}) - Title: '{title}'"
 	except Exception as exc:
 		return f"Navigation error: {exc}"
 
 
 @mcp.tool()
-async def brave_new_tab(url: str = "about:blank", block_media: bool = False) -> str:
+async def new_tab(url: str = "about:blank", block_media: Optional[bool] = None) -> str:
 	"""Open a new browser tab and navigate to url (default 'about:blank'). Set block_media=True for high-speed text-only browsing."""
-	return await brave_navigate(url=url, block_media=block_media, new_tab=True)
+	return await navigate(url=url, block_media=block_media, new_tab=True)
 
 
 @mcp.tool()
-async def brave_set_media(enable_media: bool = True, tab: int = -1) -> str:
+async def set_media(enable_media: bool = True, tab: int = -1) -> str:
 	"""Toggle media loading (images, videos, web fonts) on the current or specified tab.
 
 	Parameters:
@@ -360,17 +370,18 @@ async def brave_set_media(enable_media: bool = True, tab: int = -1) -> str:
 
 
 @mcp.tool()
-async def brave_snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1) -> str:
+async def snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1) -> str:
 	"""Extract interactive elements (buttons, inputs, links, selects, dropdowns) with exact selectors and values in a single high-speed call."""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
-		js_code = """() => {
+		js_code = """({ targetSelector }) => {
 			const isVisible = (el) => {
 				const style = window.getComputedStyle(el);
 				return style && style.visibility !== 'hidden' && style.display !== 'none' && el.offsetWidth > 0 && el.offsetHeight > 0;
 			};
-			const nodes = Array.from(document.querySelectorAll(
+			const root = (targetSelector && targetSelector !== 'body') ? (document.querySelector(targetSelector) || document) : document;
+			const nodes = Array.from(root.querySelectorAll(
 				'button, input, select, textarea, a[href], [role="button"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"]'
 			)).filter(isVisible);
 
@@ -400,7 +411,7 @@ async def brave_snapshot(selector: str = "body", max_elements: int = 80, tab: in
 				};
 			});
 		}"""
-		elements = await page.evaluate(js_code)
+		elements = await page.evaluate(js_code, {"targetSelector": selector})
 		elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
 		if not elements:
@@ -419,7 +430,7 @@ async def brave_snapshot(selector: str = "body", max_elements: int = 80, tab: in
 
 
 @mcp.tool()
-async def brave_batch(actions: list[dict], tab: int = -1) -> str:
+async def batch(actions: list[dict], tab: int = -1) -> str:
 	"""Execute a pipeline of browser actions sequentially in a single turn for maximum speed (10-100x faster than roundtrips).
 
 	Supported action types in the dict:
@@ -441,19 +452,28 @@ async def brave_batch(actions: list[dict], tab: int = -1) -> str:
 			timeout = item.get("timeout_ms", 4000)
 
 			if act == "click":
-				sel = item["selector"]
+				sel = item.get("selector")
+				if not sel:
+					results.append(f"[{idx}] click: SKIPPED (missing 'selector')")
+					continue
 				await page.locator(sel).first.click(timeout=timeout)
 				results.append(f"[{idx}] click '{sel}': OK")
 
 			elif act == "fill":
-				sel = item["selector"]
-				text = item.get("text", "")
+				sel = item.get("selector")
+				if not sel:
+					results.append(f"[{idx}] fill: SKIPPED (missing 'selector')")
+					continue
+				text = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
 				await page.locator(sel).first.fill(text, timeout=timeout)
 				results.append(f"[{idx}] fill '{sel}': OK")
 
 			elif act == "type":
-				sel = item["selector"]
-				text = item.get("text", "")
+				sel = item.get("selector")
+				if not sel:
+					results.append(f"[{idx}] type: SKIPPED (missing 'selector')")
+					continue
+				text = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
 				press_enter = item.get("press_enter", False)
 				loc = page.locator(sel).first
 				await loc.type(text, timeout=timeout)
@@ -462,29 +482,35 @@ async def brave_batch(actions: list[dict], tab: int = -1) -> str:
 				results.append(f"[{idx}] type '{sel}' ({'with Enter' if press_enter else ''}): OK")
 
 			elif act == "select":
-				sel = item["selector"]
-				val = item.get("value", "")
+				sel = item.get("selector")
+				if not sel:
+					results.append(f"[{idx}] select: SKIPPED (missing 'selector')")
+					continue
+				val = str(item.get("value") if item.get("value") is not None else item.get("text", ""))
 				await page.locator(sel).first.select_option(val, timeout=timeout)
 				results.append(f"[{idx}] select '{sel}' option '{val}': OK")
 
 			elif act == "press":
-				key = item.get("key", "Enter")
+				key = item.get("key") or item.get("button", "Enter")
 				await page.keyboard.press(key)
 				results.append(f"[{idx}] press '{key}': OK")
 
 			elif act == "wait_for":
-				sel = item["selector"]
+				sel = item.get("selector")
+				if not sel:
+					results.append(f"[{idx}] wait_for: SKIPPED (missing 'selector')")
+					continue
 				state = item.get("state", "visible")
 				await page.locator(sel).first.wait_for(state=state, timeout=timeout)
 				results.append(f"[{idx}] wait_for '{sel}' ({state}): OK")
 
 			elif act == "sleep":
-				ms = item.get("ms", 200)
+				ms = item.get("ms") or item.get("duration_ms", 200)
 				await asyncio.sleep(ms / 1000.0)
 				results.append(f"[{idx}] sleep {ms}ms: OK")
 
 			elif act == "evaluate":
-				expr = item.get("expression", "")
+				expr = item.get("expression") or item.get("code") or item.get("js", "")
 				res = await page.evaluate(expr)
 				results.append(f"[{idx}] evaluate: {res}")
 
@@ -499,23 +525,38 @@ async def brave_batch(actions: list[dict], tab: int = -1) -> str:
 
 
 @mcp.tool()
-async def brave_get_content(
+async def get_content(
 	selector: str = "body",
 	max_length: int = 4000,
 	interactive_only: bool = False,
+	clean: bool = True,
 	tab: int = -1,
 ) -> str:
-	"""Extract visible text content or interactive elements from the active tab. Set interactive_only=True for compact semantic elements snapshot."""
+	"""Extract visible text content or interactive elements from the active tab. Set interactive_only=True for compact semantic elements snapshot, or clean=False for raw text."""
 	try:
 		if interactive_only:
-			return await brave_snapshot(selector=selector, tab=tab)
+			return await snapshot(selector=selector, tab=tab)
 
 		page = await session.resolve_page(tab)
 		element = page.locator(selector).first
 		if await element.count() == 0:
 			return f"Element '{selector}' not found on page {page.url}"
 
-		text = await element.inner_text()
+		if clean:
+			js_clean = """({ sel }) => {
+				const el = document.querySelector(sel);
+				if (!el) return '';
+				const clone = el.cloneNode(true);
+				const junk = clone.querySelectorAll(
+					'script, style, svg, noscript, nav, header, footer, [role="banner"], [role="navigation"], [aria-hidden="true"], .cookie-banner, .cookie-consent, #cookie-banner, .advertisement, .ad-banner'
+				);
+				junk.forEach(n => n.remove());
+				return (clone.innerText || clone.textContent || '').trim().replace(/\\n{3,}/g, '\\n\\n');
+			}"""
+			text = await page.evaluate(js_clean, {"sel": selector})
+		else:
+			text = await element.inner_text()
+
 		text = text.strip()
 		if len(text) > max_length:
 			truncated = text[:max_length]
@@ -526,7 +567,7 @@ async def brave_get_content(
 
 
 @mcp.tool()
-async def brave_click(selector: str, tab: int = -1, timeout_ms: int = 5000) -> str:
+async def click(selector: str, tab: int = -1, timeout_ms: int = 5000) -> str:
 	"""Click an element on the active page or specified tab index by CSS selector, text, or XPath."""
 	try:
 		page = await session.resolve_page(tab)
@@ -538,7 +579,7 @@ async def brave_click(selector: str, tab: int = -1, timeout_ms: int = 5000) -> s
 
 
 @mcp.tool()
-async def brave_type(selector: str, text: str, clear_first: bool = True, press_enter: bool = False, tab: int = -1, timeout_ms: int = 5000) -> str:
+async def type(selector: str, text: str, clear_first: bool = True, press_enter: bool = False, tab: int = -1, timeout_ms: int = 5000) -> str:
 	"""Type text into an input field or textarea on the active page or specified tab index."""
 	try:
 		page = await session.resolve_page(tab)
@@ -557,7 +598,7 @@ async def brave_type(selector: str, text: str, clear_first: bool = True, press_e
 
 
 @mcp.tool()
-async def brave_press_key(key: str, tab: int = -1) -> str:
+async def press_key(key: str, tab: int = -1) -> str:
 	"""Press a keyboard key on the active page or specified tab index (e.g., 'Enter', 'Tab', 'Escape')."""
 	try:
 		page = await session.resolve_page(tab)
@@ -568,7 +609,7 @@ async def brave_press_key(key: str, tab: int = -1) -> str:
 
 
 @mcp.tool()
-async def brave_scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> str:
+async def scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> str:
 	"""Scroll the active page or specified tab index up or down (direction: 'up' or 'down', amount in pixels)."""
 	try:
 		page = await session.resolve_page(tab)
@@ -580,13 +621,13 @@ async def brave_scroll(direction: str = "down", amount: int = 600, tab: int = -1
 
 
 @mcp.tool()
-async def brave_screenshot(save_path: str = "", tab: int = -1) -> str:
+async def screenshot(save_path: str = "", tab: int = -1) -> str:
 	"""Capture a screenshot of the active page view or specified tab index and return the file path."""
 	try:
 		page = await session.resolve_page(tab)
 		if not save_path:
 			timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-			save_path = f"/tmp/brave_screenshot_{timestamp}.png"
+			save_path = f"/tmp/screenshot_{timestamp}.png"
 
 		await page.screenshot(path=save_path, full_page=False)
 		title = await page.title()
@@ -596,11 +637,11 @@ async def brave_screenshot(save_path: str = "", tab: int = -1) -> str:
 
 
 @mcp.tool()
-async def brave_fetch(
+async def fetch(
 	url: str,
 	method: str = "GET",
 	headers: Optional[dict] = None,
-	body: Optional[str] = None,
+	body: Optional[Any] = None,
 	response_type: str = "auto",
 	tab: int = -1,
 ) -> str:
@@ -610,13 +651,20 @@ async def brave_fetch(
 	- url: Target URL or endpoint path (can be relative e.g. '/api/accounts' or absolute).
 	- method: HTTP method ('GET', 'POST', 'PUT', 'DELETE', etc. Default 'GET').
 	- headers: Optional dictionary of HTTP request headers.
-	- body: Optional request payload string (e.g. JSON string or form data).
+	- body: Optional request payload (string, dict, or list; dict/list will be serialized as JSON with Content-Type header).
 	- response_type: Expected format: 'auto' (parses JSON if possible, else text), 'json', or 'text'.
 	- tab: Target tab index (-1 for active tab).
 	"""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
+
+		# Auto-serialize dict/list body to JSON
+		if isinstance(body, (dict, list)):
+			body = json.dumps(body)
+			if headers is None:
+				headers = {}
+			headers.setdefault("Content-Type", "application/json")
 		js_script = """async ({ url, method, headers, body, responseType }) => {
 			const options = {
 				method: (method || 'GET').toUpperCase(),
@@ -684,11 +732,11 @@ async def brave_fetch(
 				text = text[:60000] + f"\n... [Truncated: {len(text)} total characters]"
 			return f"{status_str} [TEXT] from {result['url']}:\n\n{text}"
 	except Exception as exc:
-		return f"Error executing brave_fetch: {exc}"
+		return f"Error executing fetch: {exc}"
 
 
 @mcp.tool()
-async def brave_state(
+async def state(
 	framework: str = "auto",
 	selector: str = "",
 	tab: int = -1,
@@ -904,7 +952,7 @@ async def brave_state(
 
 
 @mcp.tool()
-async def brave_evaluate_js(expression: str, tab: int = -1) -> str:
+async def evaluate_js(expression: str, tab: int = -1) -> str:
 	"""Evaluate a JavaScript expression in the active page or specified tab index and return the result."""
 	try:
 		page = await session.resolve_page(tab)
@@ -915,8 +963,8 @@ async def brave_evaluate_js(expression: str, tab: int = -1) -> str:
 
 
 @mcp.tool()
-async def brave_switch_tab(index: int) -> str:
-	"""Switch focus to an open tab by its numeric index (see brave_status)."""
+async def switch_tab(index: int) -> str:
+	"""Switch focus to an open tab by its numeric index (see status)."""
 	try:
 		pages = await session.get_pages()
 		if index < 0 or index >= len(pages):
@@ -932,15 +980,15 @@ async def brave_switch_tab(index: int) -> str:
 
 
 @mcp.tool()
-async def brave_close_tab(index: int = -1) -> str:
+async def close_tab(index: int = -1) -> str:
 	"""Close a tab by index (-1 closes active tab, -99 or closing last tab terminates the browser window)."""
 	try:
 		if index == -99:
-			return await brave_close_browser()
+			return await close_browser()
 
 		pages = await session.get_pages()
 		if not pages:
-			return await brave_close_browser()
+			return await close_browser()
 
 		if index == -1:
 			page = await session.get_active_page()
@@ -958,7 +1006,7 @@ async def brave_close_tab(index: int = -1) -> str:
 
 		remaining = await session.get_pages()
 		if not remaining:
-			await brave_close_browser()
+			await close_browser()
 			return f"Closed last tab [{target_index}] ({url}). Browser window completely closed."
 		return f"Closed tab [{target_index}] ({url}). Remaining open tabs: {len(remaining)}"
 	except Exception as exc:
@@ -966,7 +1014,7 @@ async def brave_close_tab(index: int = -1) -> str:
 
 
 @mcp.tool()
-async def brave_close_browser() -> str:
+async def close_browser() -> str:
 	"""Completely close the browser window, terminate the browser process, and release all resources."""
 	try:
 		if session._context is not None:
@@ -987,6 +1035,7 @@ async def brave_close_browser() -> str:
 
 def main():
 	parser = argparse.ArgumentParser(
+		prog="stealth-browser",
 		description="FastMCP server providing browser automation tools over CDP or standalone stealth Chromium using patchright."
 	)
 	parser.parse_args()
