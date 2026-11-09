@@ -229,11 +229,8 @@ class BrowserSessionManager:
 			blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
 			if blank_pages:
 				page = blank_pages[0]
-			elif self._browser is not None:
-				# Connected via CDP with only active user pages open: open dedicated tab
-				page = await context.new_page()
 			elif pages:
-				page = pages[0]
+				page = pages[-1]
 			else:
 				page = await context.new_page()
 
@@ -249,7 +246,7 @@ class BrowserSessionManager:
 				if blank_pages:
 					page = blank_pages[0]
 				elif pages:
-					page = pages[0]
+					page = pages[-1]
 				else:
 					page = await context.new_page()
 				self.set_active_page(page)
@@ -515,7 +512,12 @@ async def navigate(
 	try:
 		context = await session.get_context()
 		if new_tab:
-			page = await context.new_page()
+			pages = await session.get_pages()
+			blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
+			if blank_pages:
+				page = blank_pages[0]
+			else:
+				page = await context.new_page()
 			session.set_active_page(page)
 		else:
 			page = await session.resolve_page(tab)
@@ -1205,10 +1207,10 @@ async def close_tab(index: int = -1) -> str:
 		url = page.url
 		await keep_alive_mgr.stop(page)
 		await page.close()
-		if page == session._active_page:
-			session._active_page = None
 
 		remaining = await session.get_pages()
+		if page == session._active_page:
+			session._active_page = remaining[-1] if remaining else None
 		if not remaining:
 			await close_browser()
 			return f"Closed last tab [{target_index}] ({url}). Browser window completely closed."
