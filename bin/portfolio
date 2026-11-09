@@ -1,0 +1,478 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+# 	"typer",
+# 	"pyyaml",
+# 	"rich",
+# ]
+# ///
+"""Portfolio Manager CLI: SQLite transaction ledger & YAML snapshot sync.
+
+Maintains a local SQLite database for investment transactions and generates
+a clean YAML snapshot for AI agents and rapid inspection.
+"""
+
+from datetime import date, datetime
+from enum import Enum
+import json
+import os
+from pathlib import Path
+import sqlite3
+from typing import Optional
+from rich.console import Console
+from rich.table import Table
+import typer
+import yaml
+
+
+app = typer.Typer(
+	name="portfolio",
+	help="Portfolio Manager: SQLite transaction ledger and YAML snapshot sync.",
+	add_completion=False,
+)
+console = Console()
+
+# Default data paths pointing to knowledge-base finances directory
+DEFAULT_KB_DIR = Path.home() / "repos" / "knowledge-base" / "finances"
+DB_PATH = Path(os.environ.get("PORTFOLIO_DB_PATH", DEFAULT_KB_DIR / "portfolio.db"))
+ACCOUNTS_YAML_PATH = Path(os.environ.get("PORTFOLIO_ACCOUNTS_PATH", DEFAULT_KB_DIR / "accounts.yaml"))
+OUTPUT_YAML_PATH = Path(os.environ.get("PORTFOLIO_YAML_PATH", DEFAULT_KB_DIR / "portfolio.yaml"))
+
+
+class TransactionType(str, Enum):
+	BUY = "BUY"
+	SELL = "SELL"
+	DIVIDEND = "DIVIDEND"
+
+
+def get_db_connection(db_file: Path = DB_PATH) -> sqlite3.Connection:
+	"""Open SQLite database connection with row factory and foreign keys."""
+	db_file.parent.mkdir(parents=True, exist_ok=True)
+	conn = sqlite3.connect(db_file)
+	conn.row_factory = sqlite3.Row
+	conn.execute("PRAGMA foreign_keys = ON;")
+	return conn
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+	"""Initialize database tables if they do not exist."""
+	with conn:
+		conn.executescript("""
+			CREATE TABLE IF NOT EXISTS accounts (
+				account_id   TEXT PRIMARY KEY,
+				name         TEXT NOT NULL,
+				tax_wrapper  TEXT,
+				institution  TEXT NOT NULL,
+				currency     TEXT NOT NULL DEFAULT 'CAD',
+				status       TEXT NOT NULL DEFAULT 'active'
+			);
+
+			CREATE TABLE IF NOT EXISTS transactions (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				account_id       TEXT NOT NULL,
+				symbol           TEXT NOT NULL,
+				transaction_type TEXT NOT NULL,
+				quantity         REAL NOT NULL,
+				price_per_share  REAL NOT NULL,
+				transaction_date TEXT NOT NULL,
+				fees             REAL DEFAULT 0.0,
+				currency         TEXT NOT NULL DEFAULT 'CAD',
+				notes            TEXT,
+				created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+			);
+
+			CREATE TABLE IF NOT EXISTS holdings (
+				account_id   TEXT NOT NULL,
+				symbol       TEXT NOT NULL,
+				currency     TEXT NOT NULL,
+				total_shares REAL NOT NULL DEFAULT 0.0,
+				average_cost REAL NOT NULL DEFAULT 0.0,
+				last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (account_id, symbol, currency),
+				FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE
+			);
+		""")
+
+
+def sync_accounts_from_registry(conn: sqlite3.Connection, accounts_path: Path = ACCOUNTS_YAML_PATH) -> None:
+	"""Populate or update accounts table using accounts.yaml registry."""
+	if not accounts_path.exists():
+		return
+
+	with open(accounts_path, "r", encoding="utf-8") as f:
+		data = yaml.safe_load(f) or {}
+
+	accounts = data.get("accounts", {})
+	with conn:
+		for acc_id, meta in accounts.items():
+			conn.execute("""
+				INSERT INTO accounts (account_id, name, tax_wrapper, institution, currency, status)
+				VALUES (?, ?, ?, ?, ?, ?)
+				ON CONFLICT(account_id) DO UPDATE SET
+					name = excluded.name,
+					tax_wrapper = excluded.tax_wrapper,
+					institution = excluded.institution,
+					currency = excluded.currency,
+					status = excluded.status;
+			""", (
+				str(acc_id),
+				meta.get("name", f"Account {acc_id}"),
+				meta.get("tax_wrapper", ""),
+				meta.get("institution", ""),
+				meta.get("currency", "CAD"),
+				meta.get("status", "active"),
+			))
+
+
+def calculate_and_update_holdings(conn: sqlite3.Connection) -> None:
+	"""Recalculate holdings and adjusted cost base (ACB) from all transactions."""
+	cursor = conn.cursor()
+	cursor.execute("""
+		SELECT account_id, symbol, currency, transaction_type, quantity, price_per_share, fees, transaction_date
+		FROM transactions
+		ORDER BY transaction_date ASC, id ASC;
+	""")
+	txs = cursor.fetchall()
+
+	holdings_map: dict = {}
+
+	for tx in txs:
+		key = (tx["account_id"], tx["symbol"].upper(), tx["currency"].upper())
+		if key not in holdings_map:
+			holdings_map[key] = {"shares": 0.0, "total_cost": 0.0, "avg_cost": 0.0}
+
+		item = holdings_map[key]
+		tx_type = tx["transaction_type"].upper()
+		qty = float(tx["quantity"])
+		price = float(tx["price_per_share"])
+		fees = float(tx["fees"] or 0.0)
+
+		if tx_type == "BUY":
+			item["total_cost"] += (qty * price) + fees
+			item["shares"] += qty
+			if item["shares"] > 0:
+				item["avg_cost"] = item["total_cost"] / item["shares"]
+		elif tx_type == "SELL":
+			if item["shares"] > 0:
+				current_avg = item["avg_cost"]
+				item["shares"] -= qty
+				if item["shares"] <= 0:
+					item["shares"] = 0.0
+					item["total_cost"] = 0.0
+					item["avg_cost"] = 0.0
+				else:
+					item["total_cost"] = item["shares"] * current_avg
+
+	now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+	with conn:
+		conn.execute("DELETE FROM holdings;")
+		for (acc_id, symbol, curr), vals in holdings_map.items():
+			if vals["shares"] > 0:
+				conn.execute("""
+					INSERT INTO holdings (account_id, symbol, currency, total_shares, average_cost, last_updated)
+					VALUES (?, ?, ?, ?, ?, ?);
+				""", (acc_id, symbol, curr, vals["shares"], round(vals["avg_cost"], 4), now_str))
+
+
+def export_yaml_snapshot(conn: sqlite3.Connection, output_file: Path = OUTPUT_YAML_PATH) -> dict:
+	"""Generate clean YAML snapshot from holdings and accounts."""
+	cursor = conn.cursor()
+	cursor.execute("""
+		SELECT 
+			h.account_id,
+			h.symbol,
+			h.currency,
+			h.total_shares,
+			h.average_cost,
+			a.name AS account_name,
+			a.tax_wrapper,
+			a.institution
+		FROM holdings h
+		JOIN accounts a ON h.account_id = a.account_id
+		WHERE h.total_shares > 0
+		ORDER BY a.name, h.symbol;
+	""")
+	rows = cursor.fetchall()
+
+	grouped_accounts: dict = {}
+	symbols_set = set()
+	total_positions = len(rows)
+
+	for r in rows:
+		acc_id = str(r["account_id"])
+		symbols_set.add(r["symbol"])
+
+		if acc_id not in grouped_accounts:
+			grouped_accounts[acc_id] = {
+				"name": r["account_name"],
+				"tax_wrapper": r["tax_wrapper"],
+				"institution": r["institution"],
+				"positions": [],
+			}
+
+		grouped_accounts[acc_id]["positions"].append({
+			"symbol": r["symbol"],
+			"shares": r["total_shares"],
+			"avg_cost": r["average_cost"],
+			"currency": r["currency"],
+		})
+
+	now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+	data = {
+		"last_updated": now_str,
+		"source": "portfolio.db",
+		"summary": {
+			"total_positions": total_positions,
+			"unique_symbols": len(symbols_set),
+			"active_accounts": len(grouped_accounts),
+		},
+		"accounts": grouped_accounts,
+	}
+
+	header = (
+		"# Master Portfolio Snapshot\n"
+		"# Auto-generated from finances/portfolio.db via portfolio sync\n"
+		"# Single-read cache for AI agents and rapid inspection\n\n"
+	)
+	yaml_content = header + yaml.dump(data, default_flow_style=False, sort_keys=False, indent=2)
+
+	output_file.parent.mkdir(parents=True, exist_ok=True)
+	with open(output_file, "w", encoding="utf-8") as f:
+		f.write(yaml_content)
+
+	return data
+
+
+@app.command("list")
+def list_cmd(
+	json_output: bool = typer.Option(False, "--json", "-j", help="Output raw JSON array for agent consumption"),
+):
+	"""List current holdings across all accounts."""
+	conn = get_db_connection()
+	init_db(conn)
+	sync_accounts_from_registry(conn)
+
+	cursor = conn.cursor()
+	cursor.execute("""
+		SELECT h.account_id, a.name AS account_name, h.symbol, h.total_shares, h.average_cost, h.currency
+		FROM holdings h
+		JOIN accounts a ON h.account_id = a.account_id
+		WHERE h.total_shares > 0
+		ORDER BY a.name, h.symbol;
+	""")
+	rows = cursor.fetchall()
+	conn.close()
+
+	if json_output:
+		data = [
+			{
+				"account_id": r["account_id"],
+				"account_name": r["account_name"],
+				"symbol": r["symbol"],
+				"total_shares": r["total_shares"],
+				"average_cost": r["average_cost"],
+				"currency": r["currency"],
+			}
+			for r in rows
+		]
+		print(json.dumps(data, indent=2))
+		return
+
+	if not rows:
+		console.print("[yellow]No holdings found.[/yellow]")
+		return
+
+	table = Table(title="Current Portfolio Holdings", show_lines=False)
+	table.add_column("Account", style="cyan")
+	table.add_column("Symbol", style="bold green")
+	table.add_column("Shares", justify="right")
+	table.add_column("Avg Cost", justify="right")
+	table.add_column("Curr", justify="center")
+
+	for r in rows:
+		table.add_row(
+			r["account_name"],
+			r["symbol"],
+			f"{r['total_shares']:.2f}",
+			f"{r['average_cost']:.4f}",
+			r["currency"],
+		)
+
+	console.print(table)
+
+
+@app.command("history")
+def history_cmd(
+	account: Optional[str] = typer.Option(None, "--account", "-a", help="Filter by account ID or account name"),
+	symbol: Optional[str] = typer.Option(None, "--symbol", "-s", help="Filter by ticker symbol"),
+	type_: Optional[TransactionType] = typer.Option(None, "--type", "-t", help="Filter by transaction type (BUY, SELL, DIVIDEND)"),
+	limit: int = typer.Option(30, "--limit", "-n", help="Maximum transactions to show (0 for all)"),
+	json_output: bool = typer.Option(False, "--json", "-j", help="Output raw JSON array for agent consumption"),
+):
+	"""View transaction history in a formatted table with optional filters."""
+	conn = get_db_connection()
+	init_db(conn)
+	sync_accounts_from_registry(conn)
+
+	query = """
+		SELECT t.id, t.transaction_date, a.name AS account_name, t.account_id, t.transaction_type,
+		       t.symbol, t.quantity, t.price_per_share, (t.quantity * t.price_per_share) AS total_val,
+		       t.currency, t.fees, t.notes
+		FROM transactions t
+		JOIN accounts a ON t.account_id = a.account_id
+		WHERE 1=1
+	"""
+	params = []
+
+	if account:
+		query += " AND (t.account_id = ? OR a.name LIKE ?)"
+		params.extend([str(account), f"%{account}%"])
+	if symbol:
+		query += " AND UPPER(t.symbol) = UPPER(?)"
+		params.append(symbol)
+	if type_:
+		query += " AND UPPER(t.transaction_type) = UPPER(?)"
+		params.append(type_.value)
+
+	query += " ORDER BY t.transaction_date DESC, t.id DESC"
+
+	if limit > 0:
+		query += f" LIMIT {limit}"
+
+	cursor = conn.cursor()
+	cursor.execute(query, params)
+	rows = cursor.fetchall()
+	conn.close()
+
+	if json_output:
+		data = [
+			{
+				"id": r["id"],
+				"transaction_date": r["transaction_date"],
+				"account_id": r["account_id"],
+				"account_name": r["account_name"],
+				"transaction_type": r["transaction_type"],
+				"symbol": r["symbol"],
+				"quantity": r["quantity"],
+				"price_per_share": r["price_per_share"],
+				"total_val": r["total_val"],
+				"currency": r["currency"],
+				"fees": r["fees"],
+				"notes": r["notes"],
+			}
+			for r in rows
+		]
+		print(json.dumps(data, indent=2))
+		return
+
+	if not rows:
+		console.print("[yellow]No matching transactions found.[/yellow]")
+		return
+
+	table = Table(title="Transaction History", show_lines=False)
+	table.add_column("Date", style="dim")
+	table.add_column("Account", style="cyan")
+	table.add_column("Type", style="bold")
+	table.add_column("Symbol", style="bold green")
+	table.add_column("Shares", justify="right")
+	table.add_column("Price", justify="right")
+	table.add_column("Total", justify="right")
+	table.add_column("Curr", justify="center")
+	table.add_column("Notes", style="italic")
+
+	for r in rows:
+		tx_type = r["transaction_type"]
+		type_style = "green" if tx_type == "BUY" else "red" if tx_type == "SELL" else "blue"
+		table.add_row(
+			r["transaction_date"],
+			r["account_name"],
+			f"[{type_style}]{tx_type}[/{type_style}]",
+			r["symbol"],
+			f"{r['quantity']:.2f}",
+			f"{r['price_per_share']:.2f}",
+			f"{r['total_val']:.2f}",
+			r["currency"],
+			r["notes"] or "",
+		)
+
+	console.print(table)
+	console.print(f"[dim]Showing {len(rows)} transactions.[/dim]")
+
+
+@app.command("add")
+def add_cmd(
+	account: str = typer.Option(..., "--account", "-a", help="Account ID (e.g. 1001)"),
+	symbol: str = typer.Option(..., "--symbol", "-s", help="Ticker symbol (e.g. VOO, AAPL)"),
+	type_: TransactionType = typer.Option(TransactionType.BUY, "--type", "-t", help="Transaction type"),
+	quantity: float = typer.Option(..., "--quantity", "-q", help="Number of shares"),
+	price: float = typer.Option(..., "--price", "-p", help="Price per share"),
+	currency: str = typer.Option("CAD", "--currency", "-c", help="Currency (CAD or USD)"),
+	date_val: Optional[str] = typer.Option(None, "--date", "-d", help="Transaction date YYYY-MM-DD (default: today)"),
+	fees: float = typer.Option(0.0, "--fees", help="Trading fees (default: 0.0)"),
+	notes: Optional[str] = typer.Option(None, "--notes", help="Optional transaction notes"),
+	force: bool = typer.Option(False, "--force", "-f", help="Force insert even if duplicate transaction detected"),
+):
+	"""Record a new transaction and update portfolio snapshot."""
+	tx_date = date_val or date.today().isoformat()
+	conn = get_db_connection()
+	init_db(conn)
+	sync_accounts_from_registry(conn)
+
+	cursor = conn.cursor()
+	cursor.execute("""
+		SELECT id FROM transactions
+		WHERE account_id = ?
+		  AND UPPER(symbol) = ?
+		  AND UPPER(transaction_type) = ?
+		  AND ABS(quantity - ?) < 0.0001
+		  AND ABS(price_per_share - ?) < 0.0001
+		  AND transaction_date = ?
+		LIMIT 1;
+	""", (str(account), symbol.upper(), type_.value, quantity, price, tx_date))
+	existing = cursor.fetchone()
+
+	if existing and not force:
+		console.print(f"[yellow]Skipped (Duplicate detected):[/yellow] Existing transaction #{existing['id']} already matches {type_.value} {quantity} {symbol.upper()} @ {price} on {tx_date} (Account: {account}). Use --force to record anyway.")
+		conn.close()
+		return
+
+	with conn:
+		conn.execute("""
+			INSERT INTO transactions (account_id, symbol, transaction_type, quantity, price_per_share,
+			                         transaction_date, fees, currency, notes)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+		""", (
+			str(account),
+			symbol.upper(),
+			type_.value,
+			quantity,
+			price,
+			tx_date,
+			fees,
+			currency.upper(),
+			notes,
+		))
+
+	console.print(f"[green]Recorded transaction:[/green] {type_.value} {quantity} {symbol.upper()} @ {price} {currency.upper()} (Account: {account})")
+	calculate_and_update_holdings(conn)
+	data = export_yaml_snapshot(conn)
+	conn.close()
+	console.print(f"[dim]Updated {OUTPUT_YAML_PATH} ({data['summary']['total_positions']} positions)[/dim]")
+
+
+@app.command("sync")
+def sync_cmd():
+	"""Recalculate holdings and Adjusted Cost Base (ACB) and regenerate portfolio.yaml."""
+	conn = get_db_connection()
+	init_db(conn)
+	sync_accounts_from_registry(conn)
+	calculate_and_update_holdings(conn)
+	data = export_yaml_snapshot(conn)
+	conn.close()
+	console.print(f"[green]Successfully synced[/green] {data['summary']['total_positions']} holdings to {OUTPUT_YAML_PATH}")
+
+
+if __name__ == "__main__":
+	app()
