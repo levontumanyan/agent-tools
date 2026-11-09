@@ -70,7 +70,7 @@ Launching a second browser binary alongside an active one on macOS can corrupt s
 `stealth-browser` avoids this completely:
 
 1. **CDP First**: Attempts to attach to an existing browser session over `http://127.0.0.1:9222` (`STEALTH_BROWSER_CDP_PORT`).
-2. **Standalone Stealth Fallback**: Falls back to launching a dedicated Patchright stealth Chromium instance (`~/.agent-chromium-profile`) with `AutomationControlled` disabled.
+2. **Standalone Stealth Fallback**: Falls back to launching a dedicated Patchright stealth Chromium instance (`~/.agent-chromium-profile`) with native stealth masking and isolated profile.
 3. **Clean Lifecycle & Idle Watchdog**: Automatically shuts down the background Patchright Node driver after 5 minutes of inactivity (`STEALTH_BROWSER_IDLE_TIMEOUT=300`) and guarantees immediate subprocess teardown on `SIGTERM`, `SIGHUP`, or `stdin` EOF.
 
 ## MCP Configuration (`mcp_config.json`)

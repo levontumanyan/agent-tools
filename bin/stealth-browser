@@ -147,7 +147,6 @@ class BrowserSessionManager:
 			shutil.copy2(system_manifest, nm_manifest)
 
 		browser_args = [
-			"--disable-blink-features=AutomationControlled",
 			f"--remote-debugging-port={CDP_PORT}",
 		]
 		if os.path.exists(APPLE_PASSWORDS_EXT):
@@ -186,7 +185,6 @@ class BrowserSessionManager:
 					user_data_dir=fallback_dir,
 					executable_path=BROWSER_EXECUTABLE,
 					headless=False,
-					args=["--disable-blink-features=AutomationControlled"],
 					ignore_default_args=["--no-sandbox"],
 				)
 			else:
@@ -279,6 +277,125 @@ class BrowserSessionManager:
 
 session = BrowserSessionManager(CDP_URL)
 
+
+class KeepAliveManager:
+	"""Manages background jittered keep-alive workers to prevent web session timeouts."""
+
+	def __init__(self):
+		self._tasks: dict[Page, asyncio.Task] = {}
+		self._configs: dict[Page, dict] = {}
+
+	def has_active(self) -> bool:
+		self._cleanup_dead_tasks()
+		return bool(self._tasks)
+
+	def _cleanup_dead_tasks(self):
+		dead = [p for p, t in self._tasks.items() if p.is_closed() or t.done()]
+		for p in dead:
+			self._tasks.pop(p, None)
+			self._configs.pop(p, None)
+
+	def is_active(self, page: Page) -> bool:
+		task = self._tasks.get(page)
+		return task is not None and not task.done() and not page.is_closed()
+
+	def get_config(self, page: Page) -> Optional[dict]:
+		return self._configs.get(page)
+
+	async def stop(self, page: Page):
+		task = self._tasks.pop(page, None)
+		self._configs.pop(page, None)
+		if task is not None and not task.done():
+			task.cancel()
+			try:
+				await task
+			except asyncio.CancelledError:
+				pass
+
+	async def stop_all(self):
+		tasks = list(self._tasks.values())
+		self._tasks.clear()
+		self._configs.clear()
+		for t in tasks:
+			if not t.done():
+				t.cancel()
+		if tasks:
+			await asyncio.gather(*tasks, return_exceptions=True)
+
+	async def start(
+		self,
+		page: Page,
+		min_seconds: int = 45,
+		max_seconds: int = 90,
+		ping_url: Optional[str] = None,
+	):
+		await self.stop(page)
+		self._configs[page] = {
+			"min_seconds": min_seconds,
+			"max_seconds": max_seconds,
+			"ping_url": ping_url,
+			"started_at": datetime.datetime.now().isoformat(),
+			"last_ping": None,
+		}
+
+		async def _worker():
+			try:
+				while not page.is_closed():
+					delay = random.uniform(float(min_seconds), float(max_seconds))
+					await asyncio.sleep(delay)
+					if page.is_closed():
+						break
+
+					session._touch_activity()
+
+					js_keep_alive = """async (pingUrl) => {
+						const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+						const keepWorking = buttons.find(b => {
+							const t = (b.innerText || '').toLowerCase();
+							return t.includes('keep working') || t.includes('continue session') || t.includes('stay signed in') || t.includes('extend session');
+						});
+						let clicked = false;
+						if (keepWorking) {
+							try { keepWorking.click(); clicked = true; } catch (e) {}
+						}
+
+						const x = Math.floor(Math.random() * 500) + 100;
+						const y = Math.floor(Math.random() * 400) + 100;
+						window.dispatchEvent(new MouseEvent('mousemove', { clientX: x, clientY: y, bubbles: true }));
+						window.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+						let pingStatus = null;
+						if (pingUrl) {
+							try {
+								const res = await fetch(pingUrl);
+								pingStatus = res.status;
+							} catch (e) {
+								pingStatus = e.message;
+							}
+						}
+						return { clicked, pingStatus, x, y };
+					}"""
+					try:
+						res = await page.evaluate(js_keep_alive, ping_url)
+						if page in self._configs:
+							self._configs[page]["last_ping"] = {
+								"timestamp": datetime.datetime.now().isoformat(),
+								"details": res,
+							}
+					except Exception:
+						pass
+			except asyncio.CancelledError:
+				pass
+			finally:
+				self._tasks.pop(page, None)
+				self._configs.pop(page, None)
+
+		task = asyncio.create_task(_worker())
+		self._tasks[page] = task
+
+
+keep_alive_mgr = KeepAliveManager()
+
 MEDIA_RESOURCE_TYPES = {"image", "media", "font"}
 MEDIA_FILE_EXTENSIONS = (
 	".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
@@ -320,11 +437,59 @@ async def status() -> str:
 		for idx, page in enumerate(pages):
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
 			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
+			keep_alive_status = " [KEEP-ALIVE ACTIVE]" if keep_alive_mgr.is_active(page) else ""
 			title = await page.title()
-			lines.append(f"\t[{idx}] {title} - {page.url}{media_status}{active_marker}")
+			lines.append(f"\t[{idx}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Disconnected: {exc}"
+
+
+@mcp.tool()
+async def keep_alive(
+	enable: bool = True,
+	tab: int = -1,
+	min_seconds: int = 45,
+	max_seconds: int = 90,
+	ping_url: Optional[str] = None,
+) -> str:
+	"""Keep a web session alive with randomized jitter intervals and automatic modal dismissal.
+
+	Runs a background worker for the tab that:
+	- Periodically dispatches randomized human-like mouse movements and scroll events.
+	- Detects and automatically clicks common session-timeout dialogs (e.g. 'Keep Working', 'Stay Signed In').
+	- Optionally pings a specified session heartbeat endpoint with HTTP requests.
+	- Prevents the stealth-browser MCP driver from shutting down on idle.
+
+	Parameters:
+	- enable: Set to True to activate keep-alive on the tab; False to disable.
+	- tab: Target tab index (-1 for active tab).
+	- min_seconds: Minimum randomized interval between heartbeats (default 45).
+	- max_seconds: Maximum randomized interval between heartbeats (default 90).
+	- ping_url: Optional relative or absolute URL to fetch periodically for server-side token refresh.
+	"""
+	try:
+		page = await session.resolve_page(tab)
+		pages = await session.get_pages()
+		target_index = pages.index(page) if page in pages else tab
+
+		if not enable:
+			await keep_alive_mgr.stop(page)
+			return f"Disabled keep-alive on tab [{target_index}] ({page.url})"
+
+		await keep_alive_mgr.start(
+			page=page,
+			min_seconds=min_seconds,
+			max_seconds=max_seconds,
+			ping_url=ping_url,
+		)
+		ping_info = f", pinging '{ping_url}'" if ping_url else ""
+		return (
+			f"Activated keep-alive on tab [{target_index}] ({page.url}): "
+			f"jitter interval {min_seconds}-{max_seconds}s, auto-dismiss modals enabled{ping_info}."
+		)
+	except Exception as exc:
+		return f"Error managing keep-alive: {exc}"
 
 
 @mcp.tool()
@@ -1038,6 +1203,7 @@ async def close_tab(index: int = -1) -> str:
 			target_index = index
 
 		url = page.url
+		await keep_alive_mgr.stop(page)
 		await page.close()
 		if page == session._active_page:
 			session._active_page = None
