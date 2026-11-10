@@ -291,6 +291,7 @@ class BrowserSessionManager:
 				user_data_dir=PROFILE_DIR,
 				executable_path=BROWSER_EXECUTABLE,
 				headless=False,
+				no_viewport=True,
 				args=browser_args,
 				ignore_default_args=["--no-sandbox"],
 			)
@@ -317,6 +318,7 @@ class BrowserSessionManager:
 					user_data_dir=fallback_dir,
 					executable_path=BROWSER_EXECUTABLE,
 					headless=False,
+					no_viewport=True,
 					ignore_default_args=["--no-sandbox"],
 				)
 			else:
@@ -1360,8 +1362,19 @@ async def close_tab(index: int = -1) -> str:
 def _force_kill_browser_processes():
 	"""Terminates lingering Chromium processes strictly associated with the agent's profile or CDP port."""
 	try:
-		subprocess.run(["pkill", "-f", f"--user-data-dir={PROFILE_DIR}"], capture_output=True)
-		subprocess.run(["pkill", "-f", f"--remote-debugging-port={CDP_PORT}"], capture_output=True)
+		subprocess.run(["pkill", "-f", "--", f"--user-data-dir={PROFILE_DIR}"], capture_output=True)
+		subprocess.run(["pkill", "-f", "--", f"--remote-debugging-port={CDP_PORT}"], capture_output=True)
+		time.sleep(0.3)
+		subprocess.run(["pkill", "-9", "-f", "--", f"--user-data-dir={PROFILE_DIR}"], capture_output=True)
+		subprocess.run(["pkill", "-9", "-f", "--", f"--remote-debugging-port={CDP_PORT}"], capture_output=True)
+		# Clean up any orphaned Chromium singleton locks left behind
+		for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+			lock_path = os.path.join(PROFILE_DIR, lock_name)
+			if os.path.islink(lock_path) or os.path.exists(lock_path):
+				try:
+					os.unlink(lock_path)
+				except Exception:
+					pass
 	except Exception:
 		pass
 
