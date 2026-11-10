@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # dependencies = [
+# 	"adblock",
 # 	"mcp<2",
 # 	"patchright",
 # ]
@@ -16,9 +17,12 @@ import random
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
+import urllib.request
 from typing import Any, Optional, Union
+from adblock import Engine, FilterSet
 from mcp.server.fastmcp import FastMCP
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 
@@ -34,6 +38,132 @@ BROWSER_EXECUTABLE = os.environ.get("STEALTH_BROWSER_EXECUTABLE", DEFAULT_BROWSE
 APPLE_PASSWORDS_EXT = os.path.expanduser(
 	"~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Extensions/pejdijmoenmkgeppbflobdenhhabjlaj/3.4.0_0"
 )
+
+MEDIA_RESOURCE_TYPES = {"image", "media", "font"}
+MEDIA_FILE_EXTENSIONS = (
+	".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+	".mp4", ".webm", ".ogg", ".woff", ".woff2", ".ttf", ".otf"
+)
+
+CACHE_DIR = os.path.expanduser("~/.cache/stealth-browser")
+CACHE_FILE = os.path.join(CACHE_DIR, "easyprivacy.txt")
+CACHE_BIN_FILE = os.path.join(CACHE_DIR, "easyprivacy.bin")
+EASYPRIVACY_URL = "https://easylist.to/easylist/easyprivacy.txt"
+
+_adblock_engine: Optional[Engine] = None
+_adblock_initialized: bool = False
+
+
+def _load_or_build_engine() -> Optional[Engine]:
+	"""Load cached binary engine or compile EasyPrivacy into Brave's adblock-rust engine."""
+	os.makedirs(CACHE_DIR, exist_ok=True)
+
+	# 1. Fast path: load compiled binary cache (< 20ms)
+	if os.path.exists(CACHE_BIN_FILE):
+		try:
+			if (time.time() - os.path.getmtime(CACHE_BIN_FILE)) < (7 * 86400):
+				engine = Engine(filter_set=FilterSet())
+				engine.deserialize_from_file(CACHE_BIN_FILE)
+				return engine
+		except Exception:
+			pass
+
+	# 2. Text rule file: load from cache or download fresh
+	content = None
+	if os.path.exists(CACHE_FILE):
+		try:
+			if (time.time() - os.path.getmtime(CACHE_FILE)) < (7 * 86400):
+				with open(CACHE_FILE, "r", encoding="utf-8") as f:
+					content = f.read()
+		except Exception:
+			content = None
+
+	if not content:
+		try:
+			req = urllib.request.Request(EASYPRIVACY_URL, headers={"User-Agent": "Mozilla/5.0"})
+			with urllib.request.urlopen(req, timeout=5) as resp:
+				content = resp.read().decode("utf-8", errors="ignore")
+			with open(CACHE_FILE, "w", encoding="utf-8") as f:
+				f.write(content)
+		except Exception:
+			if os.path.exists(CACHE_FILE):
+				try:
+					with open(CACHE_FILE, "r", encoding="utf-8") as f:
+						content = f.read()
+				except Exception:
+					content = None
+
+	if content:
+		try:
+			filters = FilterSet()
+			filters.add_filter_list(content)
+			engine = Engine(filter_set=filters)
+			# Serialize compiled binary to disk for instant subsequent startups
+			try:
+				engine.serialize_to_file(CACHE_BIN_FILE)
+			except Exception:
+				pass
+			return engine
+		except Exception:
+			pass
+	return None
+
+
+def get_adblock_engine() -> Optional[Engine]:
+	global _adblock_engine, _adblock_initialized
+	if not _adblock_initialized:
+		_adblock_initialized = True
+		_adblock_engine = _load_or_build_engine()
+	return _adblock_engine
+
+
+async def _network_route_handler(route, request):
+	"""Intercepts network requests: evaluates trackers against EasyPrivacy and blocks media when enabled."""
+	handled = False
+	try:
+		# Service worker requests do not have an associated frame and should not be blocked
+		frame = None
+		try:
+			frame = request.frame
+		except Exception:
+			frame = None
+
+		url = request.url
+		frame_url = frame.url if frame else ""
+		res_type = request.resource_type or "other"
+
+		# Adblock tracker check
+		engine = get_adblock_engine()
+		if engine is not None:
+			try:
+				if engine.check_network_urls(url, frame_url, res_type).matched:
+					handled = True
+					await route.abort()
+					return
+			except Exception:
+				pass
+
+		# Media blocking check (fast path)
+		page = frame.page if frame else None
+		if page and getattr(page, "_media_blocked", False):
+			if res_type in MEDIA_RESOURCE_TYPES:
+				handled = True
+				await route.abort()
+				return
+			url_clean = url.split("?")[0].lower()
+			if url_clean.endswith(MEDIA_FILE_EXTENSIONS):
+				handled = True
+				await route.abort()
+				return
+
+		handled = True
+		await route.continue_()
+	except Exception:
+		if not handled:
+			try:
+				await route.continue_()
+			except Exception:
+				pass
 
 
 class BrowserSessionManager:
@@ -131,6 +261,7 @@ class BrowserSessionManager:
 			)
 			if self._browser.contexts:
 				self._context = self._browser.contexts[0]
+				await self._ensure_interceptor(self._context)
 				return self._context
 		except Exception:
 			self._browser = None
@@ -175,6 +306,7 @@ class BrowserSessionManager:
 						)
 						if self._browser.contexts:
 							self._context = self._browser.contexts[0]
+							await self._ensure_interceptor(self._context)
 							return self._context
 					except Exception:
 						pass
@@ -189,7 +321,17 @@ class BrowserSessionManager:
 				)
 			else:
 				raise
+		await self._ensure_interceptor(self._context)
 		return self._context
+
+	async def _ensure_interceptor(self, context: BrowserContext):
+		if getattr(context, "_interceptor_attached", False):
+			return
+		setattr(context, "_interceptor_attached", True)
+		try:
+			await context.route("**/*", _network_route_handler)
+		except Exception:
+			pass
 
 	def _register_page_listeners(self, page: Page):
 		"""Attach lifecycle event listeners to auto-invalidate cached pointer on tab close or renderer crash."""
@@ -393,34 +535,9 @@ class KeepAliveManager:
 
 keep_alive_mgr = KeepAliveManager()
 
-MEDIA_RESOURCE_TYPES = {"image", "media", "font"}
-MEDIA_FILE_EXTENSIONS = (
-	".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
-	".mp4", ".webm", ".ogg", ".woff", ".woff2", ".ttf", ".otf"
-)
-
-
-async def _media_blocker_handler(route, request):
-	"""Intercepts and aborts heavy media (images, videos, custom web fonts) when media blocking is active."""
-	url_clean = request.url.split("?")[0].lower()
-	if request.resource_type in MEDIA_RESOURCE_TYPES or any(url_clean.endswith(ext) for ext in MEDIA_FILE_EXTENSIONS):
-		await route.abort()
-	else:
-		await route.continue_()
-
-
 async def set_page_media_state(page: Page, block_media: bool):
 	"""Enable or disable media blocking on a given page."""
-	is_currently_blocked = getattr(page, "_media_blocked", False)
-	if block_media and not is_currently_blocked:
-		await page.route("**/*", _media_blocker_handler)
-		setattr(page, "_media_blocked", True)
-	elif not block_media and is_currently_blocked:
-		try:
-			await page.unroute("**/*", _media_blocker_handler)
-		except Exception:
-			pass
-		setattr(page, "_media_blocked", False)
+	setattr(page, "_media_blocked", block_media)
 
 
 @mcp.tool()
@@ -435,7 +552,10 @@ async def status() -> str:
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
 			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
 			keep_alive_status = " [KEEP-ALIVE ACTIVE]" if keep_alive_mgr.is_active(page) else ""
-			title = await page.title()
+			try:
+				title = await asyncio.wait_for(page.title(), timeout=2.0)
+			except Exception:
+				title = "(Unresponsive / Busy)"
 			lines.append(f"\t[{idx}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
 		return "\n".join(lines)
 	except Exception as exc:
@@ -613,7 +733,10 @@ async def snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1
 				};
 			});
 		}"""
-		elements = await page.evaluate(js_code, {"targetSelector": selector})
+		try:
+			elements = await asyncio.wait_for(page.evaluate(js_code, {"targetSelector": selector}), timeout=10.0)
+		except asyncio.TimeoutError:
+			return f"Error capturing snapshot: Timed out after 10000ms"
 		elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
 		if not elements:
@@ -713,7 +836,7 @@ async def batch(actions: list[dict], tab: int = -1) -> str:
 
 			elif act == "evaluate":
 				expr = item.get("expression") or item.get("code") or item.get("js", "")
-				res = await page.evaluate(expr)
+				res = await asyncio.wait_for(page.evaluate(expr), timeout=timeout / 1000.0)
 				results.append(f"[{idx}] evaluate: {res}")
 
 			else:
@@ -755,9 +878,9 @@ async def get_content(
 				junk.forEach(n => n.remove());
 				return (clone.innerText || clone.textContent || '').trim().replace(/\\n{3,}/g, '\\n\\n');
 			}"""
-			text = await page.evaluate(js_clean, {"sel": selector})
+			text = await asyncio.wait_for(page.evaluate(js_clean, {"sel": selector}), timeout=10.0)
 		else:
-			text = await element.inner_text()
+			text = await asyncio.wait_for(element.inner_text(), timeout=10.0)
 
 		text = text.strip()
 		if len(text) > max_length:
@@ -846,6 +969,7 @@ async def fetch(
 	body: Optional[Any] = None,
 	response_type: str = "auto",
 	tab: int = -1,
+	timeout_ms: int = 15000,
 ) -> str:
 	"""Execute an in-browser HTTP request in the active tab origin using authenticated cookies and session state.
 
@@ -909,13 +1033,19 @@ async def fetch(
 				};
 			}
 		}"""
-		result = await page.evaluate(js_script, {
-			"url": url,
-			"method": method,
-			"headers": headers or {},
-			"body": body,
-			"responseType": response_type,
-		})
+		try:
+			result = await asyncio.wait_for(
+				page.evaluate(js_script, {
+					"url": url,
+					"method": method,
+					"headers": headers or {},
+					"body": body,
+					"responseType": response_type,
+				}),
+				timeout=timeout_ms / 1000.0,
+			)
+		except asyncio.TimeoutError:
+			return f"Error executing fetch: Timed out after {timeout_ms}ms"
 		elapsed_total = int((time.perf_counter() - t0) * 1000)
 
 		if "error" in result:
@@ -1120,10 +1250,16 @@ async def state(
 
 			return results;
 		}"""
-		results = await page.evaluate(js_script, {
-			"targetFramework": framework,
-			"selector": selector,
-		})
+		try:
+			results = await asyncio.wait_for(
+				page.evaluate(js_script, {
+					"targetFramework": framework,
+					"selector": selector,
+				}),
+				timeout=10.0,
+			)
+		except asyncio.TimeoutError:
+			return f"Error detecting state: Timed out after 10000ms"
 		elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
 		if not results:
@@ -1154,12 +1290,14 @@ async def state(
 
 
 @mcp.tool()
-async def evaluate_js(expression: str, tab: int = -1) -> str:
+async def evaluate_js(expression: str, tab: int = -1, timeout_ms: int = 15000) -> str:
 	"""Evaluate a JavaScript expression in the active page or specified tab index and return the result."""
 	try:
 		page = await session.resolve_page(tab)
-		result = await page.evaluate(expression)
+		result = await asyncio.wait_for(page.evaluate(expression), timeout=timeout_ms / 1000.0)
 		return f"Result: {result}"
+	except asyncio.TimeoutError:
+		return f"JavaScript execution error: Timed out after {timeout_ms}ms"
 	except Exception as exc:
 		return f"JavaScript execution error: {exc}"
 
@@ -1219,9 +1357,18 @@ async def close_tab(index: int = -1) -> str:
 		return f"Error closing tab: {exc}"
 
 
+def _force_kill_browser_processes():
+	"""Terminates lingering Chromium processes strictly associated with the agent's profile or CDP port."""
+	try:
+		subprocess.run(["pkill", "-f", f"--user-data-dir={PROFILE_DIR}"], capture_output=True)
+		subprocess.run(["pkill", "-f", f"--remote-debugging-port={CDP_PORT}"], capture_output=True)
+	except Exception:
+		pass
+
+
 @mcp.tool()
-async def close_browser() -> str:
-	"""Completely close the browser window, terminate the browser process, and release all resources."""
+async def close_browser(force_kill: bool = True) -> str:
+	"""Completely close the browser window, terminate all browser and renderer processes, and release all resources."""
 	try:
 		if session._context is not None:
 			try:
@@ -1234,9 +1381,25 @@ async def close_browser() -> str:
 			except Exception:
 				pass
 		await session.close()
+		if force_kill:
+			_force_kill_browser_processes()
 		return "Browser completely closed and all resources released."
 	except Exception as exc:
 		return f"Error closing browser: {exc}"
+
+
+@mcp.tool()
+async def restart_browser() -> str:
+	"""Force terminate all browser instances, clean up lingering renderer processes, and start a fresh session."""
+	try:
+		await close_browser(force_kill=True)
+		# Allow OS kernel and filesystem locks on PROFILE_DIR to settle cleanly
+		await asyncio.sleep(0.3)
+		page = await session.get_active_page()
+		title = await page.title()
+		return f"Browser restarted successfully with fresh session on tab [0]: '{title}' ({page.url})"
+	except Exception as exc:
+		return f"Error restarting browser: {exc}"
 
 
 def main():
