@@ -279,6 +279,7 @@ class BrowserSessionManager:
 			shutil.copy2(system_manifest, nm_manifest)
 
 		browser_args = [
+			"--test-type",
 			f"--remote-debugging-port={CDP_PORT}",
 		]
 		if os.path.exists(APPLE_PASSWORDS_EXT):
@@ -320,6 +321,7 @@ class BrowserSessionManager:
 					executable_path=BROWSER_EXECUTABLE,
 					headless=HEADLESS,
 					no_viewport=True,
+					args=browser_args,
 					ignore_default_args=["--no-sandbox"],
 				)
 			else:
