@@ -98,11 +98,23 @@ struct HopResult: Codable {
 	var stageDescription: String
 }
 
+struct RouterUpstreamDetails: Codable {
+	var isBeryl: Bool
+	var uplinkMode: String?
+	var upstreamSsid: String?
+	var upstreamBssid: String?
+	var upstreamChannel: Int?
+	var upstreamRssi: Int?
+	var upstreamSignalQuality: String?
+	var wireguardActive: Bool?
+}
+
 struct DiagnosticReport: Codable {
 	var timestamp: String
 	var wifi: WifiDetails?
 	var deep: DeepDiagnostics?
 	var ip: IpDetails?
+	var router: RouterUpstreamDetails?
 	var vpn: VpnAuditResult?
 	var hops: [HopResult]
 	var ping: [PingResult]
@@ -124,14 +136,17 @@ func printUsage() {
 	  • VPN & Stealth Audit: Validates home residential IP, tests for DNS leaks, and checks IPv6
 	  • Latency Route Map: Hop-by-hop breakdown (Local Airwaves ➔ Subsea Tunnel ➔ Home LAN ➔ Edge)
 	  • Internet Capacity: Download/upload bandwidth and loaded bufferbloat responsiveness (RPM)
+	  • Travel Router Uplink: Auto-detects Beryl AX upstream Wi-Fi (Airbnb SSID, RSSI, channel)
 
 	Options:
-	  -q, --quick        Quick mode (skip ~15s throughput test; runs Wi-Fi + VPN + hops + ping)
-	  -d, --deep         Deep hardware mode (reads airtime congestion, MIMO streams, MCS via sudo wdutil)
-	  -s, --scan         Scan and display nearby Wi-Fi networks and signal strengths
-	  -j, --json         Output raw JSON for automation, logging, or Grafana dashboards
-	  -c, --count <N>    Number of ping probe packets (default: 5)
-	  -h, --help         Show this help message
+	  -q, --quick          Quick mode (skip ~15s throughput test; runs Wi-Fi + VPN + hops + ping)
+	  -d, --deep           Deep hardware mode (reads airtime congestion, MIMO streams, MCS via sudo wdutil)
+	  -s, --scan           Scan and display nearby Wi-Fi networks and signal strengths
+	  -j, --json           Output raw JSON for automation, logging, or Grafana dashboards
+	  -l, --location <tag> Tag location or Airbnb name (defaults to upstream SSID)
+	      --ship           Ship test results to InfluxDB / Grafana dashboard
+	  -c, --count <N>      Number of ping probe packets (default: 5)
+	  -h, --help           Show this help message
 	"""
 	print(usage)
 }
@@ -542,13 +557,226 @@ func runSpeedTest() -> SpeedResult? {
 	)
 }
 
+func readConfigEnv(_ key: String) -> String? {
+	if let val = ProcessInfo.processInfo.environment[key], !val.isEmpty {
+		return val
+	}
+	let configPaths = [
+		NSString(string: "~/.config/wifi-check/config.env").expandingTildeInPath,
+		NSString(string: "~/.config/agent-tools/.env").expandingTildeInPath
+	]
+	for path in configPaths {
+		guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+		for line in content.components(separatedBy: .newlines) {
+			let trimmed = line.trimmingCharacters(in: .whitespaces)
+			if trimmed.hasPrefix("#") || !trimmed.contains("=") { continue }
+			let parts = trimmed.split(separator: "=", maxSplits: 1).map(String.init)
+			if parts.count == 2 && parts[0].trimmingCharacters(in: .whitespaces) == key {
+				var val = parts[1].trimmingCharacters(in: .whitespaces)
+				if (val.hasPrefix("\"") && val.hasSuffix("\"")) || (val.hasPrefix("'") && val.hasSuffix("'")) {
+					val = String(val.dropFirst().dropLast())
+				}
+				return val
+			}
+		}
+	}
+	return nil
+}
+
+func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
+	guard gateway == "192.168.8.1" else { return nil }
+
+	let keyPath = NSString(string: ProcessInfo.processInfo.environment["WIFI_CHECK_SSH_KEY"] ?? "~/.ssh/id_beryl").expandingTildeInPath
+	guard FileManager.default.fileExists(atPath: keyPath) else { return nil }
+
+	let pipe = Pipe()
+	let proc = Process()
+	proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+	proc.arguments = [
+		"-i", keyPath,
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=1",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"root@192.168.8.1",
+		"echo \"{\\\"repeater\\\": $(ubus call repeater status 2>/dev/null || echo \\\"{}\\\"), \\\"wan\\\": $(ubus call network.interface.wan status 2>/dev/null || echo \\\"{}\\\"), \\\"wg\\\": $(ubus call network.interface.wgclient status 2>/dev/null || echo \\\"{}\\\")}\""
+	]
+	proc.standardOutput = pipe
+	proc.standardError = Pipe()
+
+	do {
+		try proc.run()
+		proc.waitUntilExit()
+	} catch {
+		return nil
+	}
+
+	guard proc.terminationStatus == 0 else { return nil }
+
+	let data = pipe.fileHandleForReading.readDataToEndOfFile()
+	guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+
+	let repeater = json["repeater"] as? [String: Any] ?? [:]
+	let wan = json["wan"] as? [String: Any] ?? [:]
+	let wg = json["wg"] as? [String: Any] ?? [:]
+
+	let isRepeaterConnected = (repeater["state_name"] as? String) == "connected"
+	let isWanUp = (wan["up"] as? Bool) ?? false
+	let isWgUp = (wg["up"] as? Bool) ?? false
+
+	var mode = "Disconnected / Local Only"
+	var ssid: String? = nil
+	var bssid: String? = nil
+	var channel: Int? = nil
+	var rssi: Int? = nil
+	var quality: String? = nil
+
+	if isRepeaterConnected {
+		mode = "Wi-Fi Repeater"
+		ssid = repeater["ssid"] as? String
+		bssid = repeater["bssid"] as? String
+		if let freq = repeater["frequency"] as? Int {
+			channel = freq >= 5000 ? (freq - 5000) / 5 : (freq - 2407) / 5
+		}
+		if let sig = repeater["signal"] as? Int {
+			rssi = sig
+			quality = getSignalQuality(rssi: sig).rating
+		}
+	} else if isWanUp {
+		mode = "Ethernet WAN"
+	}
+
+	return RouterUpstreamDetails(
+		isBeryl: true,
+		uplinkMode: mode,
+		upstreamSsid: ssid,
+		upstreamBssid: bssid,
+		upstreamChannel: channel,
+		upstreamRssi: rssi,
+		upstreamSignalQuality: quality,
+		wireguardActive: isWgUp
+	)
+}
+
+func shipTelemetryToInflux(report: DiagnosticReport, locationLabel: String?, pingGw: PingResult?, pingEdge: PingResult?) {
+	let env = ProcessInfo.processInfo.environment
+	guard let urlString = env["WIFI_CHECK_INFLUX_URL"] ?? readConfigEnv("WIFI_CHECK_INFLUX_URL"),
+	      let token = env["WIFI_CHECK_INFLUX_TOKEN"] ?? readConfigEnv("WIFI_CHECK_INFLUX_TOKEN") else {
+		return
+	}
+
+	let org = env["WIFI_CHECK_INFLUX_ORG"] ?? readConfigEnv("WIFI_CHECK_INFLUX_ORG") ?? "fibonacci"
+	let bucket = env["WIFI_CHECK_INFLUX_BUCKET"] ?? readConfigEnv("WIFI_CHECK_INFLUX_BUCKET") ?? "market_data"
+
+	guard var components = URLComponents(string: urlString) else { return }
+	components.queryItems = [
+		URLQueryItem(name: "org", value: org),
+		URLQueryItem(name: "bucket", value: bucket),
+		URLQueryItem(name: "precision", value: "s")
+	]
+	guard let targetUrl = components.url else { return }
+
+	func escapeTag(_ s: String) -> String {
+		return s.replacingOccurrences(of: ",", with: "\\,")
+		        .replacingOccurrences(of: " ", with: "\\ ")
+		        .replacingOccurrences(of: "=", with: "\\=")
+	}
+
+	let timestampS = Int(Date().timeIntervalSince1970)
+	var tags: [String] = []
+	let hostname = Host.current().localizedName ?? "MacBook"
+	tags.append("host=\(escapeTag(hostname))")
+
+	if let gw = report.ip?.localGateway {
+		tags.append("gateway=\(escapeTag(gw))")
+	}
+	if let r = report.router {
+		if let mode = r.uplinkMode {
+			tags.append("uplink_mode=\(escapeTag(mode))")
+		}
+		if let ssid = r.upstreamSsid, !ssid.isEmpty {
+			tags.append("upstream_ssid=\(escapeTag(ssid))")
+		}
+	}
+	let locationTag = locationLabel ?? report.router?.upstreamSsid ?? report.wifi?.ssid ?? "Unknown"
+	tags.append("location=\(escapeTag(locationTag))")
+
+	if let vpn = report.vpn {
+		tags.append("is_vpn=\(vpn.isVpnDetected)")
+		tags.append("tunnel=\(escapeTag(vpn.tunnelName))")
+	}
+	if let w = report.wifi {
+		tags.append("wifi_band=\(escapeTag(w.band))")
+		tags.append("phy_mode=\(escapeTag(w.phyMode))")
+	}
+
+	var fields: [String] = []
+	if let w = report.wifi {
+		fields.append("wifi_rssi=\(w.rssi)i")
+		fields.append("wifi_noise=\(w.noise)i")
+		fields.append("wifi_snr=\(w.snr)i")
+		fields.append("wifi_tx_rate=\(w.txRateMbps)")
+	}
+	if let r = report.router, let ur = r.upstreamRssi {
+		fields.append("upstream_rssi=\(ur)i")
+	}
+	if let s = report.speed {
+		fields.append("download_mbps=\(s.downloadMbps)")
+		fields.append("upload_mbps=\(s.uploadMbps)")
+		fields.append("idle_latency_ms=\(s.idleLatencyMs)")
+		fields.append("bufferbloat_rpm=\(Int(s.responsivenessRpm))i")
+		if let loaded = s.loadedLatencyMs {
+			fields.append("loaded_latency_ms=\(loaded)")
+		}
+	}
+	if let gwPing = pingGw {
+		fields.append("gw_latency_ms=\(gwPing.avgMs)")
+		fields.append("gw_jitter_ms=\(gwPing.stddevMs)")
+	}
+	if let edgePing = pingEdge {
+		fields.append("wan_latency_ms=\(edgePing.avgMs)")
+		fields.append("wan_jitter_ms=\(edgePing.stddevMs)")
+	}
+	if let dns = report.dnsLatency {
+		fields.append("dns_latency_ms=\(dns.queryTimeMs)")
+	}
+	if report.hops.count >= 2 {
+		let hop2 = report.hops[1]
+		fields.append("tunnel_latency_ms=\(hop2.rttMs)")
+	}
+
+	guard !fields.isEmpty else { return }
+
+	let line = "wifi_speedtest,\(tags.joined(separator: ",")) \(fields.joined(separator: ",")) \(timestampS)"
+	guard let httpBody = line.data(using: .utf8) else { return }
+
+	var request = URLRequest(url: targetUrl)
+	request.httpMethod = "POST"
+	request.setValue("Token \(token)", forHTTPHeaderField: "Authorization")
+	request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+	request.httpBody = httpBody
+	request.timeoutInterval = 2.5
+
+	let config = URLSessionConfiguration.ephemeral
+	config.timeoutIntervalForResource = 2.5
+	config.waitsForConnectivity = false
+	let session = URLSession(configuration: config)
+
+	let sema = DispatchSemaphore(value: 0)
+	let task = session.dataTask(with: request) { _, _, _ in
+		sema.signal()
+	}
+	task.resume()
+	_ = sema.wait(timeout: .now() + 2.5)
+}
+
 func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status: String) -> VpnAuditResult {
 	let isBeryl = ip.localGateway == "192.168.8.1"
-	let isHomeRogers = ip.publicIp == "99.241.213.21" || (ip.org?.contains("Rogers") ?? false)
-	let isVpn = isBeryl || isHomeRogers
+	let homeIp = ProcessInfo.processInfo.environment["WIFI_CHECK_HOME_IP"] ?? readConfigEnv("WIFI_CHECK_HOME_IP")
+	let isHomeMatched = (homeIp != nil && ip.publicIp == homeIp) || (ip.org?.contains("Rogers") ?? false)
+	let isVpn = isBeryl || isHomeMatched
 
 	let tunnelName: String
-	if isHomeRogers {
+	if isHomeMatched {
 		tunnelName = "WireGuard Tunnel to Toronto Home (Rogers)"
 	} else if isVpn {
 		tunnelName = "Active VPN Tunnel"
@@ -558,7 +786,7 @@ func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status
 
 	var isDnsSecure = true
 	if let dns = dnsGeo {
-		if isHomeRogers && !dns.contains("Canada") && !dns.contains("United States") {
+		if isHomeMatched && !dns.contains("Canada") && !dns.contains("United States") {
 			isDnsSecure = false
 		}
 	}
@@ -566,7 +794,7 @@ func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status
 	return VpnAuditResult(
 		isVpnDetected: isVpn,
 		tunnelName: tunnelName,
-		homeIpMatch: isHomeRogers,
+		homeIpMatch: isHomeMatched,
 		dnsResolverGeo: dnsGeo,
 		ednsClientGeo: ednsGeo,
 		isDnsSecure: isDnsSecure,
@@ -734,6 +962,8 @@ var isQuick = false
 var isDeep = false
 var isScan = false
 var isJson = false
+var isShip = false
+var customLocation: String? = nil
 var pingCount = 5
 
 let args = CommandLine.arguments
@@ -749,6 +979,13 @@ while i < args.count {
 		isScan = true
 	case "-j", "--json":
 		isJson = true
+	case "-l", "--location":
+		if i + 1 < args.count {
+			customLocation = args[i + 1]
+			i += 1
+		}
+	case "--ship":
+		isShip = true
 	case "-c", "--count":
 		if i + 1 < args.count, let n = Int(args[i + 1]) {
 			pingCount = n
@@ -801,6 +1038,15 @@ let isBeryl = gateway == "192.168.8.1"
 // 2. Run Diagnostics & Network Probes Concurrently
 let group = DispatchGroup()
 let queue = DispatchQueue.global(qos: .userInitiated)
+
+var routerDetails: RouterUpstreamDetails? = nil
+if isBeryl {
+	group.enter()
+	queue.async {
+		routerDetails = fetchBerylUpstreamTelemetry(gateway: gateway)
+		group.leave()
+	}
+}
 
 var deep: DeepDiagnostics? = nil
 if isDeep || getuid() == 0 {
@@ -901,6 +1147,7 @@ let report = DiagnosticReport(
 	wifi: wifi,
 	deep: deep,
 	ip: ipDetails,
+	router: routerDetails,
 	vpn: vpn,
 	hops: hops,
 	ping: pings,
@@ -980,6 +1227,28 @@ if let pub = ipDetails.publicIp {
 	print("  • Public IP lookup failed (no internet or timeout)")
 }
 
+// Travel Router Uplink Section (GL.iNet Beryl AX)
+if let r = routerDetails, r.isBeryl {
+	print("\n\(Colors.bold)Travel Router Uplink (GL.iNet Beryl AX):\(Colors.reset)")
+	if let mode = r.uplinkMode {
+		print("  • Uplink Mode:      \(mode)")
+	}
+	if let ssid = r.upstreamSsid {
+		print("  • Upstream Wi-Fi:   \(Colors.bold)\(ssid)\(Colors.reset)")
+	}
+	if let rssi = r.upstreamRssi {
+		let (_, sigCol) = getSignalQuality(rssi: rssi)
+		print("  • Host Signal:      \(sigCol)\(rssi) dBm (\(r.upstreamSignalQuality ?? ""))\(Colors.reset)")
+	}
+	if let ch = r.upstreamChannel {
+		print("  • Host Channel:     Channel \(ch)")
+	}
+	if let wg = r.wireguardActive {
+		let wgStatus = wg ? "\(Colors.green)Connected (Tunnel Up)\(Colors.reset)" : "\(Colors.red)Down\(Colors.reset)"
+		print("  • WireGuard Tunnel: \(wgStatus)")
+	}
+}
+
 // VPN & Stealth Audit Section
 if vpn.isVpnDetected {
 	print("\n\(Colors.bold)VPN & Stealth Audit:\(Colors.reset)")
@@ -1055,3 +1324,12 @@ if let s = speed {
 print("\n\(Colors.bold)Nomad & Remote Work Verdict:\(Colors.reset)")
 print("  • Call Jitter:      \(jitterResult.rating)")
 print("  • Work Verdict:     \(rating)\n")
+
+// 6. InfluxDB Historical Telemetry Shipping
+let shouldShip = isShip || (readConfigEnv("WIFI_CHECK_AUTO_SHIP") == "true")
+if shouldShip {
+	shipTelemetryToInflux(report: report, locationLabel: customLocation, pingGw: pingGw, pingEdge: pingCloudflare)
+	if !isJson {
+		print("\(Colors.dim)⚡ Telemetry shipped to Fibonacci dashboard.\(Colors.reset)\n")
+	}
+}
