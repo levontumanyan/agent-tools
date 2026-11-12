@@ -32,6 +32,7 @@ CDP_PORT = int(os.environ.get("STEALTH_BROWSER_CDP_PORT", os.environ.get("CDP_PO
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 PROFILE_DIR = os.path.expanduser(os.environ.get("STEALTH_BROWSER_PROFILE_DIR", "~/.agent-chromium-profile"))
 IDLE_TIMEOUT_SECONDS = int(os.environ.get("STEALTH_BROWSER_IDLE_TIMEOUT", "300"))
+HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
 CHROMIUM_APP_BIN = "/Applications/Chromium.app/Contents/MacOS/Chromium"
 DEFAULT_BROWSER_EXECUTABLE = CHROMIUM_APP_BIN if os.path.exists(CHROMIUM_APP_BIN) else None
 BROWSER_EXECUTABLE = os.environ.get("STEALTH_BROWSER_EXECUTABLE", DEFAULT_BROWSER_EXECUTABLE)
@@ -290,7 +291,7 @@ class BrowserSessionManager:
 			self._context = await self._playwright.chromium.launch_persistent_context(
 				user_data_dir=PROFILE_DIR,
 				executable_path=BROWSER_EXECUTABLE,
-				headless=False,
+				headless=HEADLESS,
 				no_viewport=True,
 				args=browser_args,
 				ignore_default_args=["--no-sandbox"],
@@ -317,7 +318,7 @@ class BrowserSessionManager:
 				self._context = await self._playwright.chromium.launch_persistent_context(
 					user_data_dir=fallback_dir,
 					executable_path=BROWSER_EXECUTABLE,
-					headless=False,
+					headless=HEADLESS,
 					no_viewport=True,
 					ignore_default_args=["--no-sandbox"],
 				)
@@ -548,7 +549,8 @@ async def status() -> str:
 	try:
 		pages = await session.get_pages()
 		active_page = session._active_page if (session._active_page is not None and not session._active_page.is_closed()) else None
-		lines = [f"Connected to browser session at {CDP_URL}"]
+		mode_str = "Headless" if HEADLESS else "Headed"
+		lines = [f"Connected to browser session at {CDP_URL} (Mode: {mode_str})"]
 		lines.append(f"Total open tabs: {len(pages)}")
 		for idx, page in enumerate(pages):
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
