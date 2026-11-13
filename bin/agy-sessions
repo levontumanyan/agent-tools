@@ -115,7 +115,8 @@ def get_live_processes() -> tuple[dict, dict, dict, dict]:
 			if tty_short == "??":
 				continue
 			tty = "/dev/" + tty_short
-			if cmd == "agy" or cmd.startswith("agy "):
+			exe = os.path.basename(cmd.split(None, 1)[0])
+			if exe == "agy":
 				tty_to_agy[tty] = (pid, cmd)
 			elif cmd in ("-zsh", "zsh", "/bin/zsh"):
 				tty_to_zsh[tty] = pid
