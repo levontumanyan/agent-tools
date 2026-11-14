@@ -2,6 +2,7 @@
 
 import Foundation
 import CoreWLAN
+import SystemConfiguration
 
 // ============================================================================
 // wifi-check: Comprehensive macOS Wi-Fi & Internet Diagnostic Utility
@@ -189,10 +190,56 @@ func getChannelWidthMHz(_ width: CWChannelWidth) -> Int {
 	}
 }
 
+func readCachedScanRecord(interfaceName: String) -> (ssid: String?, bssid: String?) {
+	guard let store = SCDynamicStoreCreate(nil, "wifi-check" as CFString, nil, nil),
+	      let dict = SCDynamicStoreCopyValue(store, "State:/Network/Interface/\(interfaceName)/AirPort" as CFString) as? [String: Any],
+	      let data = dict["CachedScanRecord"] as? Data,
+	      let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+	      let objects = plist["$objects"] as? [Any],
+	      let top = plist["$top"] as? [String: Any],
+	      let rootRef = top["root"] else {
+		return (nil, nil)
+	}
+
+	func cfUidValue(_ ref: Any) -> Int? {
+		let desc = String(describing: ref)
+		if let range = desc.range(of: #"value\s*=\s*(\d+)"#, options: .regularExpression),
+		   let numRange = desc[range].range(of: #"\d+"#, options: .regularExpression) {
+			return Int(desc[numRange])
+		}
+		return nil
+	}
+
+	guard let rootIdx = cfUidValue(rootRef),
+	      rootIdx < objects.count,
+	      let rootDict = objects[rootIdx] as? [String: Any],
+	      let keyRefs = rootDict["NS.keys"] as? [Any],
+	      let valRefs = rootDict["NS.objects"] as? [Any],
+	      keyRefs.count == valRefs.count else {
+		return (nil, nil)
+	}
+
+	var ssid: String? = nil
+	var bssid: String? = nil
+	for (kRef, vRef) in zip(keyRefs, valRefs) {
+		guard let kIdx = cfUidValue(kRef), let vIdx = cfUidValue(vRef),
+		      kIdx < objects.count, vIdx < objects.count,
+		      let key = objects[kIdx] as? String else { continue }
+		if key == "SSID_STR", let val = objects[vIdx] as? String {
+			ssid = val
+		} else if key == "BSSID", let val = objects[vIdx] as? String {
+			bssid = val
+		}
+	}
+	return (ssid, bssid)
+}
+
 func inspectCurrentWifi() -> WifiDetails? {
 	guard let iface = CWWiFiClient.shared().interface() else {
 		return nil
 	}
+	let ifName = iface.interfaceName ?? "en0"
+	let cached: (ssid: String?, bssid: String?) = (iface.ssid() == nil || iface.bssid() == nil) ? readCachedScanRecord(interfaceName: ifName) : (nil, nil)
 	let ch = iface.wlanChannel()
 	let bandStr: String
 	switch ch?.channelBand {
@@ -208,9 +255,9 @@ func inspectCurrentWifi() -> WifiDetails? {
 	let (quality, _) = getSignalQuality(rssi: rssi)
 
 	return WifiDetails(
-		interfaceName: iface.interfaceName ?? "en0",
-		ssid: iface.ssid(),
-		bssid: iface.bssid(),
+		interfaceName: ifName,
+		ssid: iface.ssid() ?? cached.ssid,
+		bssid: iface.bssid() ?? cached.bssid,
 		band: bandStr,
 		channel: Int(ch?.channelNumber ?? 0),
 		channelWidthMHz: getChannelWidthMHz(ch?.channelWidth ?? .widthUnknown),
@@ -1168,6 +1215,10 @@ print("\n\(Colors.bold)Wi-Fi Wireless Link:\(Colors.reset)")
 if let w = wifi {
 	let (_, sigColor) = getSignalQuality(rssi: w.rssi)
 	print("  • Interface:        \(w.interfaceName)")
+	if let ssid = w.ssid, !ssid.isEmpty {
+		let bssidStr = w.bssid.map { " (\($0))" } ?? ""
+		print("  • Network (SSID):   \(Colors.bold)\(ssid)\(Colors.reset)\(Colors.dim)\(bssidStr)\(Colors.reset)")
+	}
 	print("  • Frequency Band:   \(w.band) (Channel \(w.channel), \(w.channelWidthMHz) MHz width)")
 	print("  • Physical Standard: \(w.phyMode)")
 	print("  • Link Transmit Rate: \(w.txRateMbps) Mbps")
