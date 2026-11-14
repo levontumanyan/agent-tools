@@ -1,0 +1,13 @@
+[Unit]
+Description=AGY Streamable HTTP MCP & Dispatch Control Plane
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/home/ubuntu/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/bin/agy-mcp-server --host 127.0.0.1 --port 8765
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
