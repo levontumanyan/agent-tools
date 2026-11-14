@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+agy-task-runner: Autonomous & Interactive Task Runner for Antigravity (AGY) on Fibonacci.
+Runs agy inside a persistent tmux session in an ephemeral git worktree,
+records state in SQLite (WAL), runs evidence gates, and opens PRs.
+"""
+
+import argparse
+import datetime
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+
+REPOS_BASE = os.path.expanduser("~/repos")
+WORKTREES_BASE = "/tmp/agy-worktrees"
+LOGS_BASE = os.path.expanduser("~/logs/agy-tasks")
+DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/agy-dispatch/state.db")
+TMUX_BIN = os.environ.get("TMUX_BIN", "/home/linuxbrew/.linuxbrew/bin/tmux")
+AGY_BIN = os.environ.get("AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
+GH_BIN = os.environ.get("GH_BIN", "/home/linuxbrew/.linuxbrew/bin/gh")
+
+
+def get_db_path() -> str:
+	"""Return path to SQLite state database, ensuring parent directory exists."""
+	db_path = os.environ.get("AGY_DISPATCH_DB", DEFAULT_DB_PATH)
+	os.makedirs(os.path.dirname(db_path), exist_ok=True)
+	return db_path
+
+
+def get_db_conn() -> sqlite3.Connection:
+	"""Open a WAL-mode SQLite connection and ensure schema exists."""
+	conn = sqlite3.connect(get_db_path(), timeout=15.0)
+	conn.execute("PRAGMA journal_mode=WAL;")
+	conn.execute("PRAGMA busy_timeout=10000;")
+	conn.execute("""
+		CREATE TABLE IF NOT EXISTS tasks (
+			task_id TEXT PRIMARY KEY,
+			run_id TEXT,
+			worker_name TEXT,
+			repo TEXT NOT NULL,
+			base_branch TEXT NOT NULL DEFAULT 'main',
+			branch TEXT,
+			worktree_dir TEXT,
+			tmux_session TEXT,
+			prompt TEXT NOT NULL,
+			mode TEXT NOT NULL DEFAULT 'autonomous',
+			status TEXT NOT NULL,
+			conversation_id TEXT,
+			pr_url TEXT,
+			evidence_receipt TEXT,
+			summary TEXT,
+			report_md TEXT,
+			error_log TEXT,
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			duration_seconds REAL
+		);
+	""")
+	conn.execute("""
+		CREATE TABLE IF NOT EXISTS agent_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id TEXT,
+			from_agent TEXT NOT NULL,
+			to_agent TEXT NOT NULL,
+			body TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+	""")
+	conn.commit()
+	return conn
+
+
+def utc_now_iso() -> str:
+	"""Return current UTC timestamp in ISO-8601 format."""
+	return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def record_task_start(args, task_id: str, repo_name: str, branch_name: str, worktree_dir: str, tmux_session: str) -> None:
+	"""Insert or update initial running task record in SQLite."""
+	mode = "interactive" if args.interactive else "autonomous"
+	with get_db_conn() as conn:
+		conn.execute(
+			"""
+			INSERT INTO tasks (
+				task_id, run_id, worker_name, repo, base_branch, branch,
+				worktree_dir, tmux_session, prompt, mode, status, started_at
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+			ON CONFLICT(task_id) DO UPDATE SET
+				status = 'running',
+				started_at = excluded.started_at,
+				tmux_session = excluded.tmux_session,
+				worktree_dir = excluded.worktree_dir;
+			""",
+			(
+				task_id, args.run_id or None, args.worker_name or task_id,
+				repo_name, args.base_branch, branch_name, worktree_dir,
+				tmux_session, args.prompt, mode, utc_now_iso(),
+			),
+		)
+
+
+def record_task_finish(
+	task_id: str,
+	status: str,
+	branch: str = None,
+	pr_url: str = None,
+	receipt: str = None,
+	error: str = None,
+	duration: float = 0.0,
+) -> None:
+	"""Update task row upon completion or failure."""
+	with get_db_conn() as conn:
+		conn.execute(
+			"""
+			UPDATE tasks
+			SET status = ?,
+				branch = COALESCE(?, branch),
+				pr_url = COALESCE(?, pr_url),
+				evidence_receipt = COALESCE(?, evidence_receipt),
+				error_log = COALESCE(?, error_log),
+				completed_at = ?,
+				duration_seconds = ?
+			WHERE task_id = ?;
+			""",
+			(status, branch, pr_url, receipt, error, utc_now_iso(), round(duration, 2), task_id),
+		)
+
+
+def resolve_repo_path(repo_arg: str) -> str:
+	"""Resolve repository name under ~/repos or explicit directory path."""
+	if os.path.isabs(repo_arg) and os.path.isdir(repo_arg):
+		return repo_arg
+	candidate = os.path.join(REPOS_BASE, repo_arg)
+	if os.path.isdir(candidate):
+		return candidate
+	raise ValueError(f"Repository not found: {repo_arg} (checked {candidate})")
+
+
+def build_worker_prompt(args, task_id: str) -> str:
+	"""Append coordination protocol instructions to the user prompt."""
+	worker_id = args.worker_name or task_id
+	run_note = f" (run_id: `{args.run_id}`)" if args.run_id else ""
+	return (
+		f"{args.prompt}\n\n"
+		f"---\n"
+		f"Worker Metadata: task_id=`{task_id}`, worker_name=`{worker_id}`{run_note}.\n"
+		f"If you have `fibonacci-dispatch` MCP tools available:\n"
+		f"- Call `read_messages(agent_name='{worker_id}')` if you expect peer/coordinator updates.\n"
+		f"- Call `submit_report(task_id='{task_id}', summary='...', report_md='...')` as soon as your work is complete.\n"
+		f"- Leave the session open afterward unless instructed to exit, so the user can inspect or ask follow-ups."
+	)
+
+
+def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_file: str, interactive: bool, log_file: str) -> str:
+	"""Start agy -i inside a detached tmux session with zero keybinding friction."""
+	exit_file = f"/tmp/agy-exit-{task_id}"
+	if os.path.exists(exit_file):
+		os.remove(exit_file)
+
+	perm_flag = "" if interactive else "--dangerously-skip-permissions "
+	inner_cmd = (
+		f"cd {shlex.quote(worktree_dir)} && "
+		f"{shlex.quote(AGY_BIN)} -i \"$(cat {shlex.quote(prompt_file)})\" "
+		f"{perm_flag}--effort high; "
+		f"echo $? > {shlex.quote(exit_file)}"
+	)
+
+	tmux_cmd = [
+		TMUX_BIN, "new-session", "-d",
+		"-s", tmux_session,
+		"-c", worktree_dir,
+		"bash", "-c", inner_cmd,
+	]
+
+	# Run via systemd-run --user --scope so the tmux session survives daemon restarts
+	systemd_cmd = ["systemd-run", "--user", "--scope", f"--unit=agy-{task_id}", "--quiet"] + tmux_cmd
+	res = subprocess.run(systemd_cmd, capture_output=True, text=True)
+	if res.returncode != 0:
+		subprocess.run(tmux_cmd, check=True)
+
+	# Hide tmux chrome and disable prefix key so users never need tmux shortcuts
+	for opt, val in [("status", "off"), ("prefix", "None"), ("prefix2", "None"), ("mouse", "on")]:
+		subprocess.run([TMUX_BIN, "set-option", "-t", tmux_session, opt, val], capture_output=True)
+
+	# Stream pane output to log file for offline inspection
+	subprocess.run(
+		[TMUX_BIN, "pipe-pane", "-t", tmux_session, "-o", f"cat >> {shlex.quote(log_file)}"],
+		capture_output=True,
+	)
+	return exit_file
+
+
+def wait_for_tmux_exit(tmux_session: str, exit_file: str, timeout: int) -> int:
+	"""Wait until tmux session ends or timeout expires; return exit code."""
+	deadline = time.time() + timeout if timeout > 0 else None
+	while True:
+		if os.path.exists(exit_file):
+			try:
+				with open(exit_file, "r", encoding="utf-8") as f:
+					raw = f.read().strip()
+				return int(raw) if raw else 0
+			except Exception:
+				return 0
+
+		chk = subprocess.run([TMUX_BIN, "has-session", "-t", tmux_session], capture_output=True)
+		if chk.returncode != 0:
+			return 0
+
+		if deadline and time.time() > deadline:
+			subprocess.run([TMUX_BIN, "kill-session", "-t", tmux_session], capture_output=True)
+			raise subprocess.TimeoutExpired(cmd="agy", timeout=timeout)
+
+		time.sleep(2)
+
+
+def detect_gate(worktree_dir: str, explicit_gate: str) -> str:
+	"""Return explicit gate command or auto-detect Makefile test/validate target."""
+	if explicit_gate:
+		return explicit_gate
+	makefile = os.path.join(worktree_dir, "Makefile")
+	if os.path.exists(makefile):
+		with open(makefile, "r", encoding="utf-8") as mf:
+			content = mf.read()
+			if "\ntest:" in content:
+				return "make test"
+			if "\nvalidate:" in content:
+				return "make validate"
+	return ""
+
+
+def cleanup_worktree(repo_path: str, worktree_dir: str, branch_name: str, delete_branch: bool) -> None:
+	"""Remove ephemeral worktree and optionally delete unused local branch."""
+	subprocess.run(["git", "worktree", "remove", "--force", worktree_dir], cwd=repo_path, capture_output=True)
+	subprocess.run(["git", "worktree", "prune"], cwd=repo_path, capture_output=True)
+	if delete_branch:
+		subprocess.run(["git", "branch", "-D", branch_name], cwd=repo_path, capture_output=True)
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(
+		description="Task runner for Antigravity (AGY) inside persistent tmux sessions on Fibonacci",
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+	)
+	parser.add_argument("repo", help="Name of repo in ~/repos/ or absolute path")
+	parser.add_argument("prompt", help="Task instruction prompt for AGY")
+	parser.add_argument("--base-branch", default="main", help="Git base branch to branch from")
+	parser.add_argument("--gate", default="", help="Evidence gate command to run before committing (e.g. 'make test')")
+	parser.add_argument("--no-push", action="store_true", help="Do not push git branch to remote")
+	parser.add_argument("--no-pr", action="store_true", help="Do not create a pull request")
+	parser.add_argument("--pr-draft", action="store_true", help="Create pull request as draft")
+	parser.add_argument("--interactive", action="store_true", help="Keep tool permission prompts enabled instead of auto-approving")
+	parser.add_argument("--timeout", type=int, default=3600, help="Maximum runtime in seconds (0 for unlimited)")
+	parser.add_argument("--task-id", default="", help="Custom task ID (default: auto-generated)")
+	parser.add_argument("--run-id", default="", help="Coordinator run ID grouping related workers")
+	parser.add_argument("--worker-name", default="", help="Logical worker name for peer messaging")
+
+	args = parser.parse_args()
+
+	repo_path = resolve_repo_path(args.repo)
+	repo_name = os.path.basename(repo_path)
+	timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+	task_id = args.task_id if args.task_id else f"task-{timestamp}"
+	branch_name = f"agent/{task_id}"
+	worktree_dir = os.path.join(WORKTREES_BASE, task_id)
+	tmux_session = f"agy-{task_id}"
+
+	os.makedirs(LOGS_BASE, exist_ok=True)
+	os.makedirs(WORKTREES_BASE, exist_ok=True)
+	log_file = os.path.join(LOGS_BASE, f"{task_id}.log")
+	prompt_file = f"/tmp/agy-prompt-{task_id}.txt"
+
+	start_time = time.time()
+	record_task_start(args, task_id, repo_name, branch_name, worktree_dir, tmux_session)
+
+	print(f"[+] Task ID:      {task_id}")
+	print(f"[+] Repository:   {repo_name} ({repo_path})")
+	print(f"[+] Worktree:     {worktree_dir}")
+	print(f"[+] tmux Session: {tmux_session}")
+	print(f"[+] Log File:     {log_file}")
+
+	delete_branch = False
+	with open(log_file, "w", encoding="utf-8") as log_fh:
+		log_fh.write(f"=== Task {task_id} Started at {utc_now_iso()} ===\n")
+		log_fh.write(f"Repo: {repo_name}\nPrompt: {args.prompt}\n\n")
+		log_fh.flush()
+
+		try:
+			subprocess.run(["git", "fetch", "origin", args.base_branch], cwd=repo_path, stdout=log_fh, stderr=log_fh, check=True)
+			subprocess.run(["git", "worktree", "add", "-b", branch_name, worktree_dir, f"origin/{args.base_branch}"], cwd=repo_path, stdout=log_fh, stderr=log_fh, check=True)
+
+			with open(prompt_file, "w", encoding="utf-8") as pf:
+				pf.write(build_worker_prompt(args, task_id))
+
+			log_fh.write(f"[*] Launching agy in tmux session {tmux_session}...\n")
+			log_fh.flush()
+
+			exit_file = launch_tmux_agy(task_id, tmux_session, worktree_dir, prompt_file, args.interactive, log_file)
+			exit_code = wait_for_tmux_exit(tmux_session, exit_file, args.timeout)
+			log_fh.write(f"\n[*] agy exited with code {exit_code}\n")
+
+			status_proc = subprocess.run(["git", "status", "--porcelain"], cwd=worktree_dir, capture_output=True, text=True)
+			changes = status_proc.stdout.strip()
+
+			if not changes:
+				duration = time.time() - start_time
+				delete_branch = True
+				log_fh.write("[*] No uncommitted changes in worktree. Recording no_changes.\n")
+				record_task_finish(task_id, "no_changes", branch=branch_name, duration=duration)
+				return
+
+			receipt = "No automated test gate detected. Clean agent execution."
+			gate_cmd = detect_gate(worktree_dir, args.gate)
+			if gate_cmd:
+				log_fh.write(f"[*] Running Evidence Gate: {gate_cmd}...\n")
+				log_fh.flush()
+				gate_proc = subprocess.run(gate_cmd, shell=True, cwd=worktree_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+				log_fh.write(gate_proc.stdout)
+				log_fh.write(gate_proc.stderr)
+				if gate_proc.returncode != 0:
+					duration = time.time() - start_time
+					err_msg = f"Evidence gate failed ({gate_cmd}) with exit code {gate_proc.returncode}"
+					log_fh.write(f"[!] {err_msg}\n")
+					record_task_finish(task_id, "failed", branch=branch_name, error=err_msg, duration=duration)
+					return
+				receipt = f"Evidence Gate Passed: `{gate_cmd}` exited 0."
+
+			short_title = re.sub(r"[^\w\s-]", "", args.prompt)[:60].strip() or task_id
+			subprocess.run(["git", "add", "-A"], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
+			subprocess.run(["git", "commit", "-m", f"feat(agent): {short_title}"], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
+
+			if not args.no_push:
+				subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
+
+			pr_url = ""
+			if not args.no_push and not args.no_pr:
+				body_file_path = f"/tmp/pr-body-{task_id}.md"
+				with open(body_file_path, "w", encoding="utf-8") as bf:
+					bf.write(f"## Autonomous Agent Task: {short_title}\n\n")
+					bf.write(f"**Task ID**: `{task_id}`\n")
+					bf.write(f"**Evidence Receipt**: {receipt}\n\n")
+					bf.write("### Original Prompt\n")
+					bf.write(f"> {args.prompt}\n\n")
+					bf.write("### Changed Files\n```\n")
+					bf.write(changes)
+					bf.write("\n```\n")
+
+				pr_cmd = [
+					GH_BIN, "pr", "create",
+					"--title", f"Agent: {short_title}",
+					"--body-file", body_file_path,
+					"--head", branch_name,
+					"--base", args.base_branch,
+				]
+				if args.pr_draft:
+					pr_cmd.append("--draft")
+
+				pr_proc = subprocess.run(pr_cmd, cwd=worktree_dir, capture_output=True, text=True)
+				if os.path.exists(body_file_path):
+					os.remove(body_file_path)
+
+				if pr_proc.returncode == 0:
+					pr_url = pr_proc.stdout.strip()
+					log_fh.write(f"[*] Pull Request created: {pr_url}\n")
+				else:
+					log_fh.write(f"[!] Failed to create PR: {pr_proc.stderr}\n")
+
+			duration = time.time() - start_time
+			record_task_finish(task_id, "passed", branch=branch_name, pr_url=pr_url or None, receipt=receipt, duration=duration)
+
+		except subprocess.TimeoutExpired:
+			duration = time.time() - start_time
+			delete_branch = True
+			err = f"Task timed out after {args.timeout}s"
+			log_fh.write(f"[!] {err}\n")
+			record_task_finish(task_id, "timeout", branch=branch_name, error=err, duration=duration)
+		except Exception as e:
+			duration = time.time() - start_time
+			delete_branch = True
+			err = f"Execution exception: {str(e)}"
+			log_fh.write(f"[!] {err}\n")
+			record_task_finish(task_id, "error", branch=branch_name, error=err, duration=duration)
+		finally:
+			if os.path.exists(prompt_file):
+				os.remove(prompt_file)
+			log_fh.write("[*] Cleaning up ephemeral worktree...\n")
+			cleanup_worktree(repo_path, worktree_dir, branch_name, delete_branch=delete_branch)
+
+
+if __name__ == "__main__":
+	main()

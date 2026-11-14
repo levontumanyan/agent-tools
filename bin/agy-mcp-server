@@ -1,0 +1,541 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "mcp>=2.0.0",
+#     "starlette>=0.40.0",
+#     "uvicorn>=0.30.0",
+# ]
+# ///
+"""
+agy-mcp-server: Streamable HTTP MCP + REST control plane for remote AGY workers on Fibonacci.
+Manages SQLite (WAL) task/message state, tmux worker injection, and live transcript inspection.
+"""
+
+import argparse
+import asyncio
+import datetime
+import json
+import os
+import shlex
+import sqlite3
+import subprocess
+import tempfile
+from typing import Any
+
+import uvicorn
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+REPOS_BASE = os.path.expanduser("~/repos")
+LOGS_BASE = os.path.expanduser("~/logs/agy-tasks")
+DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/agy-dispatch/state.db")
+AGY_SUMMARIES_DB = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+RUNNER_BIN = os.environ.get("AGY_TASK_RUNNER", os.path.expanduser("~/bin/agy-task-runner"))
+TMUX_BIN = os.environ.get("TMUX_BIN", "/home/linuxbrew/.linuxbrew/bin/tmux")
+
+# In-memory wakeup events keyed by target name ("coordinator", worker_name, task_id, "*")
+_WAITERS: dict[str, list[asyncio.Event]] = {}
+
+
+def get_db_path() -> str:
+	"""Return SQLite database path and ensure parent directory exists."""
+	db_path = os.environ.get("AGY_DISPATCH_DB", DEFAULT_DB_PATH)
+	os.makedirs(os.path.dirname(db_path), exist_ok=True)
+	return db_path
+
+
+def get_db_conn() -> sqlite3.Connection:
+	"""Open WAL-mode SQLite connection and initialize tables if needed."""
+	conn = sqlite3.connect(get_db_path(), timeout=15.0)
+	conn.row_factory = sqlite3.Row
+	conn.execute("PRAGMA journal_mode=WAL;")
+	conn.execute("PRAGMA busy_timeout=10000;")
+	conn.execute("""
+		CREATE TABLE IF NOT EXISTS tasks (
+			task_id TEXT PRIMARY KEY,
+			run_id TEXT,
+			worker_name TEXT,
+			repo TEXT NOT NULL,
+			base_branch TEXT NOT NULL DEFAULT 'main',
+			branch TEXT,
+			worktree_dir TEXT,
+			tmux_session TEXT,
+			prompt TEXT NOT NULL,
+			mode TEXT NOT NULL DEFAULT 'autonomous',
+			status TEXT NOT NULL,
+			conversation_id TEXT,
+			pr_url TEXT,
+			evidence_receipt TEXT,
+			summary TEXT,
+			report_md TEXT,
+			error_log TEXT,
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			duration_seconds REAL
+		);
+	""")
+	conn.execute("""
+		CREATE TABLE IF NOT EXISTS agent_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id TEXT,
+			from_agent TEXT NOT NULL,
+			to_agent TEXT NOT NULL,
+			body TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+	""")
+	conn.commit()
+	return conn
+
+
+def utc_now_iso() -> str:
+	"""Return current UTC ISO-8601 timestamp."""
+	return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def notify_waiters(*keys: str) -> None:
+	"""Wake any async long-pollers waiting on the specified target keys."""
+	for key in (*keys, "*"):
+		if not key:
+			continue
+		for ev in _WAITERS.get(key, []):
+			ev.set()
+
+
+def tmux_has_session(session_name: str) -> bool:
+	"""Check whether a tmux session is currently alive."""
+	if not session_name:
+		return False
+	res = subprocess.run([TMUX_BIN, "has-session", "-t", session_name], capture_output=True)
+	return res.returncode == 0
+
+
+def tmux_capture_tail(session_name: str, lines: int = 25) -> str:
+	"""Capture recent lines from a tmux pane without modifying state."""
+	if not tmux_has_session(session_name):
+		return ""
+	res = subprocess.run(
+		[TMUX_BIN, "capture-pane", "-p", "-t", session_name, "-S", f"-{lines}"],
+		capture_output=True,
+		text=True,
+	)
+	return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def tmux_inject_text(session_name: str, text: str) -> bool:
+	"""Paste text cleanly into a tmux pane using load-buffer + paste-buffer + Enter."""
+	if not tmux_has_session(session_name):
+		return False
+	with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+		tf.write(text)
+		buf_path = tf.name
+	try:
+		subprocess.run([TMUX_BIN, "load-buffer", buf_path], check=True, capture_output=True)
+		subprocess.run([TMUX_BIN, "paste-buffer", "-t", session_name], check=True, capture_output=True)
+		subprocess.run([TMUX_BIN, "send-keys", "-t", session_name, "Enter"], check=True, capture_output=True)
+		return True
+	except subprocess.CalledProcessError:
+		return False
+	finally:
+		if os.path.exists(buf_path):
+			os.remove(buf_path)
+
+
+def read_live_transcript_info(worktree_dir: str) -> dict[str, Any]:
+	"""Look up matching AGY conversation metadata and last transcript step for a worktree."""
+	if not worktree_dir or not os.path.exists(AGY_SUMMARIES_DB):
+		return {}
+	try:
+		conn = sqlite3.connect(f"file:{AGY_SUMMARIES_DB}?mode=ro", uri=True, timeout=5.0)
+		conn.row_factory = sqlite3.Row
+		row = conn.execute(
+			"""
+			SELECT conversation_id, step_count, status, not_fully_idle, last_modified_time
+			FROM conversation_summaries
+			WHERE workspace_uris LIKE ?
+			ORDER BY last_modified_time DESC
+			LIMIT 1;
+			""",
+			(f"%{worktree_dir}%",),
+		).fetchone()
+		conn.close()
+		if not row:
+			return {}
+		info = dict(row)
+		cid = info["conversation_id"]
+		transcript_path = os.path.expanduser(
+			f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"
+		)
+		if os.path.exists(transcript_path):
+			with open(transcript_path, "r", encoding="utf-8") as tf:
+				lines = tf.readlines()
+			if lines:
+				last_step = json.loads(lines[-1])
+				info["last_step_type"] = last_step.get("type")
+				info["last_step_status"] = last_step.get("status")
+				tools = [t.get("name") for t in (last_step.get("tool_calls") or []) if t.get("name")]
+				if tools:
+					info["last_tools"] = tools
+		return info
+	except Exception:
+		return {}
+
+
+def resolve_tmux_for_target(target: str) -> str | None:
+	"""Resolve a task_id or worker_name to an active tmux session name."""
+	with get_db_conn() as conn:
+		row = conn.execute(
+			"""
+			SELECT tmux_session FROM tasks
+			WHERE (task_id = ? OR worker_name = ?) AND tmux_session IS NOT NULL
+			ORDER BY started_at DESC
+			LIMIT 1;
+			""",
+			(target, target),
+		).fetchone()
+	if row and tmux_has_session(row["tmux_session"]):
+		return row["tmux_session"]
+	return None
+
+
+def _dispatch_task_impl(
+	repo: str,
+	prompt: str,
+	base_branch: str = "main",
+	gate: str = "",
+	interactive: bool = False,
+	no_push: bool = False,
+	no_pr: bool = False,
+	pr_draft: bool = False,
+	timeout: int = 3600,
+	run_id: str = "",
+	worker_name: str = "",
+) -> dict[str, Any]:
+	"""Spawn agy-task-runner detached on fibonacci and return task metadata."""
+	os.makedirs(LOGS_BASE, exist_ok=True)
+	ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+	task_id = f"task-{ts}"
+	out_log = os.path.join(LOGS_BASE, f"{task_id}.out")
+
+	cmd = [
+		RUNNER_BIN,
+		repo,
+		prompt,
+		"--base-branch", base_branch,
+		"--timeout", str(timeout),
+		"--task-id", task_id,
+	]
+	if gate:
+		cmd.extend(["--gate", gate])
+	if interactive:
+		cmd.append("--interactive")
+	if no_push:
+		cmd.append("--no-push")
+	if no_pr:
+		cmd.append("--no-pr")
+	if pr_draft:
+		cmd.append("--pr-draft")
+	if run_id:
+		cmd.extend(["--run-id", run_id])
+	if worker_name:
+		cmd.extend(["--worker-name", worker_name])
+
+	with open(out_log, "w", encoding="utf-8") as out_fh, open(os.devnull, "r") as devnull:
+		subprocess.Popen(
+			cmd,
+			stdin=devnull,
+			stdout=out_fh,
+			stderr=subprocess.STDOUT,
+			start_new_session=True,
+		)
+
+	tmux_session = f"agy-{task_id}"
+	notify_waiters("coordinator", task_id, worker_name)
+	return {
+		"task_id": task_id,
+		"worker_name": worker_name or task_id,
+		"repo": repo,
+		"mode": "interactive" if interactive else "autonomous",
+		"tmux_session": tmux_session,
+		"attach_cmd": f"ssh -t fibonacci tmux attach -t {tmux_session}",
+		"status": "starting",
+	}
+
+
+def _get_task_status_impl(task_id: str) -> dict[str, Any]:
+	"""Return combined SQLite state, tmux pane status/tail, and transcript progress."""
+	with get_db_conn() as conn:
+		row = conn.execute("SELECT * FROM tasks WHERE task_id = ?;", (task_id,)).fetchone()
+	if not row:
+		return {"error": f"Task not found: {task_id}"}
+	data = dict(row)
+	session = data.get("tmux_session") or f"agy-{task_id}"
+	alive = tmux_has_session(session)
+	data["tmux_alive"] = alive
+	if alive:
+		data["pane_tail"] = tmux_capture_tail(session, lines=25)
+	if data.get("worktree_dir"):
+		data["transcript"] = read_live_transcript_info(data["worktree_dir"])
+	data["attach_cmd"] = f"ssh -t fibonacci tmux attach -t {session}"
+	return data
+
+
+def _send_message_impl(from_agent: str, to_agent: str, message: str, run_id: str = "") -> dict[str, Any]:
+	"""Persist message in SQLite, wake waiters, and inject into live tmux worker if applicable."""
+	now = utc_now_iso()
+	with get_db_conn() as conn:
+		cur = conn.execute(
+			"INSERT INTO agent_messages (run_id, from_agent, to_agent, body, created_at) VALUES (?, ?, ?, ?, ?);",
+			(run_id or None, from_agent, to_agent, message, now),
+		)
+		msg_id = cur.lastrowid
+
+	injected = False
+	if to_agent not in ("coordinator", "broadcast"):
+		session = resolve_tmux_for_target(to_agent)
+		if session:
+			injected = tmux_inject_text(session, f"[MSG from {from_agent}]: {message}")
+
+	notify_waiters(to_agent)
+	return {"id": msg_id, "to_agent": to_agent, "injected_to_tmux": injected, "created_at": now}
+
+
+def _read_messages_impl(agent_name: str, since_id: int = 0, limit: int = 50) -> list[dict[str, Any]]:
+	"""Query unread/recent messages for an agent (or '*' for all)."""
+	with get_db_conn() as conn:
+		if agent_name == "*":
+			rows = conn.execute(
+				"SELECT * FROM agent_messages WHERE id > ? ORDER BY id ASC LIMIT ?;",
+				(since_id, limit),
+			).fetchall()
+		else:
+			rows = conn.execute(
+				"""
+				SELECT * FROM agent_messages
+				WHERE id > ? AND (to_agent = ? OR to_agent = 'broadcast')
+				ORDER BY id ASC LIMIT ?;
+				""",
+				(since_id, agent_name, limit),
+			).fetchall()
+	return [dict(r) for r in rows]
+
+
+def _stop_task_impl(task_id: str, graceful: bool = True) -> dict[str, Any]:
+	"""Stop a running worker either by sending /exit or killing its tmux session."""
+	session = resolve_tmux_for_target(task_id) or f"agy-{task_id}"
+	if not tmux_has_session(session):
+		return {"task_id": task_id, "stopped": False, "reason": "tmux session not active"}
+	if graceful:
+		ok = tmux_inject_text(session, "/exit")
+		return {"task_id": task_id, "stopped": ok, "method": "graceful_exit"}
+	subprocess.run([TMUX_BIN, "kill-session", "-t", session], capture_output=True)
+	return {"task_id": task_id, "stopped": True, "method": "kill_session"}
+
+
+mcp = MCPServer(
+	name="fibonacci-dispatch",
+	instructions=(
+		"Coordinator & worker control plane for AGY tasks on fibonacci. "
+		"Use dispatch_task to spawn workers, get_task_status for live progress, "
+		"send_message/read_messages for coordinator<->worker and worker<->worker messaging, "
+		"and wait_for_update for low-latency event wakeups."
+	),
+)
+
+
+@mcp.tool()
+def list_repos() -> list[str]:
+	"""List available git repositories under ~/repos on fibonacci."""
+	if not os.path.isdir(REPOS_BASE):
+		return []
+	return sorted(d for d in os.listdir(REPOS_BASE) if os.path.isdir(os.path.join(REPOS_BASE, d)))
+
+
+@mcp.tool()
+def dispatch_task(
+	repo: str,
+	prompt: str,
+	base_branch: str = "main",
+	gate: str = "",
+	interactive: bool = False,
+	no_push: bool = False,
+	no_pr: bool = False,
+	pr_draft: bool = False,
+	timeout: int = 3600,
+	run_id: str = "",
+	worker_name: str = "",
+) -> dict[str, Any]:
+	"""Dispatch an AGY task into an isolated worktree + persistent tmux session on fibonacci."""
+	return _dispatch_task_impl(
+		repo=repo,
+		prompt=prompt,
+		base_branch=base_branch,
+		gate=gate,
+		interactive=interactive,
+		no_push=no_push,
+		no_pr=no_pr,
+		pr_draft=pr_draft,
+		timeout=timeout,
+		run_id=run_id,
+		worker_name=worker_name,
+	)
+
+
+@mcp.tool()
+def get_task_status(task_id: str) -> dict[str, Any]:
+	"""Get live task status, tmux pane tail, transcript step progress, and report if submitted."""
+	return _get_task_status_impl(task_id)
+
+
+@mcp.tool()
+def list_tasks(limit: int = 10, run_id: str = "") -> list[dict[str, Any]]:
+	"""List recent tasks from the SQLite ledger on fibonacci."""
+	with get_db_conn() as conn:
+		if run_id:
+			rows = conn.execute(
+				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks WHERE run_id = ? ORDER BY started_at DESC LIMIT ?;",
+				(run_id, limit),
+			).fetchall()
+		else:
+			rows = conn.execute(
+				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks ORDER BY started_at DESC LIMIT ?;",
+				(limit,),
+			).fetchall()
+	return [dict(r) for r in rows]
+
+
+@mcp.tool()
+def send_message(from_agent: str, to_agent: str, message: str, run_id: str = "") -> dict[str, Any]:
+	"""Send a message to 'coordinator', 'broadcast', or a worker (injects directly into its tmux pane)."""
+	return _send_message_impl(from_agent=from_agent, to_agent=to_agent, message=message, run_id=run_id)
+
+
+@mcp.tool()
+def read_messages(agent_name: str, since_id: int = 0, limit: int = 50) -> list[dict[str, Any]]:
+	"""Read messages addressed to agent_name or 'broadcast' (use '*' for all)."""
+	return _read_messages_impl(agent_name=agent_name, since_id=since_id, limit=limit)
+
+
+@mcp.tool()
+async def wait_for_update(target: str = "coordinator", since_id: int = 0, timeout_seconds: int = 30) -> dict[str, Any]:
+	"""Wait until a new message arrives for target (or timeout expires), returning new messages immediately."""
+	existing = _read_messages_impl(target, since_id=since_id)
+	if existing:
+		return {"messages": existing, "timed_out": False}
+
+	ev = asyncio.Event()
+	_WAITERS.setdefault(target, []).append(ev)
+	try:
+		await asyncio.wait_for(ev.wait(), timeout=max(1, min(timeout_seconds, 120)))
+		return {"messages": _read_messages_impl(target, since_id=since_id), "timed_out": False}
+	except asyncio.TimeoutError:
+		return {"messages": [], "timed_out": True}
+	finally:
+		if ev in _WAITERS.get(target, []):
+			_WAITERS[target].remove(ev)
+
+
+@mcp.tool()
+def submit_report(task_id: str, summary: str, report_md: str, conversation_id: str = "") -> dict[str, Any]:
+	"""Submit a worker's final summary & markdown report and wake the coordinator."""
+	with get_db_conn() as conn:
+		conn.execute(
+			"""
+			UPDATE tasks
+			SET summary = ?, report_md = ?, conversation_id = COALESCE(NULLIF(?, ''), conversation_id)
+			WHERE task_id = ?;
+			""",
+			(summary, report_md, conversation_id, task_id),
+		)
+	_send_message_impl(from_agent=task_id, to_agent="coordinator", message=f"Report submitted: {summary}")
+	notify_waiters("coordinator", task_id)
+	return {"task_id": task_id, "submitted": True}
+
+
+@mcp.tool()
+def stop_task(task_id: str, graceful: bool = True) -> dict[str, Any]:
+	"""Stop a running task (sends /exit so git gate & PR run, or kills tmux session if graceful=False)."""
+	return _stop_task_impl(task_id=task_id, graceful=graceful)
+
+
+# --- REST API endpoints for agy-remote CLI ---
+
+async def api_health(request: Request) -> JSONResponse:
+	return JSONResponse({"status": "ok", "service": "agy-mcp-server"})
+
+
+async def api_repos(request: Request) -> JSONResponse:
+	return JSONResponse({"repos": list_repos()})
+
+
+async def api_tasks(request: Request) -> JSONResponse:
+	if request.method == "POST":
+		body = await request.json()
+		res = _dispatch_task_impl(**body)
+		return JSONResponse(res)
+	limit = int(request.query_params.get("limit", "10"))
+	run_id = request.query_params.get("run_id", "")
+	return JSONResponse({"tasks": list_tasks(limit=limit, run_id=run_id)})
+
+
+async def api_task_detail(request: Request) -> JSONResponse:
+	task_id = request.path_params["task_id"]
+	return JSONResponse(_get_task_status_impl(task_id))
+
+
+async def api_task_stop(request: Request) -> JSONResponse:
+	task_id = request.path_params["task_id"]
+	body = await request.json() if await request.body() else {}
+	return JSONResponse(_stop_task_impl(task_id, graceful=body.get("graceful", True)))
+
+
+async def api_messages(request: Request) -> JSONResponse:
+	if request.method == "POST":
+		body = await request.json()
+		return JSONResponse(_send_message_impl(**body))
+	agent = request.query_params.get("agent", "*")
+	since_id = int(request.query_params.get("since_id", "0"))
+	return JSONResponse({"messages": _read_messages_impl(agent, since_id=since_id)})
+
+
+def build_app():
+	"""Create Starlette app hosting Streamable HTTP MCP at /mcp plus REST endpoints."""
+	app = mcp.streamable_http_app(
+		streamable_http_path="/mcp",
+		stateless_http=True,
+		transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+	)
+	app.router.routes.extend([
+		Route("/health", api_health, methods=["GET"]),
+		Route("/api/repos", api_repos, methods=["GET"]),
+		Route("/api/tasks", api_tasks, methods=["GET", "POST"]),
+		Route("/api/tasks/{task_id}", api_task_detail, methods=["GET"]),
+		Route("/api/tasks/{task_id}/stop", api_task_stop, methods=["POST"]),
+		Route("/api/messages", api_messages, methods=["GET", "POST"]),
+	])
+	return app
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(
+		description="Run the AGY Streamable HTTP MCP & REST control plane server",
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+	)
+	parser.add_argument("--host", default="127.0.0.1", help="Bind address")
+	parser.add_argument("--port", type=int, default=8765, help="Bind port")
+	parser.add_argument("--db-path", default="", help="Override SQLite DB path")
+	args = parser.parse_args()
+
+	if args.db_path:
+		os.environ["AGY_DISPATCH_DB"] = args.db_path
+
+	get_db_conn().close()
+	uvicorn.run(build_app(), host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+	main()

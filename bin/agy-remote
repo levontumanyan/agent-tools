@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-agy-remote: Dispatch, monitor, and inspect autonomous AGY tasks running on a remote worker host.
+agy-remote: Fast CLI client for dispatching, attaching to, and messaging AGY workers on Fibonacci.
+Talks to agy-mcp-server over Tailscale HTTPS/HTTP and attaches cmux/terminal tabs via tmux over SSH.
 """
 
 import argparse
-import datetime
+import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
-def load_env_files():
-	"""Loads environment variables from gitignored .env in repo root and ~/.local/bin/.env."""
+DEFAULT_REMOTE_URL = "https://fibonacci.tail8b9be7.ts.net:8765"
+DEFAULT_SSH_HOST = "fibonacci"
+
+
+def load_env_files() -> None:
+	"""Load environment variables from repo .env and ~/.local/bin/.env."""
 	repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-	candidates = [
-		os.path.join(repo_root, ".env"),
-		os.path.expanduser("~/.local/bin/.env"),
-	]
-	for env_path in candidates:
+	for env_path in (os.path.join(repo_root, ".env"), os.path.expanduser("~/.local/bin/.env")):
 		if os.path.isfile(env_path):
 			try:
 				with open(env_path, "r", encoding="utf-8") as f:
@@ -32,155 +35,247 @@ def load_env_files():
 			except Exception:
 				pass
 
+
 load_env_files()
 
-def get_host(args) -> str:
-	host = getattr(args, "host", None) or os.environ.get("AGY_REMOTE_HOST")
-	if not host:
-		sys.stderr.write("Error: Remote worker host is not configured.\n")
-		sys.stderr.write("Please set AGY_REMOTE_HOST in ~/.local/bin/.env or pass --host <hostname>.\n")
-		sys.exit(1)
-	return host
 
-def run_ssh(host: str, cmd: str, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-	ssh_cmd = ["ssh", host, cmd]
-	return subprocess.run(ssh_cmd, text=True, capture_output=capture, check=check)
+def get_base_url(args) -> str:
+	"""Resolve agy-mcp-server base URL."""
+	return (getattr(args, "url", None) or os.environ.get("AGY_REMOTE_URL") or DEFAULT_REMOTE_URL).rstrip("/")
 
-def cmd_dispatch(args):
-	host = get_host(args)
-	repo = args.repo
-	prompt = args.prompt
-	timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-	task_id = f"task-{timestamp}"
 
-	extra_flags = []
-	if args.base_branch:
-		extra_flags.append(f"--base-branch '{args.base_branch}'")
-	if args.gate:
-		extra_flags.append(f"--gate '{args.gate}'")
-	if args.no_push:
-		extra_flags.append("--no-push")
-	if args.no_pr:
-		extra_flags.append("--no-pr")
-	if args.pr_draft:
-		extra_flags.append("--pr-draft")
-	if args.timeout:
-		extra_flags.append(f"--timeout {args.timeout}")
-	extra_flags.append(f"--task-id '{task_id}'")
+def get_ssh_host(args) -> str:
+	"""Resolve SSH host for tmux attach and log tailing."""
+	return getattr(args, "host", None) or os.environ.get("AGY_REMOTE_HOST") or DEFAULT_SSH_HOST
 
-	flags_str = " ".join(extra_flags)
-	escaped_prompt = prompt.replace("'", "'\\''")
-	remote_cmd = f"nohup ~/bin/agy-task-runner '{repo}' '{escaped_prompt}' {flags_str} > ~/logs/agy-tasks/{task_id}.out 2>&1 &"
 
+def api_request(base_url: str, path: str, payload: dict | None = None) -> dict:
+	"""Perform HTTP GET or POST JSON request against agy-mcp-server."""
+	url = f"{base_url}{path}"
+	data = json.dumps(payload).encode("utf-8") if payload is not None else None
+	headers = {"Content-Type": "application/json"} if payload is not None else {}
+	req = urllib.request.Request(url, data=data, headers=headers, method="POST" if payload is not None else "GET")
 	try:
-		run_ssh(host, remote_cmd, check=True)
-		print(f"🚀 Dispatched task to remote worker ({host})!")
-		print(f"   Task ID:  {task_id}")
-		print(f"   Target:   {repo}")
-		print(f"   Prompt:   {prompt}")
-		print()
-		print(f"🔍 To tail live logs:")
-		print(f"   agy-remote tail {task_id}")
-		print(f"📊 To check status:")
-		print(f"   agy-remote status")
-	except subprocess.CalledProcessError as e:
-		sys.stderr.write(f"Failed to dispatch: {e.stderr}\n")
+		with urllib.request.urlopen(req, timeout=15) as resp:
+			return json.loads(resp.read().decode("utf-8"))
+	except urllib.error.HTTPError as e:
+		sys.stderr.write(f"HTTP {e.code} from {url}: {e.read().decode('utf-8', errors='replace')}\n")
+		sys.exit(1)
+	except urllib.error.URLError as e:
+		sys.stderr.write(f"Failed to reach {url}: {e.reason}\n")
 		sys.exit(1)
 
-def cmd_status(args):
-	host = get_host(args)
-	limit = args.limit
-	sql = f"""
-	SELECT task_id, repo, status, COALESCE(duration_seconds::text, '-') as duration, 
-	       to_char(started_at, 'YYYY-MM-DD HH24:MI:SS') as started, 
-	       COALESCE(pr_url, '-') as pr
-	FROM autonomous_tasks
-	ORDER BY started_at DESC
-	LIMIT {limit};
-	"""
-	remote_cmd = f"podman exec -i antigravity_db psql -U antigravity -d antigravity -c \"{sql}\""
-	try:
-		res = run_ssh(host, remote_cmd, check=True, capture=True)
-		print(res.stdout)
-	except subprocess.CalledProcessError as e:
-		sys.stderr.write(f"Failed to query database: {e.stderr}\n")
-		sys.exit(1)
 
-def cmd_tail(args):
-	host = get_host(args)
-	task_id = args.task_id
-	log_path = f"~/logs/agy-tasks/{task_id}.log"
-	ssh_cmd = ["ssh", "-t", host, f"tail -n 30 -f {log_path}"]
+def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str) -> None:
+	"""Open a non-focus-stealing cmux terminal tab attached to the remote tmux worker."""
+	session = f"agy-{task_id}"
+	cmd_str = f"ssh -t {ssh_host} tmux attach -t {session}"
+	short_id = task_id.replace("task-", "")[-6:]
+	tab_title = f"WORK | {short_id} | {label[:24]}"
+
+	res = subprocess.run(
+		["cmux", "new-surface", "--type", "terminal", "--focus", "false", "--command", cmd_str],
+		capture_output=True,
+		text=True,
+	)
+	if res.returncode != 0:
+		sys.stderr.write(f"Warning: cmux new-surface failed: {res.stderr.strip()}\n")
+		return
+
+	# Extract surface:NNN from output like "OK surface:240 pane:48 workspace:26"
+	surface_ref = ""
+	for token in res.stdout.split():
+		if token.startswith("surface:"):
+			surface_ref = token
+			break
+	if surface_ref:
+		subprocess.run(["cmux", "rename-tab", "--surface", surface_ref, tab_title], capture_output=True)
+		print(f"🪟 Opened cmux tab ({surface_ref}): {tab_title}")
+
+
+def cmd_dispatch(args) -> None:
+	"""Dispatch a new AGY task to fibonacci."""
+	base_url = get_base_url(args)
+	ssh_host = get_ssh_host(args)
+	payload = {
+		"repo": args.repo,
+		"prompt": args.prompt,
+		"base_branch": args.base_branch,
+		"gate": args.gate,
+		"interactive": args.interactive,
+		"no_push": args.no_push,
+		"no_pr": args.no_pr,
+		"pr_draft": args.pr_draft,
+		"timeout": args.timeout,
+		"run_id": args.run_id,
+		"worker_name": args.worker_name,
+	}
+	res = api_request(base_url, "/api/tasks", payload)
+	task_id = res["task_id"]
+	print(f"🚀 Dispatched {task_id} ({res['mode']}) on {ssh_host}")
+	print(f"   Target:  {args.repo}")
+	print(f"   Attach:  agy-remote attach {task_id}")
+	print(f"   Inspect: agy-remote inspect {task_id}")
+
+	if args.cmux:
+		open_cmux_attach_tab(ssh_host, task_id, args.worker_name or args.repo)
+
+
+def cmd_attach(args) -> None:
+	"""Attach interactively to a running worker's tmux session."""
+	ssh_host = get_ssh_host(args)
+	if args.cmux:
+		open_cmux_attach_tab(ssh_host, args.task_id, args.task_id)
+		return
+	session = f"agy-{args.task_id}"
+	os.execvp("ssh", ["ssh", "-t", ssh_host, "tmux", "attach", "-t", session])
+
+
+def cmd_status(args) -> None:
+	"""Show recent tasks from agy-mcp-server."""
+	base_url = get_base_url(args)
+	qs = f"?limit={args.limit}" + (f"&run_id={args.run_id}" if args.run_id else "")
+	res = api_request(base_url, f"/api/tasks{qs}")
+	tasks = res.get("tasks", [])
+	if not tasks:
+		print("No tasks found.")
+		return
+	print(f"{'TASK ID':<22} {'REPO':<15} {'MODE':<11} {'STATUS':<11} {'DURATION':<9} {'PR'}")
+	print("-" * 92)
+	for t in tasks:
+		dur = f"{t['duration_seconds']}s" if t.get("duration_seconds") is not None else "-"
+		pr = t.get("pr_url") or "-"
+		print(f"{t['task_id']:<22} {t['repo']:<15} {t.get('mode', '-'):<11} {t['status']:<11} {dur:<9} {pr}")
+
+
+def cmd_inspect(args) -> None:
+	"""Print detailed live status, transcript info, and pane tail for a task."""
+	base_url = get_base_url(args)
+	data = api_request(base_url, f"/api/tasks/{args.task_id}")
+	print(json.dumps(data, indent=2))
+
+
+def cmd_msg(args) -> None:
+	"""Send a message to a worker, coordinator, or broadcast."""
+	base_url = get_base_url(args)
+	res = api_request(base_url, "/api/messages", {
+		"from_agent": args.sender,
+		"to_agent": args.to,
+		"message": args.message,
+		"run_id": args.run_id,
+	})
+	print(json.dumps(res, indent=2))
+
+
+def cmd_stop(args) -> None:
+	"""Stop a running task gracefully (/exit) or force-kill its tmux session."""
+	base_url = get_base_url(args)
+	res = api_request(base_url, f"/api/tasks/{args.task_id}/stop", {"graceful": not args.kill})
+	print(json.dumps(res, indent=2))
+
+
+def cmd_tail(args) -> None:
+	"""Tail live raw log file on remote worker."""
+	ssh_host = get_ssh_host(args)
+	log_path = f"~/logs/agy-tasks/{args.task_id}.log"
 	try:
-		subprocess.run(ssh_cmd)
+		subprocess.run(["ssh", "-t", ssh_host, f"tail -n 40 -f {log_path}"])
 	except KeyboardInterrupt:
 		pass
 
-def cmd_logs(args):
-	host = get_host(args)
-	task_id = args.task_id
-	log_path = f"~/logs/agy-tasks/{task_id}.log"
-	out_path = f"~/logs/agy-tasks/{task_id}.out"
-	res = run_ssh(host, f"cat {log_path} 2>/dev/null || cat {out_path} 2>/dev/null || echo 'No log found'")
+
+def cmd_logs(args) -> None:
+	"""Print complete log of a task."""
+	ssh_host = get_ssh_host(args)
+	log_path = f"~/logs/agy-tasks/{args.task_id}.log"
+	out_path = f"~/logs/agy-tasks/{args.task_id}.out"
+	res = subprocess.run(
+		["ssh", ssh_host, f"cat {log_path} 2>/dev/null || cat {out_path} 2>/dev/null || echo 'No log found'"],
+		text=True,
+		capture_output=True,
+	)
 	print(res.stdout)
 
-def cmd_repos(args):
-	host = get_host(args)
-	res = run_ssh(host, "ls -1 ~/repos", check=True)
-	print(f"Available Repositories on {host}:")
-	for line in res.stdout.strip().split("\n"):
-		if line.strip():
-			print(f"  • {line.strip()}")
 
-def main():
+def cmd_repos(args) -> None:
+	"""List available repositories on fibonacci."""
+	base_url = get_base_url(args)
+	res = api_request(base_url, "/api/repos")
+	print("Available Repositories on fibonacci:")
+	for repo in res.get("repos", []):
+		print(f"  • {repo}")
+
+
+def main() -> None:
 	parser = argparse.ArgumentParser(
-		description="Dispatch, monitor, and inspect autonomous AGY tasks running on a remote worker host",
-		formatter_class=argparse.ArgumentDefaultsHelpFormatter
+		description="Dispatch, attach to, and message AGY tasks on Fibonacci",
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 	)
-	parser.add_argument("--host", default="", help="Remote worker SSH host (defaults to $AGY_REMOTE_HOST from ~/.local/bin/.env)")
+	parser.add_argument("--url", default="", help="agy-mcp-server base URL (defaults to $AGY_REMOTE_URL)")
+	parser.add_argument("--host", default="", help="Remote worker SSH host (defaults to $AGY_REMOTE_HOST or fibonacci)")
 	subparsers = parser.add_subparsers(dest="command", help="Subcommand to run")
 
-	# Dispatch
 	p_dispatch = subparsers.add_parser("dispatch", help="Dispatch a task to remote worker")
-	p_dispatch.add_argument("repo", help="Target repo name (e.g. repo directory in ~/repos/)")
+	p_dispatch.add_argument("repo", help="Target repo name in ~/repos/")
 	p_dispatch.add_argument("prompt", help="Prompt / instructions for AGY")
-	p_dispatch.add_argument("--base-branch", default="main", help="Base git branch to branch from")
-	p_dispatch.add_argument("--gate", default="", help="Validation / Evidence Gate command (e.g. 'make test')")
-	p_dispatch.add_argument("--no-push", action="store_true", help="Do not push git branch to remote")
-	p_dispatch.add_argument("--no-pr", action="store_true", help="Do not create a pull request")
-	p_dispatch.add_argument("--pr-draft", action="store_true", help="Create pull request as draft")
-	p_dispatch.add_argument("--timeout", type=int, default=900, help="Max execution timeout in seconds")
+	p_dispatch.add_argument("--base-branch", default="main", help="Base git branch")
+	p_dispatch.add_argument("--gate", default="", help="Validation gate command (e.g. 'make test')")
+	p_dispatch.add_argument("--interactive", action="store_true", help="Require manual tool approvals in TUI")
+	p_dispatch.add_argument("--cmux", action="store_true", help="Open a cmux viewport tab attached to the worker")
+	p_dispatch.add_argument("--no-push", action="store_true", help="Do not push git branch")
+	p_dispatch.add_argument("--no-pr", action="store_true", help="Do not create a PR")
+	p_dispatch.add_argument("--pr-draft", action="store_true", help="Create PR as draft")
+	p_dispatch.add_argument("--timeout", type=int, default=3600, help="Max timeout in seconds (0 = unlimited)")
+	p_dispatch.add_argument("--run-id", default="", help="Coordinator run ID")
+	p_dispatch.add_argument("--worker-name", default="", help="Logical worker name")
 
-	# Status
-	p_status = subparsers.add_parser("status", help="Show recent task status from remote task ledger")
+	p_attach = subparsers.add_parser("attach", help="Attach to a live worker's tmux TUI")
+	p_attach.add_argument("task_id", help="Task ID")
+	p_attach.add_argument("--cmux", action="store_true", help="Open in a new cmux tab instead of current terminal")
+
+	p_status = subparsers.add_parser("status", help="Show recent tasks")
 	p_status.add_argument("--limit", type=int, default=10, help="Number of tasks to show")
+	p_status.add_argument("--run-id", default="", help="Filter by run ID")
 
-	# Tail / Logs
-	p_tail = subparsers.add_parser("tail", help="Follow live logs of a running task")
-	p_tail.add_argument("task_id", help="Task ID (e.g. task-YYYYMMDD-HHMMSS)")
+	p_inspect = subparsers.add_parser("inspect", help="Inspect live task status, pane tail, and transcript")
+	p_inspect.add_argument("task_id", help="Task ID")
 
-	p_logs = subparsers.add_parser("logs", help="Print complete log of a task")
+	p_msg = subparsers.add_parser("msg", help="Send a message to a worker or coordinator")
+	p_msg.add_argument("to", help="Target (task_id, worker_name, coordinator, or broadcast)")
+	p_msg.add_argument("message", help="Message content")
+	p_msg.add_argument("--from", dest="sender", default="coordinator", help="Sender identity")
+	p_msg.add_argument("--run-id", default="", help="Coordinator run ID")
+
+	p_stop = subparsers.add_parser("stop", help="Stop a running task")
+	p_stop.add_argument("task_id", help="Task ID")
+	p_stop.add_argument("--kill", action="store_true", help="Force-kill tmux session instead of sending /exit")
+
+	p_tail = subparsers.add_parser("tail", help="Tail live log file")
+	p_tail.add_argument("task_id", help="Task ID")
+
+	p_logs = subparsers.add_parser("logs", help="Print complete log")
 	p_logs.add_argument("task_id", help="Task ID")
 
-	# Repos
 	subparsers.add_parser("repos", help="List available repos on remote worker")
 
 	args = parser.parse_args()
-
 	if not args.command:
 		parser.print_help()
 		sys.exit(0)
 
-	if args.command == "dispatch":
-		cmd_dispatch(args)
-	elif args.command == "status":
-		cmd_status(args)
-	elif args.command == "tail":
-		cmd_tail(args)
-	elif args.command == "logs":
-		cmd_logs(args)
-	elif args.command == "repos":
-		cmd_repos(args)
+	handlers = {
+		"dispatch": cmd_dispatch,
+		"attach": cmd_attach,
+		"status": cmd_status,
+		"inspect": cmd_inspect,
+		"msg": cmd_msg,
+		"stop": cmd_stop,
+		"tail": cmd_tail,
+		"logs": cmd_logs,
+		"repos": cmd_repos,
+	}
+	handlers[args.command](args)
+
 
 if __name__ == "__main__":
 	main()
