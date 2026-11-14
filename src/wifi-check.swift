@@ -143,7 +143,6 @@ func printUsage() {
 	  -d, --deep           Deep hardware mode (reads airtime congestion, MIMO streams, MCS via sudo wdutil)
 	  -s, --scan           Scan and display nearby Wi-Fi networks and signal strengths
 	  -j, --json           Output raw JSON for automation, logging, or Grafana dashboards
-	  -l, --location <tag> Tag location or Airbnb name (defaults to upstream SSID)
 	      --ship           Ship test results to InfluxDB / Grafana dashboard
 	  -c, --count <N>      Number of ping probe packets (default: 5)
 	  -h, --help           Show this help message
@@ -657,7 +656,7 @@ func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
 	)
 }
 
-func shipTelemetryToInflux(report: DiagnosticReport, locationLabel: String?, pingGw: PingResult?, pingEdge: PingResult?) {
+func shipTelemetryToInflux(report: DiagnosticReport, pingGw: PingResult?, pingEdge: PingResult?) {
 	let env = ProcessInfo.processInfo.environment
 	guard let urlString = env["WIFI_CHECK_INFLUX_URL"] ?? readConfigEnv("WIFI_CHECK_INFLUX_URL"),
 	      let token = env["WIFI_CHECK_INFLUX_TOKEN"] ?? readConfigEnv("WIFI_CHECK_INFLUX_TOKEN") else {
@@ -697,7 +696,7 @@ func shipTelemetryToInflux(report: DiagnosticReport, locationLabel: String?, pin
 			tags.append("upstream_ssid=\(escapeTag(ssid))")
 		}
 	}
-	let locationTag = locationLabel ?? report.router?.upstreamSsid ?? report.wifi?.ssid ?? "Unknown"
+	let locationTag = report.router?.upstreamSsid ?? report.wifi?.ssid ?? "Unknown"
 	tags.append("location=\(escapeTag(locationTag))")
 
 	if let vpn = report.vpn {
@@ -963,7 +962,6 @@ var isDeep = false
 var isScan = false
 var isJson = false
 var isShip = false
-var customLocation: String? = nil
 var pingCount = 5
 
 let args = CommandLine.arguments
@@ -979,11 +977,6 @@ while i < args.count {
 		isScan = true
 	case "-j", "--json":
 		isJson = true
-	case "-l", "--location":
-		if i + 1 < args.count {
-			customLocation = args[i + 1]
-			i += 1
-		}
 	case "--ship":
 		isShip = true
 	case "-c", "--count":
@@ -1328,7 +1321,7 @@ print("  • Work Verdict:     \(rating)\n")
 // 6. InfluxDB Historical Telemetry Shipping
 let shouldShip = isShip || (readConfigEnv("WIFI_CHECK_AUTO_SHIP") == "true")
 if shouldShip {
-	shipTelemetryToInflux(report: report, locationLabel: customLocation, pingGw: pingGw, pingEdge: pingCloudflare)
+	shipTelemetryToInflux(report: report, pingGw: pingGw, pingEdge: pingCloudflare)
 	if !isJson {
 		print("\(Colors.dim)⚡ Telemetry shipped to Fibonacci dashboard.\(Colors.reset)\n")
 	}
