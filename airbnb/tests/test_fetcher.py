@@ -111,3 +111,58 @@ def test_get_listing_calendar(mocker):
 	assert months[0]["days"][1]["available"] is True
 	mock_session.get.assert_called_once()
 
+
+def test_get_listing_calendar_node_response_and_400_retry(mocker):
+	"""Verify get_listing_calendar parses node response and retries on 400 with refreshed hash."""
+	mock_session = mocker.MagicMock()
+	resp_400 = mocker.MagicMock()
+	resp_400.status_code = 400
+	resp_200 = mocker.MagicMock()
+	resp_200.status_code = 200
+	resp_200.json.return_value = {
+		"data": {
+			"node": {
+				"pdpAvailabilityCalendar": {
+					"calendarMonths": [
+						{
+							"month": 12,
+							"year": 2026,
+							"days": [{"calendarDate": "2026-12-01", "available": True}],
+						}
+					]
+				}
+			}
+		}
+	}
+	mock_session.get.side_effect = [resp_400, resp_200]
+	mocker.patch("src.fetcher._get_session", return_value=mock_session)
+	mocker.patch("src.fetcher._robust_pyairbnb_api_get", return_value="dummy_key")
+	mocker.patch(
+		"src.fetcher._get_operation_hash",
+		return_value="old_hash_" + "0" * 55,
+	)
+	mock_refresh = mocker.patch(
+		"src.fetcher._refresh_operation_hash",
+		return_value="new_hash_" + "1" * 55,
+	)
+
+	from src.fetcher import get_listing_calendar
+
+	months = get_listing_calendar("12345", month=1, year=2020, count=1)
+	assert len(months) == 1
+	assert months[0]["month"] == 12
+	mock_refresh.assert_called_once_with("StaysPdpAtomicAvailabilityCalendarV2Query")
+	assert mock_session.get.call_count == 2
+
+
+def test_extract_operation_hash():
+	"""Verify _extract_operation_hash extracts 64-char sha256 operationId."""
+	from src.fetcher import _extract_operation_hash
+
+	sample_js = (
+		"e.default={name:'StaysSearch',type:'query',operationId:'"
+		+ ("a" * 64)
+		+ "',metadata:{}}"
+	)
+	assert _extract_operation_hash(sample_js, "StaysSearch") == "a" * 64
+	assert _extract_operation_hash(sample_js, "OtherOp") is None
