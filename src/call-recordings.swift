@@ -1188,8 +1188,75 @@ func clipCall(target: String, startTimeStr: String?, endTimeStr: String?, durati
 
 // MARK: - Sync & Backup
 
+func emitInfluxHeartbeat(status: Int, totalCalls: Int, transcribedCount: Int, backedUpCount: Int, audioSizeMB: Double, durationSec: Double) -> Bool {
+	let envPath = ("~/.config/call-recordings/influx.env" as NSString).expandingTildeInPath
+	guard let contents = try? String(contentsOfFile: envPath, encoding: .utf8) else {
+		return false
+	}
+
+	var config: [String: String] = [:]
+	for rawLine in contents.components(separatedBy: .newlines) {
+		let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+		if line.isEmpty || line.hasPrefix("#") { continue }
+		if let eqIdx = line.firstIndex(of: "=") {
+			let key = String(line[..<eqIdx]).trimmingCharacters(in: .whitespaces)
+			let val = String(line[line.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces)
+			config[key] = val
+		}
+	}
+
+	guard let baseURL = config["INFLUX_URL"],
+		  let org = config["INFLUX_ORG"],
+		  let bucket = config["INFLUX_BUCKET"],
+		  let token = config["INFLUX_TOKEN"],
+		  var comps = URLComponents(string: baseURL) else {
+		return false
+	}
+
+	comps.queryItems = [
+		URLQueryItem(name: "org", value: org),
+		URLQueryItem(name: "bucket", value: bucket),
+		URLQueryItem(name: "precision", value: "s")
+	]
+	guard let url = comps.url else { return false }
+
+	let payload = String(
+		format: "client_sync,host=macbook,task=call-recordings status=%di,duration_sec=%.2f,total_calls=%di,transcribed_count=%di,backed_up_count=%di,audio_size_mb=%.2f",
+		status, durationSec, totalCalls, transcribedCount, backedUpCount, audioSizeMB
+	)
+
+	var request = URLRequest(url: url, timeoutInterval: 10.0)
+	request.httpMethod = "POST"
+	request.setValue("Token \(token)", forHTTPHeaderField: "Authorization")
+	request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+	request.httpBody = payload.data(using: .utf8)
+
+	// Retry up to 3 times to handle brief Tailscale/Wi-Fi reconnects on wake
+	for attempt in 1...3 {
+		let sem = DispatchSemaphore(value: 0)
+		var ok = false
+		let task = URLSession.shared.dataTask(with: request) { _, response, _ in
+			if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+				ok = true
+			}
+			sem.signal()
+		}
+		task.resume()
+		_ = sem.wait(timeout: .now() + 12.0)
+		if ok { return true }
+		if attempt < 3 {
+			Thread.sleep(forTimeInterval: 5.0)
+		}
+	}
+	return false
+}
+
 func syncCalls(backupDir: String?, force: Bool) {
-	print("=== Call Recordings Sync & Backup ===")
+	let startClock = Date()
+	let logDF = DateFormatter()
+	logDF.dateFormat = "yyyy-MM-dd HH:mm:ss"
+
+	print("[\(logDF.string(from: startClock))] === Call Recordings Sync & Backup ===")
 	ensureLocalDatabase()
 	let records = fetchCallRecords()
 	print("Total recordings in Apple Notes: \(records.count)")
@@ -1227,6 +1294,9 @@ func syncCalls(backupDir: String?, force: Bool) {
 	} else {
 		print("Notice: Google Drive mount not detected and no --backup-dir specified.")
 		print("Transcriptions completed and saved to local SQLite database.")
+		let elapsed = Date().timeIntervalSince(startClock)
+		_ = emitInfluxHeartbeat(status: 0, totalCalls: records.count, transcribedCount: transcribedCount, backedUpCount: 0, audioSizeMB: 0.0, durationSec: elapsed)
+		print("[\(logDF.string(from: Date()))] Sync finished with warnings (\(String(format: "%.2f", elapsed))s).")
 		return
 	}
 
@@ -1234,11 +1304,16 @@ func syncCalls(backupDir: String?, force: Bool) {
 	try? FileManager.default.createDirectory(atPath: audioDir, withIntermediateDirectories: true, attributes: nil)
 
 	var backedUpCount = 0
+	var totalAudioBytes: Int64 = 0
 	let df = DateFormatter()
 	df.dateFormat = "yyyy-MM-dd_HHmm"
 
 	for r in records {
 		guard let src = r.localAudioPath, FileManager.default.fileExists(atPath: src) else { continue }
+		if let attrs = try? FileManager.default.attributesOfItem(atPath: src),
+		   let sz = attrs[.size] as? Int64 {
+			totalAudioBytes += sz
+		}
 		let dateStr = df.string(from: r.createdAt)
 		let safeTitle = r.title.replacingOccurrences(of: " ", with: "_").components(separatedBy: CharacterSet.alphanumerics.inverted.subtracting(CharacterSet(charactersIn: "_-"))).joined()
 		let destFilename = "\(dateStr)_\(safeTitle)_\(r.noteId).m4a"
@@ -1261,12 +1336,25 @@ func syncCalls(backupDir: String?, force: Bool) {
 		sqlite3_close(localDB)
 	}
 
+	let audioSizeMB = Double(totalAudioBytes) / (1024.0 * 1024.0)
+	let elapsed = Date().timeIntervalSince(startClock)
+	let overallStatus = (records.count > 0 && snapshotSuccess) ? 1 : 0
+	let telemetrySent = emitInfluxHeartbeat(
+		status: overallStatus,
+		totalCalls: records.count,
+		transcribedCount: transcribedCount,
+		backedUpCount: backedUpCount,
+		audioSizeMB: audioSizeMB,
+		durationSec: elapsed
+	)
+
 	print("")
 	print("Summary:")
 	print("  - Transcribed:       \(transcribedCount) new call(s)")
 	print("  - Audio backed up:   \(backedUpCount) new audio file(s) -> \(audioDir)")
 	print("  - Database snapshot: \(snapshotSuccess ? "Updated -> \(destDBPath)" : "Failed")")
-	print("Sync complete.")
+	print("  - Telemetry:         \(telemetrySent ? "Sent to Fibonacci InfluxDB" : "Skipped or unreachable")")
+	print("[\(logDF.string(from: Date()))] Sync complete (\(String(format: "%.2f", elapsed))s).")
 }
 
 func exportCall(target: String, outDestination: String?) {
