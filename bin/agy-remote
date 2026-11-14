@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+agy-remote: Dispatch, monitor, and inspect autonomous AGY tasks running on a remote worker host.
+"""
+
+import argparse
+import datetime
+import os
+import subprocess
+import sys
+
+def load_env_files():
+	"""Loads environment variables from gitignored .env in repo root and ~/.local/bin/.env."""
+	repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+	candidates = [
+		os.path.join(repo_root, ".env"),
+		os.path.expanduser("~/.local/bin/.env"),
+	]
+	for env_path in candidates:
+		if os.path.isfile(env_path):
+			try:
+				with open(env_path, "r", encoding="utf-8") as f:
+					for line in f:
+						line = line.strip()
+						if line and not line.startswith("#") and "=" in line:
+							k, v = line.split("=", 1)
+							k = k.strip()
+							v = v.strip().strip("\"'")
+							if k not in os.environ:
+								os.environ[k] = v
+			except Exception:
+				pass
+
+load_env_files()
+
+def get_host(args) -> str:
+	host = getattr(args, "host", None) or os.environ.get("AGY_REMOTE_HOST")
+	if not host:
+		sys.stderr.write("Error: Remote worker host is not configured.\n")
+		sys.stderr.write("Please set AGY_REMOTE_HOST in ~/.local/bin/.env or pass --host <hostname>.\n")
+		sys.exit(1)
+	return host
+
+def run_ssh(host: str, cmd: str, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+	ssh_cmd = ["ssh", host, cmd]
+	return subprocess.run(ssh_cmd, text=True, capture_output=capture, check=check)
+
+def cmd_dispatch(args):
+	host = get_host(args)
+	repo = args.repo
+	prompt = args.prompt
+	timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+	task_id = f"task-{timestamp}"
+
+	extra_flags = []
+	if args.base_branch:
+		extra_flags.append(f"--base-branch '{args.base_branch}'")
+	if args.gate:
+		extra_flags.append(f"--gate '{args.gate}'")
+	if args.no_push:
+		extra_flags.append("--no-push")
+	if args.no_pr:
+		extra_flags.append("--no-pr")
+	if args.pr_draft:
+		extra_flags.append("--pr-draft")
+	if args.timeout:
+		extra_flags.append(f"--timeout {args.timeout}")
+	extra_flags.append(f"--task-id '{task_id}'")
+
+	flags_str = " ".join(extra_flags)
+	escaped_prompt = prompt.replace("'", "'\\''")
+	remote_cmd = f"nohup ~/bin/agy-task-runner '{repo}' '{escaped_prompt}' {flags_str} > ~/logs/agy-tasks/{task_id}.out 2>&1 &"
+
+	try:
+		run_ssh(host, remote_cmd, check=True)
+		print(f"🚀 Dispatched task to remote worker ({host})!")
+		print(f"   Task ID:  {task_id}")
+		print(f"   Target:   {repo}")
+		print(f"   Prompt:   {prompt}")
+		print()
+		print(f"🔍 To tail live logs:")
+		print(f"   agy-remote tail {task_id}")
+		print(f"📊 To check status:")
+		print(f"   agy-remote status")
+	except subprocess.CalledProcessError as e:
+		sys.stderr.write(f"Failed to dispatch: {e.stderr}\n")
+		sys.exit(1)
+
+def cmd_status(args):
+	host = get_host(args)
+	limit = args.limit
+	sql = f"""
+	SELECT task_id, repo, status, COALESCE(duration_seconds::text, '-') as duration, 
+	       to_char(started_at, 'YYYY-MM-DD HH24:MI:SS') as started, 
+	       COALESCE(pr_url, '-') as pr
+	FROM autonomous_tasks
+	ORDER BY started_at DESC
+	LIMIT {limit};
+	"""
+	remote_cmd = f"podman exec -i antigravity_db psql -U antigravity -d antigravity -c \"{sql}\""
+	try:
+		res = run_ssh(host, remote_cmd, check=True, capture=True)
+		print(res.stdout)
+	except subprocess.CalledProcessError as e:
+		sys.stderr.write(f"Failed to query database: {e.stderr}\n")
+		sys.exit(1)
+
+def cmd_tail(args):
+	host = get_host(args)
+	task_id = args.task_id
+	log_path = f"~/logs/agy-tasks/{task_id}.log"
+	ssh_cmd = ["ssh", "-t", host, f"tail -n 30 -f {log_path}"]
+	try:
+		subprocess.run(ssh_cmd)
+	except KeyboardInterrupt:
+		pass
+
+def cmd_logs(args):
+	host = get_host(args)
+	task_id = args.task_id
+	log_path = f"~/logs/agy-tasks/{task_id}.log"
+	out_path = f"~/logs/agy-tasks/{task_id}.out"
+	res = run_ssh(host, f"cat {log_path} 2>/dev/null || cat {out_path} 2>/dev/null || echo 'No log found'")
+	print(res.stdout)
+
+def cmd_repos(args):
+	host = get_host(args)
+	res = run_ssh(host, "ls -1 ~/repos", check=True)
+	print(f"Available Repositories on {host}:")
+	for line in res.stdout.strip().split("\n"):
+		if line.strip():
+			print(f"  • {line.strip()}")
+
+def main():
+	parser = argparse.ArgumentParser(
+		description="Dispatch, monitor, and inspect autonomous AGY tasks running on a remote worker host",
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter
+	)
+	parser.add_argument("--host", default="", help="Remote worker SSH host (defaults to $AGY_REMOTE_HOST from ~/.local/bin/.env)")
+	subparsers = parser.add_subparsers(dest="command", help="Subcommand to run")
+
+	# Dispatch
+	p_dispatch = subparsers.add_parser("dispatch", help="Dispatch a task to remote worker")
+	p_dispatch.add_argument("repo", help="Target repo name (e.g. repo directory in ~/repos/)")
+	p_dispatch.add_argument("prompt", help="Prompt / instructions for AGY")
+	p_dispatch.add_argument("--base-branch", default="main", help="Base git branch to branch from")
+	p_dispatch.add_argument("--gate", default="", help="Validation / Evidence Gate command (e.g. 'make test')")
+	p_dispatch.add_argument("--no-push", action="store_true", help="Do not push git branch to remote")
+	p_dispatch.add_argument("--no-pr", action="store_true", help="Do not create a pull request")
+	p_dispatch.add_argument("--pr-draft", action="store_true", help="Create pull request as draft")
+	p_dispatch.add_argument("--timeout", type=int, default=900, help="Max execution timeout in seconds")
+
+	# Status
+	p_status = subparsers.add_parser("status", help="Show recent task status from remote task ledger")
+	p_status.add_argument("--limit", type=int, default=10, help="Number of tasks to show")
+
+	# Tail / Logs
+	p_tail = subparsers.add_parser("tail", help="Follow live logs of a running task")
+	p_tail.add_argument("task_id", help="Task ID (e.g. task-YYYYMMDD-HHMMSS)")
+
+	p_logs = subparsers.add_parser("logs", help="Print complete log of a task")
+	p_logs.add_argument("task_id", help="Task ID")
+
+	# Repos
+	subparsers.add_parser("repos", help="List available repos on remote worker")
+
+	args = parser.parse_args()
+
+	if not args.command:
+		parser.print_help()
+		sys.exit(0)
+
+	if args.command == "dispatch":
+		cmd_dispatch(args)
+	elif args.command == "status":
+		cmd_status(args)
+	elif args.command == "tail":
+		cmd_tail(args)
+	elif args.command == "logs":
+		cmd_logs(args)
+	elif args.command == "repos":
+		cmd_repos(args)
+
+if __name__ == "__main__":
+	main()
