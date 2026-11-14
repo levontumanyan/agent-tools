@@ -26,11 +26,15 @@ from adblock import Engine, FilterSet
 from mcp.server.fastmcp import FastMCP
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 
-mcp = FastMCP("stealth-browser")
+mcp = FastMCP(
+	"stealth-browser",
+	instructions="Stay headless by default. Only call set_headless(headless=False) for interactive login/2FA/CAPTCHA or when asked.",
+)
 
 CDP_PORT = int(os.environ.get("STEALTH_BROWSER_CDP_PORT", os.environ.get("CDP_PORT", "9222")))
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 PROFILE_DIR = os.path.expanduser(os.environ.get("STEALTH_BROWSER_PROFILE_DIR", "~/.agent-chromium-profile"))
+DOWNLOADS_DIR = os.path.expanduser(os.environ.get("STEALTH_BROWSER_DOWNLOADS_DIR", "~/Downloads"))
 IDLE_TIMEOUT_SECONDS = int(os.environ.get("STEALTH_BROWSER_IDLE_TIMEOUT", "300"))
 HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
 CHROMIUM_APP_BIN = "/Applications/Chromium.app/Contents/MacOS/Chromium"
@@ -235,6 +239,39 @@ class BrowserSessionManager:
 			pass
 		self._playwright = None
 
+	def _detect_cdp_headless(self) -> Optional[bool]:
+		"""Detect whether the Chromium instance listening on CDP_PORT is running headless."""
+		try:
+			pid_res = subprocess.run(
+				["lsof", "-nP", f"-iTCP:{CDP_PORT}", "-sTCP:LISTEN", "-t"],
+				capture_output=True,
+				text=True,
+				timeout=1.5,
+			)
+			pids = [p.strip() for p in pid_res.stdout.splitlines() if p.strip()]
+			if pids:
+				ps_res = subprocess.run(
+					["ps", "-o", "args=", "-p", pids[0]],
+					capture_output=True,
+					text=True,
+					timeout=1.5,
+				)
+				args = ps_res.stdout.strip()
+				if args:
+					return "--headless" in args
+		except Exception:
+			pass
+		try:
+			with urllib.request.urlopen(f"{self.cdp_url}/json/version", timeout=0.5) as resp:
+				data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+			ua = data.get("User-Agent", "")
+			browser_str = data.get("Browser", "")
+			if ua or browser_str:
+				return "HeadlessChrome" in ua or "HeadlessChrome" in browser_str
+		except Exception:
+			pass
+		return None
+
 	async def get_context(self) -> BrowserContext:
 		self._touch_activity()
 		if self._playwright is None:
@@ -261,6 +298,9 @@ class BrowserSessionManager:
 				self.cdp_url,
 				timeout=1500,
 			)
+			detected_headless = self._detect_cdp_headless()
+			if detected_headless is not None:
+				self.headless = detected_headless
 			if self._browser.contexts:
 				self._context = self._browser.contexts[0]
 				await self._ensure_interceptor(self._context)
@@ -295,6 +335,7 @@ class BrowserSessionManager:
 				executable_path=BROWSER_EXECUTABLE,
 				headless=self.headless,
 				no_viewport=True,
+				downloads_path=DOWNLOADS_DIR,
 				args=browser_args,
 				ignore_default_args=["--no-sandbox"],
 			)
@@ -322,6 +363,7 @@ class BrowserSessionManager:
 					executable_path=BROWSER_EXECUTABLE,
 					headless=self.headless,
 					no_viewport=True,
+					downloads_path=DOWNLOADS_DIR,
 					args=browser_args,
 					ignore_default_args=["--no-sandbox"],
 				)
@@ -330,7 +372,39 @@ class BrowserSessionManager:
 		await self._ensure_interceptor(self._context)
 		return self._context
 
+	async def _configure_native_downloads(self, context: BrowserContext, page: Optional[Page] = None):
+		"""Override Playwright's allowAndName download interception with native Chromium downloads."""
+		if getattr(context, "_downloads_configured", False):
+			return
+		os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+		cdp = None
+		try:
+			if self._browser is not None:
+				cdp = await self._browser.new_browser_cdp_session()
+			else:
+				target_page = page or (context.pages[0] if context.pages else None)
+				if target_page is None or target_page.is_closed():
+					return
+				cdp = await context.new_cdp_session(target_page)
+			await cdp.send(
+				"Browser.setDownloadBehavior",
+				{
+					"behavior": "allow",
+					"downloadPath": DOWNLOADS_DIR,
+				},
+			)
+			setattr(context, "_downloads_configured", True)
+		except Exception:
+			pass
+		finally:
+			if cdp is not None:
+				try:
+					await cdp.detach()
+				except Exception:
+					pass
+
 	async def _ensure_interceptor(self, context: BrowserContext):
+		await self._configure_native_downloads(context)
 		if getattr(context, "_interceptor_attached", False):
 			return
 		setattr(context, "_interceptor_attached", True)
@@ -1410,21 +1484,36 @@ async def close_browser(force_kill: bool = True) -> str:
 async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = None) -> str:
 	"""Force terminate all browser instances, clean up lingering renderer processes, and start a fresh session.
 
+	Preserves and reopens non-blank tabs across the restart (unless `url` overrides tab [0]).
+
 	Args:
 		headless: Optional boolean to explicitly set headless mode (True) or headed mode with visible UI window (False). If omitted, retains current mode.
-		url: Optional URL to navigate to in tab [0] after restarting. If omitted, retains current page URL if active, otherwise opens about:blank.
+		url: Optional URL to navigate to in tab [0] after restarting. If omitted, retains existing open tabs if active, otherwise opens about:blank.
 	"""
 	try:
-		target_url = url
-		if target_url is None:
+		preserved_urls: list[str] = []
+		try:
+			pages = await session.get_pages()
+			for p in pages:
+				if not p.is_closed():
+					curr = p.url
+					if curr and curr != "about:blank" and not curr.startswith("chrome://"):
+						preserved_urls.append(curr)
+		except Exception:
+			pass
+
+		if not preserved_urls:
 			try:
 				active = session._active_page
 				if active is not None and not active.is_closed():
 					curr = active.url
 					if curr and curr != "about:blank" and not curr.startswith("chrome://"):
-						target_url = curr
+						preserved_urls.append(curr)
 			except Exception:
 				pass
+
+		target_url = url if url is not None else (preserved_urls[0] if preserved_urls else None)
+		extra_urls = preserved_urls if url is not None else preserved_urls[1:]
 
 		if headless is not None:
 			session.headless = bool(headless)
@@ -1438,23 +1527,58 @@ async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = 
 				await page.goto(target_url, wait_until="domcontentloaded")
 			except Exception:
 				pass
+		ctx = await session.get_context()
+		for extra_url in extra_urls:
+			if url is not None and extra_url == url:
+				continue
+			try:
+				new_page = await ctx.new_page()
+				await new_page.goto(extra_url, wait_until="domcontentloaded")
+			except Exception:
+				pass
 		title = await page.title()
 		mode_str = "Headless" if session.headless else "Headed"
-		return f"Browser restarted successfully in {mode_str} mode on tab [0]: '{title}' ({page.url})"
+		reopened = f" (reopened {len(preserved_urls)} tab(s))" if preserved_urls and url is None else ""
+		return f"Browser restarted successfully in {mode_str} mode on tab [0]: '{title}' ({page.url}){reopened}"
 	except Exception as exc:
 		return f"Error restarting browser: {exc}"
 
 
 @mcp.tool()
-async def set_headless(headless: bool = True) -> str:
-	"""Switch the browser between headless mode (background, no UI window) and headed mode (visible UI window on desktop).
+async def set_headless(headless: bool = True, force: bool = False) -> str:
+	"""Switch between headless (default) and headed mode. Restarts Chromium if mode changes; refuses if non-blank tabs are open unless force=True.
 
 	Args:
-		headless: True to run headless in the background without stealing focus; False to display a visible Chromium window on your screen for interactive login or visual inspection.
+		headless: True for background headless (default); False only for interactive login/2FA/CAPTCHA or when asked.
+		force: Set True to restart Chromium even when non-blank tabs are open.
 	"""
+	# Attach to any already-running CDP browser first so session.headless reflects its true mode
+	pages: list[Page] = []
+	try:
+		pages = await session.get_pages()
+	except Exception:
+		pages = []
+
 	if session.headless == headless and (session._context is not None or session._browser is not None):
 		mode_str = "Headless" if headless else "Headed"
 		return f"Browser is already running in {mode_str} mode."
+
+	active_tabs = [
+		(idx, p.url)
+		for idx, p in enumerate(pages)
+		if not p.is_closed() and p.url and p.url != "about:blank" and not p.url.startswith("chrome://")
+	]
+	if active_tabs and not force:
+		target_mode = "Headless" if headless else "Headed"
+		tab_list = "\n".join(f"\t[{idx}] {tab_url}" for idx, tab_url in active_tabs)
+		return (
+			f"Refusing to restart browser to switch to {target_mode} mode because {len(active_tabs)} "
+			f"tab(s) are currently open (switching modes restarts Chromium and may disrupt active logins/sessions):\n"
+			f"{tab_list}\n"
+			f"Keep using the current browser mode, ask the user before interrupting, or call "
+			f"set_headless(headless={headless}, force=True) to restart and reopen these URLs."
+		)
+
 	return await restart_browser(headless=headless)
 
 
