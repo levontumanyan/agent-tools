@@ -18,12 +18,15 @@ type ToolCall struct {
 }
 
 type Event struct {
-	StepIndex int        `json:"step_index"`
-	Type      string     `json:"type"`
-	Status    string     `json:"status"`
-	CreatedAt string     `json:"created_at"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls"`
+	StepIndex       int        `json:"step_index"`
+	Type            string     `json:"type"`
+	Status          string     `json:"status"`
+	CreatedAt       string     `json:"created_at"`
+	Content         string     `json:"content"`
+	ToolCalls       []ToolCall `json:"tool_calls"`
+	InputTokens     int64      `json:"input_tokens"`
+	CacheReadTokens int64      `json:"cache_read_tokens"`
+	OutputTokens    int64      `json:"output_tokens"`
 }
 
 type ToolCallRecord struct {
@@ -73,6 +76,9 @@ type SessionMetadata struct {
 	ApprovedCalls      int
 	RejectedCalls      int
 	FailedCalls        int
+	InputTokens        int64
+	CacheReadTokens    int64
+	OutputTokens       int64
 	Prompts            []PromptRecord
 	ToolCalls          []ToolCallRecord
 	LoopEvents         []LoopEvent
@@ -567,6 +573,9 @@ func (st *TranscriptState) processEvent(evt *Event, confirmations map[int]bool) 
 
 	case "PLANNER_RESPONSE":
 		sm.ModelTurns++
+		sm.InputTokens += evt.InputTokens
+		sm.CacheReadTokens += evt.CacheReadTokens
+		sm.OutputTokens += evt.OutputTokens
 		isPromptTurn := st.nextPlannerIsPromptTriggered
 		st.nextPlannerIsPromptTriggered = false
 

@@ -19,9 +19,10 @@ const upsertSessionSQL = `
 		session_id, short_id, workspace, first_prompt, start_time, end_time,
 		duration_seconds, total_steps, user_turns, model_turns,
 		total_tool_calls, autonomous_calls, chat_initiated_calls, approved_calls, rejected_calls, failed_calls,
+		input_tokens, cache_read_tokens, output_tokens,
 		updated_at
 	) VALUES (
-		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW()
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW()
 	)
 	ON CONFLICT (session_id) DO UPDATE SET
 		workspace = EXCLUDED.workspace,
@@ -37,6 +38,9 @@ const upsertSessionSQL = `
 		approved_calls = EXCLUDED.approved_calls,
 		rejected_calls = EXCLUDED.rejected_calls,
 		failed_calls = EXCLUDED.failed_calls,
+		input_tokens = EXCLUDED.input_tokens,
+		cache_read_tokens = EXCLUDED.cache_read_tokens,
+		output_tokens = EXCLUDED.output_tokens,
 		updated_at = NOW();
 `
 
@@ -96,6 +100,9 @@ func ConnectDB(ctx context.Context, connString string) (*DB, error) {
 		CREATE INDEX IF NOT EXISTS idx_user_prompts_session ON user_prompts(session_id, turn_number ASC);
 		CREATE INDEX IF NOT EXISTS idx_user_prompts_workspace ON user_prompts(workspace);
 		CREATE INDEX IF NOT EXISTS idx_user_prompts_timestamp ON user_prompts(timestamp DESC);
+		ALTER TABLE sessions ADD COLUMN IF NOT EXISTS input_tokens BIGINT NOT NULL DEFAULT 0;
+		ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cache_read_tokens BIGINT NOT NULL DEFAULT 0;
+		ALTER TABLE sessions ADD COLUMN IF NOT EXISTS output_tokens BIGINT NOT NULL DEFAULT 0;
 	`
 	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
 		pool.Close()
@@ -134,6 +141,7 @@ func (db *DB) syncSessionInitial(ctx context.Context, st *TranscriptState) error
 		s.SessionID, s.ShortID, s.Workspace, s.FirstPrompt, s.StartTime, s.EndTime,
 		s.DurationSeconds, s.TotalSteps, s.UserTurns, s.ModelTurns,
 		s.TotalToolCalls, s.AutonomousCalls, s.ChatInitiatedCalls, s.ApprovedCalls, s.RejectedCalls, s.FailedCalls,
+		s.InputTokens, s.CacheReadTokens, s.OutputTokens,
 	)
 
 	batch.Queue(`DELETE FROM tool_calls WHERE session_id = $1`, s.SessionID)
@@ -246,6 +254,7 @@ func (db *DB) syncSessionDelta(ctx context.Context, st *TranscriptState) error {
 		s.SessionID, s.ShortID, s.Workspace, s.FirstPrompt, s.StartTime, s.EndTime,
 		s.DurationSeconds, s.TotalSteps, s.UserTurns, s.ModelTurns,
 		s.TotalToolCalls, s.AutonomousCalls, s.ChatInitiatedCalls, s.ApprovedCalls, s.RejectedCalls, s.FailedCalls,
+		s.InputTokens, s.CacheReadTokens, s.OutputTokens,
 	)
 	execCount++
 
@@ -341,6 +350,7 @@ func (db *DB) UpsertSession(ctx context.Context, s *SessionMetadata) error {
 		s.SessionID, s.ShortID, s.Workspace, s.FirstPrompt, s.StartTime, s.EndTime,
 		s.DurationSeconds, s.TotalSteps, s.UserTurns, s.ModelTurns,
 		s.TotalToolCalls, s.AutonomousCalls, s.ChatInitiatedCalls, s.ApprovedCalls, s.RejectedCalls, s.FailedCalls,
+		s.InputTokens, s.CacheReadTokens, s.OutputTokens,
 	)
 	return err
 }
