@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "mcp>=2.0.0",
+#     "pydantic>=2.0.0",
 #     "starlette>=0.40.0",
 #     "uvicorn>=0.30.0",
 # ]
@@ -15,86 +16,86 @@ Manages SQLite (WAL) task/message state, tmux worker injection, and live transcr
 import argparse
 import asyncio
 import datetime
+import hmac
 import json
+import logging
 import os
-import shlex
 import sqlite3
 import subprocess
 import tempfile
+import uuid
 from typing import Any
 
 import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel, Field, ValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-REPOS_BASE = os.path.expanduser("~/repos")
-LOGS_BASE = os.path.expanduser("~/logs/agy-tasks")
-DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/agy-dispatch/state.db")
+from agy_dispatch_common import (
+	LOGS_BASE,
+	REPOS_BASE,
+	TMUX_BIN,
+	TMP_BASE,
+	ensure_private_dirs,
+	get_db_conn,
+	init_db,
+	resolve_repo_path,
+	utc_now_iso,
+	validate_branch_name,
+	validate_safe_id,
+)
+
+logger = logging.getLogger("agy-mcp-server")
 AGY_SUMMARIES_DB = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
 RUNNER_BIN = os.environ.get("AGY_TASK_RUNNER", os.path.expanduser("~/bin/agy-task-runner"))
-TMUX_BIN = os.environ.get("TMUX_BIN", "/home/linuxbrew/.linuxbrew/bin/tmux")
 
 # In-memory wakeup events keyed by target name ("coordinator", worker_name, task_id, "*")
 _WAITERS: dict[str, list[asyncio.Event]] = {}
 
 
-def get_db_path() -> str:
-	"""Return SQLite database path and ensure parent directory exists."""
-	db_path = os.environ.get("AGY_DISPATCH_DB", DEFAULT_DB_PATH)
-	os.makedirs(os.path.dirname(db_path), exist_ok=True)
-	return db_path
+class DispatchTaskRequest(BaseModel):
+	"""Validated payload for dispatching a remote AGY task."""
+
+	repo: str = Field(min_length=1, max_length=128)
+	prompt: str = Field(min_length=1)
+	base_branch: str = Field(default="main", max_length=128)
+	gate: str = Field(default="", max_length=512)
+	interactive: bool = False
+	no_push: bool = False
+	no_pr: bool = False
+	pr_draft: bool = False
+	timeout: int = Field(default=3600, ge=0, le=86400)
+	run_id: str = Field(default="", max_length=64)
+	worker_name: str = Field(default="", max_length=64)
 
 
-def get_db_conn() -> sqlite3.Connection:
-	"""Open WAL-mode SQLite connection and initialize tables if needed."""
-	conn = sqlite3.connect(get_db_path(), timeout=15.0)
-	conn.row_factory = sqlite3.Row
-	conn.execute("PRAGMA journal_mode=WAL;")
-	conn.execute("PRAGMA busy_timeout=10000;")
-	conn.execute("""
-		CREATE TABLE IF NOT EXISTS tasks (
-			task_id TEXT PRIMARY KEY,
-			run_id TEXT,
-			worker_name TEXT,
-			repo TEXT NOT NULL,
-			base_branch TEXT NOT NULL DEFAULT 'main',
-			branch TEXT,
-			worktree_dir TEXT,
-			tmux_session TEXT,
-			prompt TEXT NOT NULL,
-			mode TEXT NOT NULL DEFAULT 'autonomous',
-			status TEXT NOT NULL,
-			conversation_id TEXT,
-			pr_url TEXT,
-			evidence_receipt TEXT,
-			summary TEXT,
-			report_md TEXT,
-			error_log TEXT,
-			started_at TEXT NOT NULL,
-			completed_at TEXT,
-			duration_seconds REAL
-		);
-	""")
-	conn.execute("""
-		CREATE TABLE IF NOT EXISTS agent_messages (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			run_id TEXT,
-			from_agent TEXT NOT NULL,
-			to_agent TEXT NOT NULL,
-			body TEXT NOT NULL,
-			created_at TEXT NOT NULL
-		);
-	""")
-	conn.commit()
-	return conn
+class SendMessageRequest(BaseModel):
+	"""Validated payload for coordinator/worker messaging."""
+
+	from_agent: str = Field(min_length=1, max_length=64)
+	to_agent: str = Field(min_length=1, max_length=64)
+	message: str = Field(min_length=1)
+	run_id: str = Field(default="", max_length=64)
 
 
-def utc_now_iso() -> str:
-	"""Return current UTC ISO-8601 timestamp."""
-	return datetime.datetime.now(datetime.timezone.utc).isoformat()
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+	"""Require Authorization: Bearer <AGY_DISPATCH_TOKEN> on /mcp and /api/* routes."""
+
+	async def dispatch(self, request: Request, call_next) -> Response:
+		token = os.environ.get("AGY_DISPATCH_TOKEN", "")
+		if request.url.path == "/health" or not token:
+			return await call_next(request)
+		auth_header = request.headers.get("authorization", "")
+		if not auth_header.startswith("Bearer "):
+			return JSONResponse({"error": "Unauthorized"}, status_code=401)
+		provided = auth_header[7:]
+		if not hmac.compare_digest(provided, token):
+			return JSONResponse({"error": "Forbidden"}, status_code=403)
+		return await call_next(request)
 
 
 def notify_waiters(*keys: str) -> None:
@@ -107,10 +108,10 @@ def notify_waiters(*keys: str) -> None:
 
 
 def tmux_has_session(session_name: str) -> bool:
-	"""Check whether a tmux session is currently alive."""
+	"""Check whether an exact tmux session is currently alive."""
 	if not session_name:
 		return False
-	res = subprocess.run([TMUX_BIN, "has-session", "-t", session_name], capture_output=True)
+	res = subprocess.run([TMUX_BIN, "has-session", "-t", f"={session_name}"], capture_output=True)
 	return res.returncode == 0
 
 
@@ -119,7 +120,7 @@ def tmux_capture_tail(session_name: str, lines: int = 25) -> str:
 	if not tmux_has_session(session_name):
 		return ""
 	res = subprocess.run(
-		[TMUX_BIN, "capture-pane", "-p", "-t", session_name, "-S", f"-{lines}"],
+		[TMUX_BIN, "capture-pane", "-p", "-t", f"={session_name}", "-S", f"-{lines}"],
 		capture_output=True,
 		text=True,
 	)
@@ -127,22 +128,41 @@ def tmux_capture_tail(session_name: str, lines: int = 25) -> str:
 
 
 def tmux_inject_text(session_name: str, text: str) -> bool:
-	"""Paste text cleanly into a tmux pane using load-buffer + paste-buffer + Enter."""
+	"""Paste text cleanly into a tmux pane using an isolated named buffer."""
 	if not tmux_has_session(session_name):
 		return False
-	with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+	ensure_private_dirs()
+	buf_name = f"agy-{uuid.uuid4().hex[:8]}"
+	with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=TMP_BASE, delete=False) as tf:
 		tf.write(text)
 		buf_path = tf.name
 	try:
-		subprocess.run([TMUX_BIN, "load-buffer", buf_path], check=True, capture_output=True)
-		subprocess.run([TMUX_BIN, "paste-buffer", "-t", session_name], check=True, capture_output=True)
-		subprocess.run([TMUX_BIN, "send-keys", "-t", session_name, "Enter"], check=True, capture_output=True)
+		subprocess.run([TMUX_BIN, "load-buffer", "-b", buf_name, buf_path], check=True, capture_output=True)
+		subprocess.run([TMUX_BIN, "paste-buffer", "-d", "-b", buf_name, "-t", f"={session_name}"], check=True, capture_output=True)
+		subprocess.run([TMUX_BIN, "send-keys", "-t", f"={session_name}", "Enter"], check=True, capture_output=True)
 		return True
 	except subprocess.CalledProcessError:
+		subprocess.run([TMUX_BIN, "delete-buffer", "-b", buf_name], capture_output=True)
 		return False
 	finally:
 		if os.path.exists(buf_path):
 			os.remove(buf_path)
+
+
+def _read_last_jsonl_line(path: str, chunk_bytes: int = 32768) -> dict[str, Any] | None:
+	"""Read only the trailing chunk of a JSONL file to avoid loading huge transcripts."""
+	with open(path, "rb") as f:
+		f.seek(0, os.SEEK_END)
+		size = f.tell()
+		if size == 0:
+			return None
+		f.seek(max(0, size - chunk_bytes), os.SEEK_SET)
+		tail = f.read().decode("utf-8", errors="replace")
+	for line in reversed(tail.splitlines()):
+		stripped = line.strip()
+		if stripped:
+			return json.loads(stripped)
+	return None
 
 
 def read_live_transcript_info(worktree_dir: str) -> dict[str, Any]:
@@ -150,38 +170,38 @@ def read_live_transcript_info(worktree_dir: str) -> dict[str, Any]:
 	if not worktree_dir or not os.path.exists(AGY_SUMMARIES_DB):
 		return {}
 	try:
+		escaped = worktree_dir.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 		conn = sqlite3.connect(f"file:{AGY_SUMMARIES_DB}?mode=ro", uri=True, timeout=5.0)
 		conn.row_factory = sqlite3.Row
 		row = conn.execute(
 			"""
 			SELECT conversation_id, step_count, status, not_fully_idle, last_modified_time
 			FROM conversation_summaries
-			WHERE workspace_uris LIKE ?
+			WHERE workspace_uris LIKE ? ESCAPE '\\'
 			ORDER BY last_modified_time DESC
 			LIMIT 1;
 			""",
-			(f"%{worktree_dir}%",),
+			(f"%file://{escaped}%",),
 		).fetchone()
 		conn.close()
 		if not row:
 			return {}
 		info = dict(row)
-		cid = info["conversation_id"]
+		cid = validate_safe_id(info["conversation_id"], "conversation_id")
 		transcript_path = os.path.expanduser(
 			f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"
 		)
 		if os.path.exists(transcript_path):
-			with open(transcript_path, "r", encoding="utf-8") as tf:
-				lines = tf.readlines()
-			if lines:
-				last_step = json.loads(lines[-1])
+			last_step = _read_last_jsonl_line(transcript_path)
+			if last_step:
 				info["last_step_type"] = last_step.get("type")
 				info["last_step_status"] = last_step.get("status")
 				tools = [t.get("name") for t in (last_step.get("tool_calls") or []) if t.get("name")]
 				if tools:
 					info["last_tools"] = tools
 		return info
-	except Exception:
+	except Exception as e:
+		logger.warning("Failed to read live transcript info for %s: %s", worktree_dir, e)
 		return {}
 
 
@@ -202,47 +222,59 @@ def resolve_tmux_for_target(target: str) -> str | None:
 	return None
 
 
-def _dispatch_task_impl(
-	repo: str,
-	prompt: str,
-	base_branch: str = "main",
-	gate: str = "",
-	interactive: bool = False,
-	no_push: bool = False,
-	no_pr: bool = False,
-	pr_draft: bool = False,
-	timeout: int = 3600,
-	run_id: str = "",
-	worker_name: str = "",
-) -> dict[str, Any]:
-	"""Spawn agy-task-runner detached on fibonacci and return task metadata."""
-	os.makedirs(LOGS_BASE, exist_ok=True)
+def _dispatch_task_impl(req: DispatchTaskRequest) -> dict[str, Any]:
+	"""Validate inputs, insert initial task row, and spawn agy-task-runner detached."""
+	resolve_repo_path(req.repo)
+	validate_branch_name(req.base_branch)
+	if req.worker_name:
+		validate_safe_id(req.worker_name, "worker_name")
+	if req.run_id:
+		validate_safe_id(req.run_id, "run_id")
+
+	ensure_private_dirs()
 	ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-	task_id = f"task-{ts}"
+	task_id = f"task-{ts}-{uuid.uuid4().hex[:6]}"
+	tmux_session = f"agy-{task_id}"
+	mode = "interactive" if req.interactive else "autonomous"
 	out_log = os.path.join(LOGS_BASE, f"{task_id}.out")
+
+	with get_db_conn() as conn:
+		conn.execute(
+			"""
+			INSERT INTO tasks (
+				task_id, run_id, worker_name, repo, base_branch, tmux_session,
+				prompt, mode, status, started_at
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?);
+			""",
+			(
+				task_id, req.run_id or None, req.worker_name or task_id,
+				req.repo, req.base_branch, tmux_session, req.prompt, mode, utc_now_iso(),
+			),
+		)
 
 	cmd = [
 		RUNNER_BIN,
-		repo,
-		prompt,
-		"--base-branch", base_branch,
-		"--timeout", str(timeout),
+		req.repo,
+		req.prompt,
+		"--base-branch", req.base_branch,
+		"--timeout", str(req.timeout),
 		"--task-id", task_id,
 	]
-	if gate:
-		cmd.extend(["--gate", gate])
-	if interactive:
+	if req.gate:
+		cmd.extend(["--gate", req.gate])
+	if req.interactive:
 		cmd.append("--interactive")
-	if no_push:
+	if req.no_push:
 		cmd.append("--no-push")
-	if no_pr:
+	if req.no_pr:
 		cmd.append("--no-pr")
-	if pr_draft:
+	if req.pr_draft:
 		cmd.append("--pr-draft")
-	if run_id:
-		cmd.extend(["--run-id", run_id])
-	if worker_name:
-		cmd.extend(["--worker-name", worker_name])
+	if req.run_id:
+		cmd.extend(["--run-id", req.run_id])
+	if req.worker_name:
+		cmd.extend(["--worker-name", req.worker_name])
 
 	with open(out_log, "w", encoding="utf-8") as out_fh, open(os.devnull, "r") as devnull:
 		subprocess.Popen(
@@ -253,25 +285,25 @@ def _dispatch_task_impl(
 			start_new_session=True,
 		)
 
-	tmux_session = f"agy-{task_id}"
-	notify_waiters("coordinator", task_id, worker_name)
+	notify_waiters("coordinator", task_id, req.worker_name)
 	return {
 		"task_id": task_id,
-		"worker_name": worker_name or task_id,
-		"repo": repo,
-		"mode": "interactive" if interactive else "autonomous",
+		"worker_name": req.worker_name or task_id,
+		"repo": req.repo,
+		"mode": mode,
 		"tmux_session": tmux_session,
 		"attach_cmd": f"ssh -t fibonacci tmux attach -t {tmux_session}",
 		"status": "starting",
 	}
 
 
-def _get_task_status_impl(task_id: str) -> dict[str, Any]:
+def _get_task_status_impl(task_id: str) -> dict[str, Any] | None:
 	"""Return combined SQLite state, tmux pane status/tail, and transcript progress."""
+	validate_safe_id(task_id, "task_id")
 	with get_db_conn() as conn:
 		row = conn.execute("SELECT * FROM tasks WHERE task_id = ?;", (task_id,)).fetchone()
 	if not row:
-		return {"error": f"Task not found: {task_id}"}
+		return None
 	data = dict(row)
 	session = data.get("tmux_session") or f"agy-{task_id}"
 	alive = tmux_has_session(session)
@@ -284,33 +316,59 @@ def _get_task_status_impl(task_id: str) -> dict[str, Any]:
 	return data
 
 
-def _send_message_impl(from_agent: str, to_agent: str, message: str, run_id: str = "") -> dict[str, Any]:
+def _list_tasks_impl(limit: int = 10, run_id: str = "") -> list[dict[str, Any]]:
+	"""Query recent tasks with bounded limit."""
+	safe_limit = max(1, min(limit, 200))
+	with get_db_conn() as conn:
+		if run_id:
+			validate_safe_id(run_id, "run_id")
+			rows = conn.execute(
+				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks WHERE run_id = ? ORDER BY started_at DESC LIMIT ?;",
+				(run_id, safe_limit),
+			).fetchall()
+		else:
+			rows = conn.execute(
+				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks ORDER BY started_at DESC LIMIT ?;",
+				(safe_limit,),
+			).fetchall()
+	return [dict(r) for r in rows]
+
+
+def _send_message_impl(req: SendMessageRequest) -> dict[str, Any]:
 	"""Persist message in SQLite, wake waiters, and inject into live tmux worker if applicable."""
+	validate_safe_id(req.from_agent, "from_agent")
+	validate_safe_id(req.to_agent, "to_agent")
+	if req.run_id:
+		validate_safe_id(req.run_id, "run_id")
+
 	now = utc_now_iso()
 	with get_db_conn() as conn:
 		cur = conn.execute(
 			"INSERT INTO agent_messages (run_id, from_agent, to_agent, body, created_at) VALUES (?, ?, ?, ?, ?);",
-			(run_id or None, from_agent, to_agent, message, now),
+			(req.run_id or None, req.from_agent, req.to_agent, req.message, now),
 		)
 		msg_id = cur.lastrowid
 
 	injected = False
-	if to_agent not in ("coordinator", "broadcast"):
-		session = resolve_tmux_for_target(to_agent)
+	if req.to_agent not in ("coordinator", "broadcast"):
+		session = resolve_tmux_for_target(req.to_agent)
 		if session:
-			injected = tmux_inject_text(session, f"[MSG from {from_agent}]: {message}")
+			injected = tmux_inject_text(session, f"[MSG from {req.from_agent}]: {req.message}")
 
-	notify_waiters(to_agent)
-	return {"id": msg_id, "to_agent": to_agent, "injected_to_tmux": injected, "created_at": now}
+	notify_waiters(req.to_agent)
+	return {"id": msg_id, "to_agent": req.to_agent, "injected_to_tmux": injected, "created_at": now}
 
 
 def _read_messages_impl(agent_name: str, since_id: int = 0, limit: int = 50) -> list[dict[str, Any]]:
 	"""Query unread/recent messages for an agent (or '*' for all)."""
+	safe_limit = max(1, min(limit, 200))
+	if agent_name != "*":
+		validate_safe_id(agent_name, "agent_name")
 	with get_db_conn() as conn:
 		if agent_name == "*":
 			rows = conn.execute(
 				"SELECT * FROM agent_messages WHERE id > ? ORDER BY id ASC LIMIT ?;",
-				(since_id, limit),
+				(since_id, safe_limit),
 			).fetchall()
 		else:
 			rows = conn.execute(
@@ -319,20 +377,21 @@ def _read_messages_impl(agent_name: str, since_id: int = 0, limit: int = 50) -> 
 				WHERE id > ? AND (to_agent = ? OR to_agent = 'broadcast')
 				ORDER BY id ASC LIMIT ?;
 				""",
-				(since_id, agent_name, limit),
+				(since_id, agent_name, safe_limit),
 			).fetchall()
 	return [dict(r) for r in rows]
 
 
 def _stop_task_impl(task_id: str, graceful: bool = True) -> dict[str, Any]:
 	"""Stop a running worker either by sending /exit or killing its tmux session."""
+	validate_safe_id(task_id, "task_id")
 	session = resolve_tmux_for_target(task_id) or f"agy-{task_id}"
 	if not tmux_has_session(session):
 		return {"task_id": task_id, "stopped": False, "reason": "tmux session not active"}
 	if graceful:
 		ok = tmux_inject_text(session, "/exit")
 		return {"task_id": task_id, "stopped": ok, "method": "graceful_exit"}
-	subprocess.run([TMUX_BIN, "kill-session", "-t", session], capture_output=True)
+	subprocess.run([TMUX_BIN, "kill-session", "-t", f"={session}"], capture_output=True)
 	return {"task_id": task_id, "stopped": True, "method": "kill_session"}
 
 
@@ -370,7 +429,7 @@ def dispatch_task(
 	worker_name: str = "",
 ) -> dict[str, Any]:
 	"""Dispatch an AGY task into an isolated worktree + persistent tmux session on fibonacci."""
-	return _dispatch_task_impl(
+	req = DispatchTaskRequest(
 		repo=repo,
 		prompt=prompt,
 		base_branch=base_branch,
@@ -383,35 +442,26 @@ def dispatch_task(
 		run_id=run_id,
 		worker_name=worker_name,
 	)
+	return _dispatch_task_impl(req)
 
 
 @mcp.tool()
 def get_task_status(task_id: str) -> dict[str, Any]:
 	"""Get live task status, tmux pane tail, transcript step progress, and report if submitted."""
-	return _get_task_status_impl(task_id)
+	res = _get_task_status_impl(task_id)
+	return res if res is not None else {"error": f"Task not found: {task_id}"}
 
 
 @mcp.tool()
 def list_tasks(limit: int = 10, run_id: str = "") -> list[dict[str, Any]]:
 	"""List recent tasks from the SQLite ledger on fibonacci."""
-	with get_db_conn() as conn:
-		if run_id:
-			rows = conn.execute(
-				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks WHERE run_id = ? ORDER BY started_at DESC LIMIT ?;",
-				(run_id, limit),
-			).fetchall()
-		else:
-			rows = conn.execute(
-				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks ORDER BY started_at DESC LIMIT ?;",
-				(limit,),
-			).fetchall()
-	return [dict(r) for r in rows]
+	return _list_tasks_impl(limit=limit, run_id=run_id)
 
 
 @mcp.tool()
 def send_message(from_agent: str, to_agent: str, message: str, run_id: str = "") -> dict[str, Any]:
 	"""Send a message to 'coordinator', 'broadcast', or a worker (injects directly into its tmux pane)."""
-	return _send_message_impl(from_agent=from_agent, to_agent=to_agent, message=message, run_id=run_id)
+	return _send_message_impl(SendMessageRequest(from_agent=from_agent, to_agent=to_agent, message=message, run_id=run_id))
 
 
 @mcp.tool()
@@ -423,15 +473,18 @@ def read_messages(agent_name: str, since_id: int = 0, limit: int = 50) -> list[d
 @mcp.tool()
 async def wait_for_update(target: str = "coordinator", since_id: int = 0, timeout_seconds: int = 30) -> dict[str, Any]:
 	"""Wait until a new message arrives for target (or timeout expires), returning new messages immediately."""
-	existing = _read_messages_impl(target, since_id=since_id)
-	if existing:
-		return {"messages": existing, "timed_out": False}
-
+	if target != "*":
+		validate_safe_id(target, "target")
+	# Register waiter before querying SQLite so concurrent arrivals are never missed
 	ev = asyncio.Event()
 	_WAITERS.setdefault(target, []).append(ev)
 	try:
+		existing = await asyncio.to_thread(_read_messages_impl, target, since_id)
+		if existing:
+			return {"messages": existing, "timed_out": False}
 		await asyncio.wait_for(ev.wait(), timeout=max(1, min(timeout_seconds, 120)))
-		return {"messages": _read_messages_impl(target, since_id=since_id), "timed_out": False}
+		msgs = await asyncio.to_thread(_read_messages_impl, target, since_id)
+		return {"messages": msgs, "timed_out": False}
 	except asyncio.TimeoutError:
 		return {"messages": [], "timed_out": True}
 	finally:
@@ -442,6 +495,9 @@ async def wait_for_update(target: str = "coordinator", since_id: int = 0, timeou
 @mcp.tool()
 def submit_report(task_id: str, summary: str, report_md: str, conversation_id: str = "") -> dict[str, Any]:
 	"""Submit a worker's final summary & markdown report and wake the coordinator."""
+	validate_safe_id(task_id, "task_id")
+	if conversation_id:
+		validate_safe_id(conversation_id, "conversation_id")
 	with get_db_conn() as conn:
 		conn.execute(
 			"""
@@ -451,8 +507,7 @@ def submit_report(task_id: str, summary: str, report_md: str, conversation_id: s
 			""",
 			(summary, report_md, conversation_id, task_id),
 		)
-	_send_message_impl(from_agent=task_id, to_agent="coordinator", message=f"Report submitted: {summary}")
-	notify_waiters("coordinator", task_id)
+	_send_message_impl(SendMessageRequest(from_agent=task_id, to_agent="coordinator", message=f"Report submitted: {summary}"))
 	return {"task_id": task_id, "submitted": True}
 
 
@@ -469,37 +524,74 @@ async def api_health(request: Request) -> JSONResponse:
 
 
 async def api_repos(request: Request) -> JSONResponse:
-	return JSONResponse({"repos": list_repos()})
+	repos = await asyncio.to_thread(list_repos)
+	return JSONResponse({"repos": repos})
 
 
 async def api_tasks(request: Request) -> JSONResponse:
 	if request.method == "POST":
-		body = await request.json()
-		res = _dispatch_task_impl(**body)
-		return JSONResponse(res)
-	limit = int(request.query_params.get("limit", "10"))
+		try:
+			raw = await request.json()
+			req = DispatchTaskRequest.model_validate(raw)
+		except (json.JSONDecodeError, ValidationError, ValueError) as e:
+			return JSONResponse({"error": str(e)}, status_code=400)
+		try:
+			res = await asyncio.to_thread(_dispatch_task_impl, req)
+			return JSONResponse(res)
+		except ValueError as e:
+			return JSONResponse({"error": str(e)}, status_code=400)
+	try:
+		limit = int(request.query_params.get("limit", "10"))
+	except ValueError:
+		return JSONResponse({"error": "Invalid limit parameter"}, status_code=400)
 	run_id = request.query_params.get("run_id", "")
-	return JSONResponse({"tasks": list_tasks(limit=limit, run_id=run_id)})
+	try:
+		tasks = await asyncio.to_thread(_list_tasks_impl, limit, run_id)
+		return JSONResponse({"tasks": tasks})
+	except ValueError as e:
+		return JSONResponse({"error": str(e)}, status_code=400)
 
 
 async def api_task_detail(request: Request) -> JSONResponse:
 	task_id = request.path_params["task_id"]
-	return JSONResponse(_get_task_status_impl(task_id))
+	try:
+		data = await asyncio.to_thread(_get_task_status_impl, task_id)
+	except ValueError as e:
+		return JSONResponse({"error": str(e)}, status_code=400)
+	if data is None:
+		return JSONResponse({"error": f"Task not found: {task_id}"}, status_code=404)
+	return JSONResponse(data)
 
 
 async def api_task_stop(request: Request) -> JSONResponse:
 	task_id = request.path_params["task_id"]
-	body = await request.json() if await request.body() else {}
-	return JSONResponse(_stop_task_impl(task_id, graceful=body.get("graceful", True)))
+	try:
+		raw_body = await request.body()
+		body = json.loads(raw_body) if raw_body else {}
+		if not isinstance(body, dict):
+			raise ValueError("JSON body must be an object")
+		res = await asyncio.to_thread(_stop_task_impl, task_id, bool(body.get("graceful", True)))
+		return JSONResponse(res)
+	except (json.JSONDecodeError, ValueError) as e:
+		return JSONResponse({"error": str(e)}, status_code=400)
 
 
 async def api_messages(request: Request) -> JSONResponse:
 	if request.method == "POST":
-		body = await request.json()
-		return JSONResponse(_send_message_impl(**body))
+		try:
+			raw = await request.json()
+			req = SendMessageRequest.model_validate(raw)
+			res = await asyncio.to_thread(_send_message_impl, req)
+			return JSONResponse(res)
+		except (json.JSONDecodeError, ValidationError, ValueError) as e:
+			return JSONResponse({"error": str(e)}, status_code=400)
 	agent = request.query_params.get("agent", "*")
-	since_id = int(request.query_params.get("since_id", "0"))
-	return JSONResponse({"messages": _read_messages_impl(agent, since_id=since_id)})
+	try:
+		since_id = int(request.query_params.get("since_id", "0"))
+		msgs = await asyncio.to_thread(_read_messages_impl, agent, since_id)
+		return JSONResponse({"messages": msgs})
+	except ValueError as e:
+		return JSONResponse({"error": str(e)}, status_code=400)
 
 
 def build_app():
@@ -507,8 +599,12 @@ def build_app():
 	app = mcp.streamable_http_app(
 		streamable_http_path="/mcp",
 		stateless_http=True,
-		transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+		transport_security=TransportSecuritySettings(
+			enable_dns_rebinding_protection=True,
+			allowed_hosts=["127.0.0.1:8765", "localhost:8765", "fibonacci.tail8b9be7.ts.net:8765"],
+		),
 	)
+	app.add_middleware(BearerAuthMiddleware)
 	app.router.routes.extend([
 		Route("/health", api_health, methods=["GET"]),
 		Route("/api/repos", api_repos, methods=["GET"]),
@@ -533,7 +629,7 @@ def main() -> None:
 	if args.db_path:
 		os.environ["AGY_DISPATCH_DB"] = args.db_path
 
-	get_db_conn().close()
+	init_db()
 	uvicorn.run(build_app(), host=args.host, port=args.port, log_level="info")
 
 
