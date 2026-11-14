@@ -509,6 +509,170 @@ def cmd_move(args):
 		sys.exit(f"Error moving message: {resp.status_code} {resp.text}")
 
 
+def mark_message_read(headers: dict, msg_id: str) -> tuple[bool, str | None]:
+	patch_headers = {**headers, "Content-Type": "application/json"}
+	resp = requests.patch(
+		f"{GRAPH_ENDPOINT}/me/messages/{msg_id}",
+		headers=patch_headers,
+		json={"isRead": True},
+	)
+	if resp.status_code in (200, 204):
+		return True, None
+	return False, f"{resp.status_code} {resp.text}"
+
+
+def message_matches_sender(msg: dict, from_filter: str) -> bool:
+	needle = from_filter.lower()
+	info = (msg.get("from") or {}).get("emailAddress") or {}
+	haystack = f"{info.get('name', '')} {info.get('address', '')}".lower()
+	return needle in haystack
+
+
+def fetch_unread_messages(
+	headers: dict,
+	folder: str | None,
+	from_filter: str | None,
+	max_items: int | None,
+) -> tuple[list[dict], dict[str, str], bool]:
+	folder_map, excluded_ids = get_folder_info(headers)
+	filters = ["isRead eq false"]
+
+	if folder:
+		folder_id = resolve_folder_id(headers, folder)
+		url = f"{GRAPH_ENDPOINT}/me/mailFolders/{folder_id}/messages"
+	else:
+		url = f"{GRAPH_ENDPOINT}/me/messages"
+		filters.append("isDraft eq false")
+		for fid in excluded_ids:
+			filters.append(f"parentFolderId ne '{fid}'")
+
+	page_size = 100 if (from_filter or max_items is None or max_items > 100) else max_items
+	next_url: str | None = url
+	next_params: dict[str, str] | None = {
+		"$top": str(page_size),
+		"$select": "id,subject,receivedDateTime,from,isRead,parentFolderId",
+		"$orderby": "receivedDateTime desc",
+		"$filter": " and ".join(filters),
+	}
+
+	matched: list[dict] = []
+	has_more = False
+
+	while next_url:
+		resp = requests.get(next_url, headers=headers, params=next_params)
+		if resp.status_code != 200:
+			folder_label = f" in '{folder}'" if folder else ""
+			sys.exit(f"Error fetching unread messages{folder_label}: {resp.status_code} {resp.text}")
+
+		data = resp.json()
+		batch = data.get("value", [])
+		next_link = data.get("@odata.nextLink")
+
+		for idx, msg in enumerate(batch):
+			if from_filter and not message_matches_sender(msg, from_filter):
+				continue
+			matched.append(msg)
+			if max_items is not None and len(matched) >= max_items:
+				remaining = batch[idx + 1:]
+				has_remaining_match = any(
+					not from_filter or message_matches_sender(m, from_filter)
+					for m in remaining
+				)
+				has_more = bool(next_link) or has_remaining_match
+				return matched, folder_map, has_more
+
+		next_url = next_link
+		next_params = None
+
+	return matched, folder_map, has_more
+
+
+def cmd_mark_read(args):
+	has_ids = bool(args.message_ids)
+	has_bulk_opts = bool(args.folder or args.from_filter or args.all or args.limit is not None)
+
+	if args.limit is not None and args.limit <= 0:
+		sys.exit("Error: --limit must be a positive integer.")
+	if has_ids and has_bulk_opts:
+		sys.exit("Error: Cannot combine explicit message IDs with bulk filter options (--folder, --from, --limit, --all).")
+	if not has_ids and not has_bulk_opts:
+		sys.exit("Error: Specify message ID(s) or use --folder / --from / --all to bulk-mark unread messages.")
+
+	token = get_access_token(interactive=True)
+	headers = get_headers(token)
+
+	if has_ids:
+		if args.dry_run:
+			folder_map, _ = get_folder_info(headers)
+			messages = []
+			for msg_id in args.message_ids:
+				resp = requests.get(
+					f"{GRAPH_ENDPOINT}/me/messages/{msg_id}",
+					headers=headers,
+					params={"$select": "id,subject,receivedDateTime,from,isRead,parentFolderId"},
+				)
+				if resp.status_code != 200:
+					sys.exit(f"Error fetching message '{msg_id}': {resp.status_code} {resp.text}")
+				messages.append(resp.json())
+			print(f"[DRY RUN] Would mark {len(messages)} message(s) as read:")
+			print_message_table(messages, folder_map, args.verbose)
+			return
+
+		succeeded = 0
+		failures = []
+		for msg_id in args.message_ids:
+			ok, err = mark_message_read(headers, msg_id)
+			if ok:
+				succeeded += 1
+				if args.verbose:
+					print(f"Marked as read: {msg_id}")
+			else:
+				failures.append((msg_id, err))
+
+		print(f"Marked {succeeded} of {len(args.message_ids)} message(s) as read.")
+		if failures:
+			for msg_id, err in failures:
+				sys.stderr.write(f"Failed to mark {msg_id} as read: {err}\n")
+			sys.exit(1)
+		return
+
+	max_items = None if args.all else (args.limit if args.limit is not None else 50)
+	messages, folder_map, has_more = fetch_unread_messages(headers, args.folder, args.from_filter, max_items)
+
+	if not messages:
+		folder_label = f" in '{args.folder}'" if args.folder else " across all folders"
+		from_label = f" from '{args.from_filter}'" if args.from_filter else ""
+		print(f"No unread messages found{folder_label}{from_label}.")
+		return
+
+	if args.dry_run:
+		print(f"[DRY RUN] Would mark {len(messages)} unread message(s) as read:")
+		print_message_table(messages, folder_map, args.verbose)
+		if has_more:
+			print(f"\nNote: Limit of {max_items} reached; more matching unread messages exist. Use --all to include all.")
+		return
+
+	succeeded = 0
+	failures = []
+	for msg in messages:
+		msg_id = msg.get("id")
+		ok, err = mark_message_read(headers, msg_id)
+		if ok:
+			succeeded += 1
+			if args.verbose:
+				print(f"Marked as read: {msg_id}")
+		else:
+			failures.append((msg_id, err))
+
+	print(f"Marked {succeeded} of {len(messages)} unread message(s) as read.")
+	if has_more:
+		print(f"Note: Limit of {max_items} reached; more matching unread messages exist. Use --all to process all.")
+	if failures:
+		for msg_id, err in failures:
+			sys.stderr.write(f"Failed to mark {msg_id} as read: {err}\n")
+		sys.exit(1)
+
+
 def cmd_rules(args):
 	token = get_access_token(interactive=True)
 	headers = get_headers(token)
@@ -627,6 +791,17 @@ def main():
 	p_move.add_argument("destination", help="Destination folder name (e.g. inbox, archive, or custom folder)")
 	p_move.add_argument("-v", "--verbose", action="store_true", help="Show new message ID")
 	p_move.set_defaults(func=cmd_move)
+
+	# mark-read
+	p_mark_read = subparsers.add_parser("mark-read", help="Mark specific or unread messages as read")
+	p_mark_read.add_argument("message_ids", nargs="*", help="Message ID(s) to mark as read")
+	p_mark_read.add_argument("-f", "--folder", help="Folder to mark unread messages as read (e.g. inbox, Alerts, junk)")
+	p_mark_read.add_argument("--from", dest="from_filter", metavar="SENDER", help="Filter unread messages by sender name or email substring")
+	p_mark_read.add_argument("-l", "--limit", type=int, default=None, help="Maximum number of unread messages to mark as read (default: 50 unless --all)")
+	p_mark_read.add_argument("--all", action="store_true", help="Mark all matching unread messages as read")
+	p_mark_read.add_argument("-n", "--dry-run", action="store_true", help="Preview matching messages without marking them as read")
+	p_mark_read.add_argument("-v", "--verbose", action="store_true", help="Show full message IDs")
+	p_mark_read.set_defaults(func=cmd_mark_read)
 
 	# rules
 	p_rules = subparsers.add_parser("rules", help="List or delete inbox rules")

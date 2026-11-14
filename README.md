@@ -206,10 +206,11 @@ whatsapp read "Alex"
 whatsapp read "@username"
 whatsapp draft --to "@username" --message "On my way!"
 
-# Outlook: list unread emails, search, read, and draft
+# Outlook: list unread emails, search, read, draft, and mark as read
 outlook unread
 outlook search "invoice"
 outlook read <message-id>
+outlook mark-read --folder Alerts --dry-run
 outlook draft --to "person@example.com" --subject "Status update" --body "Task complete."
 
 # Yahoo Mail: list unread emails, search, read, folders, and draft
