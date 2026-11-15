@@ -111,7 +111,7 @@ def tmux_has_session(session_name: str) -> bool:
 	"""Check whether an exact tmux session is currently alive."""
 	if not session_name:
 		return False
-	res = subprocess.run([TMUX_BIN, "has-session", "-t", f"={session_name}"], capture_output=True)
+	res = subprocess.run([TMUX_BIN, "has-session", "-t", session_name], capture_output=True)
 	return res.returncode == 0
 
 
@@ -120,7 +120,7 @@ def tmux_capture_tail(session_name: str, lines: int = 25) -> str:
 	if not tmux_has_session(session_name):
 		return ""
 	res = subprocess.run(
-		[TMUX_BIN, "capture-pane", "-p", "-t", f"={session_name}", "-S", f"-{lines}"],
+		[TMUX_BIN, "capture-pane", "-p", "-t", session_name, "-S", f"-{lines}"],
 		capture_output=True,
 		text=True,
 	)
@@ -138,8 +138,8 @@ def tmux_inject_text(session_name: str, text: str) -> bool:
 		buf_path = tf.name
 	try:
 		subprocess.run([TMUX_BIN, "load-buffer", "-b", buf_name, buf_path], check=True, capture_output=True)
-		subprocess.run([TMUX_BIN, "paste-buffer", "-d", "-b", buf_name, "-t", f"={session_name}"], check=True, capture_output=True)
-		subprocess.run([TMUX_BIN, "send-keys", "-t", f"={session_name}", "Enter"], check=True, capture_output=True)
+		subprocess.run([TMUX_BIN, "paste-buffer", "-d", "-b", buf_name, "-t", session_name], check=True, capture_output=True)
+		subprocess.run([TMUX_BIN, "send-keys", "-t", session_name, "Enter"], check=True, capture_output=True)
 		return True
 	except subprocess.CalledProcessError:
 		subprocess.run([TMUX_BIN, "delete-buffer", "-b", buf_name], capture_output=True)
@@ -391,7 +391,7 @@ def _stop_task_impl(task_id: str, graceful: bool = True) -> dict[str, Any]:
 	if graceful:
 		ok = tmux_inject_text(session, "/exit")
 		return {"task_id": task_id, "stopped": ok, "method": "graceful_exit"}
-	subprocess.run([TMUX_BIN, "kill-session", "-t", f"={session}"], capture_output=True)
+	subprocess.run([TMUX_BIN, "kill-session", "-t", session], capture_output=True)
 	return {"task_id": task_id, "stopped": True, "method": "kill_session"}
 
 
