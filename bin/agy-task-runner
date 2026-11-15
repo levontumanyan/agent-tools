@@ -133,7 +133,7 @@ def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_f
 	if res.returncode != 0:
 		subprocess.run(tmux_cmd, check=True)
 
-	target = f"={tmux_session}"
+	target = tmux_session
 	for opt, val in [("status", "off"), ("prefix", "None"), ("prefix2", "None"), ("mouse", "on")]:
 		subprocess.run([TMUX_BIN, "set-option", "-t", target, opt, val], capture_output=True)
 
@@ -146,7 +146,7 @@ def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_f
 
 def wait_for_tmux_exit(tmux_session: str, exit_file: str, wait_channel: str, timeout: int) -> int:
 	"""Block on tmux wait-for channel (zero polling) until agy exits or timeout expires."""
-	target = f"={tmux_session}"
+	target = tmux_session
 	if not os.path.exists(exit_file):
 		chk = subprocess.run([TMUX_BIN, "has-session", "-t", target], capture_output=True)
 		if chk.returncode == 0:

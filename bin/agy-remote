@@ -89,9 +89,8 @@ def api_request(base_url: str, path: str, payload: dict | None = None) -> dict:
 def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str) -> None:
 	"""Open a non-focus-stealing cmux terminal tab attached to the remote tmux worker."""
 	validate_task_id(task_id)
-	session = f"=agy-{task_id}"
-	# Quote for both local zsh and remote zsh so '=agy-...' is never EQUALS-expanded.
-	remote_cmd = f"tmux attach -t '{session}'"
+	session = f"agy-{task_id}"
+	remote_cmd = f"tmux attach -t {shlex.quote(session)}"
 	cmd_str = f"ssh -t {shlex.quote(ssh_host)} {shlex.quote(remote_cmd)}"
 	short_id = task_id.replace("task-", "")[-6:]
 	tab_title = f"WORK | {short_id} | {label[:24]}"
@@ -150,8 +149,8 @@ def cmd_attach(args) -> None:
 	if args.cmux:
 		open_cmux_attach_tab(ssh_host, task_id, task_id)
 		return
-	session = f"=agy-{task_id}"
-	os.execvp("ssh", ["ssh", "-t", ssh_host, f"tmux attach -t '{session}'"])
+	session = f"agy-{task_id}"
+	os.execvp("ssh", ["ssh", "-t", ssh_host, "tmux", "attach", "-t", session])
 
 
 def cmd_status(args) -> None:
