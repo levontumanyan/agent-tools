@@ -180,27 +180,13 @@ def _format_coords(coords):
 	lng = coords.get("longitude")
 	if lat is None or lng is None:
 		return "-"
-	return f"{lat:.4f}, {lng:.4f}"
+	try:
+		return f"{float(lat):.4f}, {float(lng):.4f}"
+	except (TypeError, ValueError):
+		return "-"
 
 
 def main():
-	# Initial parser to check for verbose and json flags before logging setup
-	temp_parser = argparse.ArgumentParser(add_help=False)
-	temp_parser.add_argument("-v", "--verbose", action="store_true")
-	temp_parser.add_argument("--json", action="store_true")
-	temp_args, _ = temp_parser.parse_known_args()
-
-	# Configure logging (redirect to stderr when --json is used so stdout stays clean)
-	log_level = logging.INFO if temp_args.verbose else logging.WARNING
-	log_stream = sys.stderr if temp_args.json else sys.stdout
-	logger = setup_logging(level=log_level, stream=log_stream)
-
-	if not check_internet_connection():
-		logger.error("No internet connection detected. Please check your network.")
-		if temp_args.json:
-			print(json.dumps({"error": "No internet connection detected."}))
-		sys.exit(1)
-
 	# Load search defaults
 	filters = load_search_filters()
 	defaults = filters.get("defaults", {})
@@ -359,6 +345,17 @@ def main():
 	)
 
 	args = parser.parse_args()
+
+	# Configure logging (redirect to stderr when --json is used so stdout stays clean)
+	log_level = logging.INFO if args.verbose else logging.WARNING
+	log_stream = sys.stderr if args.json else sys.stdout
+	logger = setup_logging(level=log_level, stream=log_stream)
+
+	if not check_internet_connection():
+		logger.error("No internet connection detected. Please check your network.")
+		if args.json:
+			print(json.dumps({"error": "No internet connection detected."}))
+		sys.exit(1)
 
 	if args.cookie:
 		from fetcher import set_session_cookie
@@ -1060,11 +1057,15 @@ def main():
 					f"{'Rank':<5} {'Score':<7} {'Nightly':<14} {'Total Stay':<14} {'Rating':<12} {'Coordinates':<20} {'Title':<32} {'URL'}"
 				)
 				print("-" * 135)
-				for i, r in enumerate(display_rows):
-					n_price = (
-						f"{r.get('currency', '')} ${r.get('nightly_price', 0):.2f}/nt"
-					)
-					t_price = f"{r.get('currency', '')} ${r.get('total_price', 0):.2f}"
+			else:
+				print(
+					f"{'Rank':<5} {'Score':<7} {'Nightly':<14} {'Total Stay':<14} {'Rating':<8} {'Title'}"
+				)
+				print("-" * 80)
+			for i, r in enumerate(display_rows):
+				n_price = f"{r.get('currency', '')} ${r.get('nightly_price', 0):.2f}/nt"
+				t_price = f"{r.get('currency', '')} ${r.get('total_price', 0):.2f}"
+				if args.compact:
 					rating_str = (
 						f"★{r.get('rating', 0):.2f} ({r.get('review_count', 0)})"
 					)
@@ -1073,16 +1074,7 @@ def main():
 					print(
 						f"#{i + 1:<4} {r.get('score', 0):<7.1f} {n_price:<14} {t_price:<14} {rating_str:<12} {coords_str:<20} {title:<32} {r.get('url', '')}"
 					)
-			else:
-				print(
-					f"{'Rank':<5} {'Score':<7} {'Nightly':<14} {'Total Stay':<14} {'Rating':<8} {'Title'}"
-				)
-				print("-" * 80)
-				for i, r in enumerate(display_rows):
-					n_price = (
-						f"{r.get('currency', '')} ${r.get('nightly_price', 0):.2f}/nt"
-					)
-					t_price = f"{r.get('currency', '')} ${r.get('total_price', 0):.2f}"
+				else:
 					rating_str = f"★ {r.get('rating', 0):.2f}"
 					title = (r.get("name") or "")[:35]
 					print(

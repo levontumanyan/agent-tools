@@ -31,10 +31,12 @@ LOG_FILE = LOG_DIR / "app.log"
 # Reports path
 REPORTS_DIR = ROOT_DIR / "reports"
 
-# Ensure directories exist
-LISTING_CACHE.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+# Ensure directories exist (ignore read-only/sandbox permission errors)
+for _dir in (LISTING_CACHE, LOG_DIR, REPORTS_DIR):
+	try:
+		_dir.mkdir(parents=True, exist_ok=True)
+	except OSError:
+		pass
 
 # Test Data (for caching and integration tests)
 TEST_DATA_DIR = ROOT_DIR / "tests" / "data"

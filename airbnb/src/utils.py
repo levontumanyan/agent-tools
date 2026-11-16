@@ -1,7 +1,9 @@
 import json
 import logging
 import sys
+import tempfile
 import urllib.request
+from pathlib import Path
 
 from geopy.geocoders import Nominatim
 
@@ -35,11 +37,17 @@ def setup_logging(level=logging.WARNING, stream=sys.stdout):
 	console_handler.setFormatter(formatter)
 	logger.addHandler(console_handler)
 
-	# File Handler
-	file_handler = logging.FileHandler(LOG_FILE)
-	file_handler.setLevel(logging.DEBUG)
-	file_handler.setFormatter(formatter)
-	logger.addHandler(file_handler)
+	# File Handler (fall back to /tmp, or skip if filesystem is read-only)
+	for log_path in (LOG_FILE, Path(tempfile.gettempdir()) / "airbnb-app.log"):
+		try:
+			log_path.parent.mkdir(parents=True, exist_ok=True)
+			file_handler = logging.FileHandler(log_path)
+			file_handler.setLevel(logging.DEBUG)
+			file_handler.setFormatter(formatter)
+			logger.addHandler(file_handler)
+			break
+		except OSError:
+			continue
 
 	return logger
 

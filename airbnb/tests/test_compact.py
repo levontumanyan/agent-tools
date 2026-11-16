@@ -35,5 +35,10 @@ def test_format_coords():
 		_format_coords({"latitude": 11.25241, "longitude": -85.86892})
 		== "11.2524, -85.8689"
 	)
+	assert (
+		_format_coords({"latitude": "11.25241", "longitude": "-85.86892"})
+		== "11.2524, -85.8689"
+	)
+	assert _format_coords({"latitude": "bad", "longitude": -85.86892}) == "-"
 	assert _format_coords({}) == "-"
 	assert _format_coords(None) == "-"
