@@ -21,6 +21,7 @@ import urllib.request
 
 DEFAULT_REMOTE_URL = "https://fibonacci.tail8b9be7.ts.net:8765"
 DEFAULT_SSH_HOST = "fibonacci"
+REMOTE_TMUX_BIN = os.environ.get("AGY_REMOTE_TMUX", "/home/linuxbrew/.linuxbrew/bin/tmux")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -90,7 +91,7 @@ def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str) -> None:
 	"""Open a non-focus-stealing cmux terminal tab attached to the remote tmux worker."""
 	validate_task_id(task_id)
 	session = f"agy-{task_id}"
-	remote_cmd = f"tmux attach -t {shlex.quote(session)}"
+	remote_cmd = f"{shlex.quote(REMOTE_TMUX_BIN)} attach -t {shlex.quote(session)}"
 	cmd_str = f"ssh -t {shlex.quote(ssh_host)} {shlex.quote(remote_cmd)}"
 	short_id = task_id.replace("task-", "")[-6:]
 	tab_title = f"WORK | {short_id} | {label[:24]}"
@@ -150,7 +151,7 @@ def cmd_attach(args) -> None:
 		open_cmux_attach_tab(ssh_host, task_id, task_id)
 		return
 	session = f"agy-{task_id}"
-	os.execvp("ssh", ["ssh", "-t", ssh_host, "tmux", "attach", "-t", session])
+	os.execvp("ssh", ["ssh", "-t", ssh_host, REMOTE_TMUX_BIN, "attach", "-t", session])
 
 
 def cmd_status(args) -> None:

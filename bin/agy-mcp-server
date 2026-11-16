@@ -292,7 +292,7 @@ def _dispatch_task_impl(req: DispatchTaskRequest) -> dict[str, Any]:
 		"repo": req.repo,
 		"mode": mode,
 		"tmux_session": tmux_session,
-		"attach_cmd": f"ssh -t fibonacci tmux attach -t {tmux_session}",
+		"attach_cmd": f"ssh -t fibonacci {TMUX_BIN} attach -t {tmux_session}",
 		"status": "starting",
 	}
 
@@ -312,7 +312,7 @@ def _get_task_status_impl(task_id: str) -> dict[str, Any] | None:
 		data["pane_tail"] = tmux_capture_tail(session, lines=25)
 	if data.get("worktree_dir"):
 		data["transcript"] = read_live_transcript_info(data["worktree_dir"])
-	data["attach_cmd"] = f"ssh -t fibonacci tmux attach -t {session}"
+	data["attach_cmd"] = f"ssh -t fibonacci {TMUX_BIN} attach -t {session}"
 	return data
 
 
