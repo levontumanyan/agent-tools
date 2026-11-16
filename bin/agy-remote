@@ -92,7 +92,13 @@ def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str) -> None:
 	validate_task_id(task_id)
 	session = f"agy-{task_id}"
 	remote_cmd = f"{shlex.quote(REMOTE_TMUX_BIN)} attach -t {shlex.quote(session)}"
-	cmd_str = f"ssh -t {shlex.quote(ssh_host)} {shlex.quote(remote_cmd)}"
+	# Keepalive prevents NAT idle drops; trailing printf resets mouse/focus/color-scheme modes on unclean exit.
+	reset_seq = r"\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?2031l"
+	cmd_str = (
+		f"ssh -t -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "
+		f"{shlex.quote(ssh_host)} {shlex.quote(remote_cmd)}; "
+		f"printf '{reset_seq}'"
+	)
 	short_id = task_id.replace("task-", "")[-6:]
 	tab_title = f"WORK | {short_id} | {label[:24]}"
 
@@ -151,7 +157,15 @@ def cmd_attach(args) -> None:
 		open_cmux_attach_tab(ssh_host, task_id, task_id)
 		return
 	session = f"agy-{task_id}"
-	os.execvp("ssh", ["ssh", "-t", ssh_host, REMOTE_TMUX_BIN, "attach", "-t", session])
+	os.execvp(
+		"ssh",
+		[
+			"ssh", "-t",
+			"-o", "ServerAliveInterval=30",
+			"-o", "ServerAliveCountMax=3",
+			ssh_host, REMOTE_TMUX_BIN, "attach", "-t", session,
+		],
+	)
 
 
 def cmd_status(args) -> None:
