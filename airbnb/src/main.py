@@ -164,6 +164,25 @@ def run_survey(args, defaults, search_amenities, logger):
 		print(f"\nSurvey reports saved to:\n  CSV:  {csv_path}\n  JSON: {json_path}")
 
 
+_COMPACT_DROP_KEYS = {"review_evidence", "description", "reviews", "reviews_matched"}
+
+
+def compact_listing(item):
+	"""Return a compact copy of a listing dict without verbose text/review payloads."""
+	return {k: v for k, v in item.items() if k not in _COMPACT_DROP_KEYS}
+
+
+def _format_coords(coords):
+	"""Format a coordinates dict into a short 'lat, lng' string or '-'."""
+	if not isinstance(coords, dict):
+		return "-"
+	lat = coords.get("latitude")
+	lng = coords.get("longitude")
+	if lat is None or lng is None:
+		return "-"
+	return f"{lat:.4f}, {lng:.4f}"
+
+
 def main():
 	# Initial parser to check for verbose and json flags before logging setup
 	temp_parser = argparse.ArgumentParser(add_help=False)
@@ -295,6 +314,11 @@ def main():
 		"--json",
 		action="store_true",
 		help="Output JSON summary directly to stdout and suppress human-readable logging",
+	)
+	parser.add_argument(
+		"--compact",
+		action="store_true",
+		help="Compact output: omit verbose review evidence/descriptions in --json mode, or print all listings with coordinates in text mode",
 	)
 	parser.add_argument(
 		"--cookie",
@@ -533,7 +557,8 @@ def main():
 		}
 
 		if args.json:
-			print(json.dumps(payload, indent=2, ensure_ascii=False))
+			out_payload = compact_listing(payload) if args.compact else payload
+			print(json.dumps(out_payload, indent=2, ensure_ascii=False))
 		else:
 			print(f"\n# {title_str}")
 			if sub_title:
@@ -655,7 +680,7 @@ def main():
 				print(format_calendar_view(cal_data))
 			elif not (args.reviews or args.search_reviews):
 				print(
-					f'\n(Tip: pass --calendar to view availability, --reviews to list all {len(raw_reviews)} reviews)'
+					f"\n(Tip: pass --calendar to view availability, --reviews to list all {len(raw_reviews)} reviews)"
 				)
 		return
 
@@ -945,6 +970,7 @@ def main():
 					"currency": lp["currency"],
 					"bedrooms": details.get("bedrooms", 1),
 					"person_capacity": details.get("person_capacity", 2),
+					"coordinates": details.get("coordinates") or {},
 					"review_count": rating.get("review_count", 0),
 					"rating": rating.get("guest_satisfaction", 0),
 					"amenities": total_amenities,
@@ -1000,6 +1026,9 @@ def main():
 			except Exception:
 				final_listings = scored_results
 
+			if args.compact:
+				final_listings = [compact_listing(item) for item in final_listings]
+
 			output_payload = {
 				"location": args.location,
 				"check_in": args.check_in,
@@ -1019,19 +1048,46 @@ def main():
 			sorted_display = sorted(
 				scored_results, key=lambda x: x.get("score", 0), reverse=True
 			)
-			print(f"\nTop {min(10, len(sorted_display))} Scored Listings:")
-			print(
-				f"{'Rank':<5} {'Score':<7} {'Nightly':<14} {'Total Stay':<14} {'Rating':<8} {'Title'}"
+			display_rows = sorted_display if args.compact else sorted_display[:10]
+			header_label = (
+				f"\nAll {len(display_rows)} Scored Listings (Compact):"
+				if args.compact
+				else f"\nTop {len(display_rows)} Scored Listings:"
 			)
-			print("-" * 80)
-			for i, r in enumerate(sorted_display[:10]):
-				n_price = f"{r.get('currency', '')} ${r.get('nightly_price', 0):.2f}/nt"
-				t_price = f"{r.get('currency', '')} ${r.get('total_price', 0):.2f}"
-				rating_str = f"★ {r.get('rating', 0):.2f}"
-				title = (r.get("name") or "")[:35]
+			print(header_label)
+			if args.compact:
 				print(
-					f"#{i + 1:<4} {r.get('score', 0):<7.1f} {n_price:<14} {t_price:<14} {rating_str:<8} {title}"
+					f"{'Rank':<5} {'Score':<7} {'Nightly':<14} {'Total Stay':<14} {'Rating':<12} {'Coordinates':<20} {'Title':<32} {'URL'}"
 				)
+				print("-" * 135)
+				for i, r in enumerate(display_rows):
+					n_price = (
+						f"{r.get('currency', '')} ${r.get('nightly_price', 0):.2f}/nt"
+					)
+					t_price = f"{r.get('currency', '')} ${r.get('total_price', 0):.2f}"
+					rating_str = (
+						f"★{r.get('rating', 0):.2f} ({r.get('review_count', 0)})"
+					)
+					coords_str = _format_coords(r.get("coordinates"))
+					title = (r.get("name") or "").replace("\n", " ")[:30]
+					print(
+						f"#{i + 1:<4} {r.get('score', 0):<7.1f} {n_price:<14} {t_price:<14} {rating_str:<12} {coords_str:<20} {title:<32} {r.get('url', '')}"
+					)
+			else:
+				print(
+					f"{'Rank':<5} {'Score':<7} {'Nightly':<14} {'Total Stay':<14} {'Rating':<8} {'Title'}"
+				)
+				print("-" * 80)
+				for i, r in enumerate(display_rows):
+					n_price = (
+						f"{r.get('currency', '')} ${r.get('nightly_price', 0):.2f}/nt"
+					)
+					t_price = f"{r.get('currency', '')} ${r.get('total_price', 0):.2f}"
+					rating_str = f"★ {r.get('rating', 0):.2f}"
+					title = (r.get("name") or "")[:35]
+					print(
+						f"#{i + 1:<4} {r.get('score', 0):<7.1f} {n_price:<14} {t_price:<14} {rating_str:<8} {title}"
+					)
 			print("\n--- SUCCESS: Reports saved/merged ---")
 			print(f"CSV:  {csv_path}")
 			print(f"JSON: {json_path}")
