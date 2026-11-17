@@ -10,17 +10,24 @@
 
 import argparse
 import asyncio
+import base64
 import datetime
+import fcntl
+import hashlib
+import io
 import json
 import os
 import random
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
+import zipfile
 from typing import Any, Optional, Union
 from adblock import Engine, FilterSet
 from mcp.server.fastmcp import FastMCP
@@ -40,9 +47,205 @@ HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "
 CHROMIUM_APP_BIN = "/Applications/Chromium.app/Contents/MacOS/Chromium"
 DEFAULT_BROWSER_EXECUTABLE = CHROMIUM_APP_BIN if os.path.exists(CHROMIUM_APP_BIN) else None
 BROWSER_EXECUTABLE = os.environ.get("STEALTH_BROWSER_EXECUTABLE", DEFAULT_BROWSER_EXECUTABLE)
-APPLE_PASSWORDS_EXT = os.path.expanduser(
-	"~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Extensions/pejdijmoenmkgeppbflobdenhhabjlaj/3.4.0_0"
+APPLE_PASSWORDS_EXT_ID = "pejdijmoenmkgeppbflobdenhhabjlaj"
+APPLE_PASSWORDS_EXT_DIR = os.path.expanduser(
+	os.environ.get("STEALTH_BROWSER_EXTENSIONS_DIR", "~/.local/share/stealth-browser/extensions")
 )
+APPLE_PASSWORDS_CRX_URL = (
+	"https://clients2.google.com/service/update2/crx?response=redirect"
+	"&prodversion={prodversion}&acceptformat=crx2,crx3&x=id%3D{ext_id}%26uc"
+)
+APPLE_PASSWORDS_CRX_PRODVERSION = os.environ.get("STEALTH_BROWSER_CRX_PRODVERSION", "140.0.0.0")
+_ID_ALPHABET = "abcdefghijklmnop"
+_apple_passwords_ext_cache: Optional[str] = None
+
+
+def _extension_id_from_key(key_b64: str) -> str:
+	"""Derive the Chromium extension ID from a manifest `key` (SHA-256 of DER key, mapped 0-f -> a-p)."""
+	digest = hashlib.sha256(base64.b64decode(key_b64)).hexdigest()[:32]
+	return "".join(_ID_ALPHABET[int(chunk, 16)] for chunk in digest)
+
+
+def _read_extension_id(ext_dir: str) -> Optional[str]:
+	"""Return the extension ID declared by an unpacked extension, or None if unreadable."""
+	try:
+		with open(os.path.join(ext_dir, "manifest.json"), "r", encoding="utf-8") as f:
+			key = json.load(f).get("key")
+		return _extension_id_from_key(key) if key else None
+	except Exception:
+		return None
+
+
+def _cached_apple_passwords_ext() -> Optional[str]:
+	"""Return an already-extracted, identity-verified copy from the tool-owned extension cache."""
+	ext_root = os.path.join(APPLE_PASSWORDS_EXT_DIR, "apple-passwords")
+	if not os.path.isdir(ext_root):
+		return None
+	for entry in sorted(os.listdir(ext_root), reverse=True):
+		candidate = os.path.join(ext_root, entry)
+		if os.path.isfile(os.path.join(candidate, "manifest.json")) and _read_extension_id(candidate) == APPLE_PASSWORDS_EXT_ID:
+			return candidate
+	return None
+
+
+def _read_varint(data: bytes, offset: int) -> tuple:
+	result = 0
+	shift = 0
+	while True:
+		byte = data[offset]
+		offset += 1
+		result |= (byte & 0x7F) << shift
+		if not byte & 0x80:
+			return result, offset
+		shift += 7
+
+
+def _iter_protobuf_fields(data: bytes):
+	"""Yield (field_number, value) for a minimal protobuf message; only wire types 0/1/2/5."""
+	offset = 0
+	while offset < len(data):
+		tag, offset = _read_varint(data, offset)
+		field, wire = tag >> 3, tag & 7
+		if wire == 0:
+			value, offset = _read_varint(data, offset)
+		elif wire == 2:
+			length, offset = _read_varint(data, offset)
+			value, offset = data[offset:offset + length], offset + length
+		elif wire == 5:
+			value, offset = data[offset:offset + 4], offset + 4
+		elif wire == 1:
+			value, offset = data[offset:offset + 8], offset + 8
+		else:
+			raise ValueError(f"unsupported protobuf wire type {wire}")
+		if not isinstance(value, bytes):
+			continue
+		yield field, value
+
+
+def _crx_id_from_pubkey(pubkey: bytes) -> str:
+	digest = hashlib.sha256(pubkey).digest()[:16]
+	return "".join(_ID_ALPHABET[nibble] for byte in digest for nibble in (byte >> 4, byte & 0xF))
+
+
+def _rsa_sha256_verify(pubkey_der: bytes, message: bytes, signature: bytes) -> bool:
+	"""Verify an RSASSA-PKCS1-v1_5 SHA-256 signature via the openssl CLI (no extra Python deps)."""
+	with tempfile.TemporaryDirectory() as tmp:
+		pub_path = os.path.join(tmp, "pub.der")
+		sig_path = os.path.join(tmp, "sig.bin")
+		msg_path = os.path.join(tmp, "msg.bin")
+		for path, blob in ((pub_path, pubkey_der), (sig_path, signature), (msg_path, message)):
+			with open(path, "wb") as f:
+				f.write(blob)
+		proc = subprocess.run(
+			["openssl", "dgst", "-sha256", "-keyform", "DER", "-verify", pub_path, "-signature", sig_path, msg_path],
+			capture_output=True,
+			text=True,
+		)
+	return proc.returncode == 0 and "Verified OK" in proc.stdout
+
+
+def _verify_crx(data: bytes, expected_id: str) -> Optional[bytes]:
+	"""Parse a CRX3 container, verify its publisher-key signature, and return the zip payload.
+
+	Per Chromium's crx3.proto, each sha256_with_rsa proof (field 2) signs
+	"CRX3 SignedData\\0" + LE32(signed_header_data size) + signed_header_data (field 10000)
+	+ the zip archive. The publisher proof's public key must derive the expected ID.
+	"""
+	if data[:4] != b"Cr24":
+		raise ValueError("not a CRX container")
+	version = struct.unpack("<I", data[4:8])[0]
+	if version != 3:
+		raise ValueError(f"unsupported CRX version {version} (expected 3)")
+	header_size = struct.unpack("<I", data[8:12])[0]
+	header = data[12:12 + header_size]
+	payload = data[12 + header_size:]
+
+	signed_header_data = None
+	proofs = []
+	for field, value in _iter_protobuf_fields(header):
+		if field == 2:
+			proofs.append(value)
+		elif field == 10000:
+			signed_header_data = value
+	if signed_header_data is None:
+		raise ValueError("CRX header is missing signed_header_data")
+
+	message = (
+		b"CRX3 SignedData\x00"
+		+ struct.pack("<I", len(signed_header_data))
+		+ signed_header_data
+		+ payload
+	)
+	for proof in proofs:
+		pubkey = sig = None
+		for sub_field, value in _iter_protobuf_fields(proof):
+			if sub_field == 1:
+				pubkey = value
+			elif sub_field == 2:
+				sig = value
+		if not pubkey or not sig:
+			return None
+		if _crx_id_from_pubkey(pubkey) != expected_id:
+			continue  # not the publisher key we pin; keep looking
+		if not _rsa_sha256_verify(pubkey, message, sig):
+			return None
+		return payload
+	raise ValueError("no publisher signature for the expected extension ID in CRX header")
+
+
+def _download_apple_passwords_crx() -> Optional[bytes]:
+	url = APPLE_PASSWORDS_CRX_URL.format(
+		prodversion=APPLE_PASSWORDS_CRX_PRODVERSION, ext_id=APPLE_PASSWORDS_EXT_ID
+	)
+	try:
+		req = urllib.request.Request(url, headers={"User-Agent": f"Chromium/{APPLE_PASSWORDS_CRX_PRODVERSION}"})
+		with urllib.request.urlopen(req, timeout=15) as resp:
+			return resp.read()
+	except Exception as exc:
+		print(f"stealth-browser: Apple Passwords CRX download failed: {exc}", file=sys.stderr)
+		return None
+
+
+def _install_apple_passwords_ext() -> Optional[str]:
+	"""Fetch, identity-check, and unpack the Apple Passwords extension into the tool-owned cache dir."""
+	global _apple_passwords_ext_cache
+	cached = _cached_apple_passwords_ext()
+	if cached:
+		_apple_passwords_ext_cache = cached
+		return cached
+
+	data = _download_apple_passwords_crx()
+	if not data:
+		return None
+	try:
+		payload = _verify_crx(data, APPLE_PASSWORDS_EXT_ID)
+	except Exception as exc:
+		print(f"stealth-browser: Apple Passwords CRX rejected: {exc}", file=sys.stderr)
+		return None
+
+	ext_root = os.path.join(APPLE_PASSWORDS_EXT_DIR, "apple-passwords")
+	os.makedirs(ext_root, exist_ok=True)
+	staging = tempfile.mkdtemp(prefix=".staging-", dir=ext_root)
+	try:
+		with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+			archive.extractall(staging)
+		if _read_extension_id(staging) != APPLE_PASSWORDS_EXT_ID:
+			print("stealth-browser: Apple Passwords CRX failed identity check; ignoring", file=sys.stderr)
+			return None
+		with open(os.path.join(staging, "manifest.json"), "r", encoding="utf-8") as f:
+			version = json.load(f).get("version") or "unknown"
+		target = os.path.join(ext_root, version)
+		if os.path.exists(target):
+			shutil.rmtree(target, ignore_errors=True)
+		os.replace(staging, target)
+		_apple_passwords_ext_cache = target
+		return target
+	except Exception as exc:
+		print(f"stealth-browser: Apple Passwords install failed: {exc}", file=sys.stderr)
+		return None
+	finally:
+		if os.path.isdir(staging):
+			shutil.rmtree(staging, ignore_errors=True)
 
 MEDIA_RESOURCE_TYPES = {"image", "media", "font"}
 MEDIA_FILE_EXTENSIONS = (
@@ -53,7 +256,37 @@ MEDIA_FILE_EXTENSIONS = (
 CACHE_DIR = os.path.expanduser("~/.cache/stealth-browser")
 CACHE_FILE = os.path.join(CACHE_DIR, "easyprivacy.txt")
 CACHE_BIN_FILE = os.path.join(CACHE_DIR, "easyprivacy.bin")
+STATE_FILE = os.path.join(CACHE_DIR, f"state-{CDP_PORT}.json")
 EASYPRIVACY_URL = "https://easylist.to/easylist/easyprivacy.txt"
+
+
+def _load_persisted_headless() -> bool:
+	"""Return persisted headless preference if STEALTH_BROWSER_HEADLESS is not explicitly set."""
+	if "STEALTH_BROWSER_HEADLESS" in os.environ:
+		return HEADLESS
+	try:
+		if os.path.exists(STATE_FILE):
+			with open(STATE_FILE, "r", encoding="utf-8") as f:
+				data = json.load(f)
+			if isinstance(data.get("headless"), bool):
+				return data["headless"]
+	except Exception:
+		pass
+	return HEADLESS
+
+
+def _save_persisted_headless(headless: Optional[bool]) -> None:
+	"""Persist headless mode for crash recovery, or remove state file when None."""
+	try:
+		if headless is None:
+			if os.path.exists(STATE_FILE):
+				os.unlink(STATE_FILE)
+			return
+		os.makedirs(CACHE_DIR, exist_ok=True)
+		with open(STATE_FILE, "w", encoding="utf-8") as f:
+			json.dump({"headless": bool(headless)}, f)
+	except Exception:
+		pass
 
 _adblock_engine: Optional[Engine] = None
 _adblock_initialized: bool = False
@@ -176,7 +409,7 @@ class BrowserSessionManager:
 
 	def __init__(self, cdp_url: str):
 		self.cdp_url = cdp_url
-		self.headless: bool = HEADLESS
+		self.headless: bool = _load_persisted_headless()
 		self._playwright = None
 		self._browser: Optional[Browser] = None
 		self._context: Optional[BrowserContext] = None
@@ -272,6 +505,92 @@ class BrowserSessionManager:
 			pass
 		return None
 
+	async def _connect_cdp(self) -> Optional[BrowserContext]:
+		"""Attach to an already-running Chromium CDP endpoint and sync headless state."""
+		try:
+			self._browser = await self._playwright.chromium.connect_over_cdp(
+				self.cdp_url,
+				timeout=1500,
+			)
+			detected_headless = self._detect_cdp_headless()
+			if detected_headless is not None:
+				self.headless = detected_headless
+			if self._browser.contexts:
+				self._context = self._browser.contexts[0]
+				await self._ensure_interceptor(self._context)
+				return self._context
+		except Exception:
+			self._browser = None
+		return None
+
+	async def _launch_detached_chromium(self) -> None:
+		"""Launch standalone Chromium detached from the MCP server process so it survives restarts."""
+		os.makedirs(PROFILE_DIR, exist_ok=True)
+
+		# Ensure Apple Passwords native messaging manifest exists in agent profile
+		nm_hosts_dir = os.path.join(PROFILE_DIR, "NativeMessagingHosts")
+		os.makedirs(nm_hosts_dir, exist_ok=True)
+		nm_manifest = os.path.join(nm_hosts_dir, "com.apple.passwordmanager.json")
+		system_manifest = "/Library/Google/Chrome/NativeMessagingHosts/com.apple.passwordmanager.json"
+		if not os.path.exists(nm_manifest) and os.path.exists(system_manifest):
+			shutil.copy2(system_manifest, nm_manifest)
+
+		executable = BROWSER_EXECUTABLE or self._playwright.chromium.executable_path
+		browser_args = [
+			f"--remote-debugging-port={CDP_PORT}",
+			f"--user-data-dir={PROFILE_DIR}",
+			"--test-type",
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--disable-search-engine-choice-screen",
+			"--disable-sync",
+			"--disable-background-networking",
+			"--disable-background-timer-throttling",
+			"--disable-backgrounding-occluded-windows",
+			"--disable-renderer-backgrounding",
+			"--disable-prompt-on-repost",
+			"--use-mock-keychain",
+			"--disable-blink-features=AutomationControlled",
+		]
+		if self.headless:
+			browser_args.append("--headless=new")
+		# Resolve at launch so extension refreshes apply without restarting the MCP server
+		apple_passwords_ext = _apple_passwords_ext_cache
+		if not apple_passwords_ext:
+			os.makedirs(CACHE_DIR, exist_ok=True)
+			with open(os.path.join(CACHE_DIR, "apple-passwords-ext.lock"), "w", encoding="utf-8") as lock_file:
+				fcntl.flock(lock_file, fcntl.LOCK_EX)
+				try:
+					apple_passwords_ext = _install_apple_passwords_ext()
+				finally:
+					fcntl.flock(lock_file, fcntl.LOCK_UN)
+		if apple_passwords_ext:
+			browser_args.extend([
+				f"--disable-extensions-except={apple_passwords_ext}",
+				f"--load-extension={apple_passwords_ext}",
+			])
+
+		proc = subprocess.Popen(
+			[executable, *browser_args],
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+			start_new_session=True,
+		)
+
+		deadline = time.monotonic() + 5.0
+		while time.monotonic() < deadline:
+			if proc.poll() is not None:
+				raise RuntimeError(f"Detached Chromium exited early with code {proc.returncode}")
+			try:
+				with urllib.request.urlopen(f"{self.cdp_url}/json/version", timeout=0.3) as resp:
+					if resp.status == 200:
+						return
+			except Exception:
+				pass
+			await asyncio.sleep(0.05)
+		raise TimeoutError(f"Timed out waiting for Chromium CDP endpoint at {self.cdp_url}")
+
 	async def get_context(self) -> BrowserContext:
 		self._touch_activity()
 		if self._playwright is None:
@@ -292,85 +611,28 @@ class BrowserSessionManager:
 				self._context = None
 				self._browser = None
 
-		# 1. Try attaching to existing CDP session (e.g., if launched on port 9222)
-		try:
-			self._browser = await self._playwright.chromium.connect_over_cdp(
-				self.cdp_url,
-				timeout=1500,
-			)
-			detected_headless = self._detect_cdp_headless()
-			if detected_headless is not None:
-				self.headless = detected_headless
-			if self._browser.contexts:
-				self._context = self._browser.contexts[0]
-				await self._ensure_interceptor(self._context)
-				return self._context
-		except Exception:
-			self._browser = None
+		# 1. Try attaching to existing CDP session (e.g., detached Chromium on CDP_PORT)
+		ctx = await self._connect_cdp()
+		if ctx is not None:
+			return ctx
 
-		# 2. Launch dedicated standalone stealth Chromium with CDP remote debugging port enabled
-		os.makedirs(PROFILE_DIR, exist_ok=True)
+		# 2. Launch detached standalone stealth Chromium under a file lock to prevent startup races
+		os.makedirs(CACHE_DIR, exist_ok=True)
+		lock_path = os.path.join(CACHE_DIR, f"launch-{CDP_PORT}.lock")
+		with open(lock_path, "w", encoding="utf-8") as lock_file:
+			fcntl.flock(lock_file, fcntl.LOCK_EX)
+			try:
+				ctx = await self._connect_cdp()
+				if ctx is not None:
+					return ctx
+				await self._launch_detached_chromium()
+				ctx = await self._connect_cdp()
+				if ctx is not None:
+					return ctx
+			finally:
+				fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-		# Ensure Apple Passwords native messaging manifest exists in agent profile
-		nm_hosts_dir = os.path.join(PROFILE_DIR, "NativeMessagingHosts")
-		os.makedirs(nm_hosts_dir, exist_ok=True)
-		nm_manifest = os.path.join(nm_hosts_dir, "com.apple.passwordmanager.json")
-		system_manifest = "/Library/Google/Chrome/NativeMessagingHosts/com.apple.passwordmanager.json"
-		if not os.path.exists(nm_manifest) and os.path.exists(system_manifest):
-			shutil.copy2(system_manifest, nm_manifest)
-
-		browser_args = [
-			"--test-type",
-			f"--remote-debugging-port={CDP_PORT}",
-		]
-		if os.path.exists(APPLE_PASSWORDS_EXT):
-			browser_args.extend([
-				f"--disable-extensions-except={APPLE_PASSWORDS_EXT}",
-				f"--load-extension={APPLE_PASSWORDS_EXT}",
-			])
-
-		try:
-			self._context = await self._playwright.chromium.launch_persistent_context(
-				user_data_dir=PROFILE_DIR,
-				executable_path=BROWSER_EXECUTABLE,
-				headless=self.headless,
-				no_viewport=True,
-				downloads_path=DOWNLOADS_DIR,
-				args=browser_args,
-				ignore_default_args=["--no-sandbox"],
-			)
-		except Exception as exc:
-			if "Opening in existing browser session" in str(exc) or "already in use" in str(exc):
-				# The browser might be in the middle of launching; retry connecting over CDP
-				for _ in range(3):
-					await asyncio.sleep(0.5)
-					try:
-						self._browser = await self._playwright.chromium.connect_over_cdp(
-							self.cdp_url,
-							timeout=1500,
-						)
-						if self._browser.contexts:
-							self._context = self._browser.contexts[0]
-							await self._ensure_interceptor(self._context)
-							return self._context
-					except Exception:
-						pass
-
-				fallback_dir = f"{PROFILE_DIR}-{os.getpid()}"
-				os.makedirs(fallback_dir, exist_ok=True)
-				self._context = await self._playwright.chromium.launch_persistent_context(
-					user_data_dir=fallback_dir,
-					executable_path=BROWSER_EXECUTABLE,
-					headless=self.headless,
-					no_viewport=True,
-					downloads_path=DOWNLOADS_DIR,
-					args=browser_args,
-					ignore_default_args=["--no-sandbox"],
-				)
-			else:
-				raise
-		await self._ensure_interceptor(self._context)
-		return self._context
+		raise RuntimeError(f"Failed to connect to Chromium CDP endpoint at {self.cdp_url}")
 
 	async def _configure_native_downloads(self, context: BrowserContext, page: Optional[Page] = None):
 		"""Override Playwright's allowAndName download interception with native Chromium downloads."""
@@ -1462,6 +1724,12 @@ def _force_kill_browser_processes():
 async def close_browser(force_kill: bool = True) -> str:
 	"""Completely close the browser window, terminate all browser and renderer processes, and release all resources."""
 	try:
+		if session._browser is not None and session._browser.is_connected():
+			try:
+				cdp = await session._browser.new_browser_cdp_session()
+				await cdp.send("Browser.close")
+			except Exception:
+				pass
 		if session._context is not None:
 			try:
 				await session._context.close()
@@ -1473,6 +1741,7 @@ async def close_browser(force_kill: bool = True) -> str:
 			except Exception:
 				pass
 		await session.close()
+		_save_persisted_headless(None)
 		if force_kill:
 			_force_kill_browser_processes()
 		return "Browser completely closed and all resources released."
@@ -1519,6 +1788,7 @@ async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = 
 			session.headless = bool(headless)
 
 		await close_browser(force_kill=True)
+		_save_persisted_headless(session.headless)
 		# Allow OS kernel and filesystem locks on PROFILE_DIR to settle cleanly
 		await asyncio.sleep(0.3)
 		page = await session.get_active_page()
