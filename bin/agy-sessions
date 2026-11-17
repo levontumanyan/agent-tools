@@ -13,10 +13,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import textwrap
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -808,6 +810,248 @@ def get_tty_idle_sec(tty: str) -> float:
 		return float("inf")
 
 
+def _clean_recap_text(text: str, limit: int) -> str:
+	"""Strip XML wrappers and markdown noise, then condense to limit chars at a word boundary."""
+	if not text:
+		return ""
+	text = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", " ", text, flags=re.S)
+	text = re.sub(r"</?(?:USER_REQUEST|SYSTEM_MESSAGE|ADDITIONAL_METADATA)>", " ", text)
+	text = re.sub(r"[#*`>]+", " ", text)
+	cleaned = " ".join(text.split())
+	if len(cleaned) <= limit:
+		return cleaned
+	cut = cleaned[: limit - 1].rsplit(" ", 1)[0]
+	return (cut if len(cut) > limit // 2 else cleaned[: limit - 1]).rstrip() + "…"
+
+
+def _format_local_ts(iso_str: str) -> str:
+	"""Format an ISO timestamp into a short local time string."""
+	if not iso_str:
+		return ""
+	try:
+		dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone()
+		return dt.strftime("%Y-%m-%d %H:%M")
+	except Exception:
+		return ""
+
+
+def get_session_recap(cid: str) -> dict:
+	"""Collect DB metadata, first/last user prompts, last assistant reply, and activity stats."""
+	recap = {
+		"first_user": "",
+		"last_user": "",
+		"last_agent": "",
+		"user_turns": 0,
+		"tool_count": 0,
+		"top_tools": [],
+		"step_count": 0,
+		"last_active": "",
+	}
+	if not cid:
+		return recap
+
+	if SUMMARIES_DB.exists():
+		try:
+			conn = sqlite3.connect(str(SUMMARIES_DB))
+			row = conn.execute(
+				"SELECT step_count, last_modified_time FROM conversation_summaries WHERE conversation_id=?",
+				(cid,),
+			).fetchone()
+			conn.close()
+			if row:
+				recap["step_count"] = row[0] or 0
+				recap["last_active"] = _format_local_ts(row[1] or "")
+		except Exception:
+			pass
+
+	t_path = AGY_DIR / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+	if not t_path.exists():
+		return recap
+
+	tool_counts: dict[str, int] = {}
+
+	def _consume_step(raw_line: bytes, capture_first_only: bool = False) -> None:
+		line = raw_line.decode("utf-8", errors="replace").strip()
+		if not line:
+			return
+		try:
+			step = json.loads(line)
+		except json.JSONDecodeError:
+			return
+		stype = step.get("type", "")
+		content = step.get("content") or ""
+		if stype == "USER_INPUT" and content:
+			cleaned = _clean_recap_text(content, 240)
+			if not recap["first_user"]:
+				recap["first_user"] = cleaned
+			if not capture_first_only:
+				recap["last_user"] = cleaned
+				recap["user_turns"] += 1
+		elif not capture_first_only:
+			if stype == "PLANNER_RESPONSE" and content:
+				recap["last_agent"] = _clean_recap_text(content, 480)
+			for tc in step.get("tool_calls") or []:
+				if isinstance(tc, dict):
+					tname = tc.get("name") or tc.get("function", {}).get("name") or "tool"
+					tool_counts[tname] = tool_counts.get(tname, 0) + 1
+					recap["tool_count"] += 1
+
+	try:
+		size = t_path.stat().st_size
+		with t_path.open("rb") as f:
+			if size <= 524288:
+				for raw in f:
+					_consume_step(raw)
+			else:
+				# Head pass for first prompt
+				for raw in f:
+					_consume_step(raw, capture_first_only=True)
+					if recap["first_user"] or f.tell() > 65536:
+						break
+				# Tail pass for recent turns/reply
+				f.seek(size - 262144)
+				f.readline()
+				for raw in f:
+					_consume_step(raw)
+		if tool_counts:
+			top = sorted(tool_counts.items(), key=lambda x: (-x[1], x[0]))[:4]
+			recap["top_tools"] = [f"{name} ({cnt})" for name, cnt in top]
+	except OSError:
+		pass
+	return recap
+
+
+def get_cmux_env(pid: int) -> tuple[str, str]:
+	"""Inspect process environment via ps eww to extract CMUX_SURFACE_ID and CMUX_SOCKET_PATH."""
+	try:
+		out = subprocess.check_output(
+			["ps", "eww", "-o", "command=", "-p", str(pid)],
+			text=True,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception:
+		return "", ""
+	surf_m = re.search(r"(?:^|\s)CMUX_SURFACE_ID=([^\s]+)", out)
+	sock_m = re.search(r"(?:^|\s)CMUX_SOCKET_PATH=([^\s]+)", out)
+	return (surf_m.group(1) if surf_m else ""), (sock_m.group(1) if sock_m else "")
+
+
+def resolve_cmux_bin() -> str:
+	"""Locate the cmux CLI binary."""
+	found = shutil.which("cmux")
+	if found:
+		return found
+	bundled = Path("/Applications/cmux.app/Contents/Resources/bin/cmux")
+	return str(bundled) if bundled.exists() else ""
+
+
+def graceful_exit_agy(pid: int) -> tuple[str, str, str]:
+	"""
+	Prefer a clean /exit via cmux send so agy exits with status 0 instead of
+	printing 'CLI error: program was killed: program was interrupted'.
+	Falls back to SIGINT if not running in cmux or if /exit does not complete.
+	Returns (method, surface_id, socket_path).
+	"""
+	surface_id, socket_path = get_cmux_env(pid)
+	cmux_bin = resolve_cmux_bin() if surface_id else ""
+	if surface_id and cmux_bin:
+		cmd = [cmux_bin]
+		if socket_path:
+			cmd.extend(["--socket", socket_path])
+		cmd.extend(["send", "--surface", surface_id, "/exit\n"])
+		try:
+			res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+			if res.returncode == 0:
+				for _ in range(25):
+					time.sleep(0.1)
+					try:
+						os.kill(pid, 0)
+					except ProcessLookupError:
+						return "cmux:/exit", surface_id, socket_path
+		except Exception:
+			pass
+
+	os.kill(pid, signal.SIGINT)
+	return "SIGINT", surface_id, socket_path
+
+
+def _wrap_field(label: str, text: str, width: int = 84) -> list[str]:
+	"""Format a labeled recap field with clean wrapped continuation lines."""
+	wrapped = textwrap.wrap(text, width=width) or [text]
+	out = [f"  \033[1;34m{label:<13}\033[0m {wrapped[0]}"]
+	pad = " " * 16
+	for cont in wrapped[1:]:
+		out.append(f"{pad}{cont}")
+	return out
+
+
+def write_tty_recap(
+	tty: str,
+	cid: str,
+	title: str,
+	cwd: str,
+	idle_hr: float,
+	recap: dict,
+	surface_id: str = "",
+	socket_path: str = "",
+) -> None:
+	"""Write a detailed session summary report to the tab's TTY after agy exits."""
+	if not tty or not os.path.exists(tty):
+		return
+	short_cwd = cwd.replace(str(Path.home()), "~") if cwd else ""
+	rule = "\033[2m" + ("─" * 72) + "\033[0m"
+	lines = [
+		"",
+		rule,
+		f"\033[1;36m[agy-sessions]\033[0m \033[1mSession Culled\033[0m ({idle_hr:.1f}h idle)",
+	]
+	if title:
+		lines.append(f"  \033[1;34m{'Title:':<13}\033[0m \033[1m{title}\033[0m")
+	if short_cwd:
+		lines.append(f"  \033[1;34m{'Directory:':<13}\033[0m {short_cwd}")
+
+	stats = []
+	if recap.get("user_turns"):
+		stats.append(f"{recap['user_turns']} turns")
+	if recap.get("step_count"):
+		stats.append(f"{recap['step_count']} steps")
+	if recap.get("tool_count"):
+		stats.append(f"{recap['tool_count']} tool calls")
+	if recap.get("last_active"):
+		stats.append(f"last active {recap['last_active']}")
+	if stats:
+		lines.append(f"  \033[1;34m{'Activity:':<13}\033[0m {' · '.join(stats)}")
+	if recap.get("top_tools"):
+		lines.append(f"  \033[1;34m{'Tools:':<13}\033[0m {', '.join(recap['top_tools'])}")
+
+	first_user = recap.get("first_user", "")
+	last_user = recap.get("last_user", "")
+	if first_user:
+		lines.extend(_wrap_field("First Prompt:", first_user))
+	if last_user and last_user != first_user:
+		lines.extend(_wrap_field("Last Prompt:", last_user))
+	if recap.get("last_agent"):
+		lines.extend(_wrap_field("Last Answer:", recap["last_agent"]))
+
+	lines.append(f"  \033[1;34m{'Resume:':<13}\033[0m \033[32magy --conversation={cid}\033[0m")
+	lines.append(rule)
+	lines.append("")
+	try:
+		with open(tty, "w", encoding="utf-8", errors="replace") as tf:
+			tf.write("\r\n".join(lines) + "\r\n")
+	except OSError:
+		return
+
+	if surface_id:
+		cmux_bin = resolve_cmux_bin()
+		if cmux_bin:
+			cmd = [cmux_bin]
+			if socket_path:
+				cmd.extend(["--socket", socket_path])
+			cmd.extend(["send-key", "--surface", surface_id, "enter"])
+			subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+
+
 def cmd_cull(args: argparse.Namespace) -> int:
 	"""
 	Gracefully close agy sessions that have been idle for more than --hours (default: 6h).
@@ -821,7 +1065,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 	  * tty_idle: time since last keystroke / output in the terminal tab
 	  A session is only culled if ALL THREE indicate inactivity for > --hours.
 	"""
-	tty_to_agy, _, _, pid_to_cid = get_live_processes()
+	tty_to_agy, _, pid_to_cwd, pid_to_cid = get_live_processes()
 	if not pid_to_cid:
 		if not args.quiet:
 			print("No live agy sessions found.")
@@ -874,7 +1118,8 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		stats.append((pid, cid, title, conv_idle_sec / 3600.0, proc_elapsed_sec / 3600.0, tty_idle_sec / 3600.0, idle_hr))
 
 		if idle_sec >= threshold_sec:
-			candidates.append((pid, cid, title, idle_hr))
+			cwd = pid_to_cwd.get(pid_str, "")
+			candidates.append((pid, cid, title, idle_hr, tty, cwd))
 
 	if conn:
 		conn.close()
@@ -897,18 +1142,19 @@ def cmd_cull(args: argparse.Namespace) -> int:
 	# First, save current state so every culled session's tab and CID is recorded in iterm-sessions.json
 	cmd_save(argparse.Namespace(quiet=True))
 
+	culled_sessions = []
 	print(f"Found {len(candidates)} session(s) idle for > {args.hours:g}h {'[DRY-RUN]' if args.dry_run else ''}:")
-	for pid, cid, title, idle_hr in candidates:
+	for pid, cid, title, idle_hr, tty, cwd in candidates:
 		title_disp = f"'{title}'" if title else cid
 		if args.dry_run:
 			print(f"  [DRY-RUN] Would cull PID {pid} (idle {idle_hr:.1f}h): {title_disp}")
 		else:
 			try:
-				# SIGINT instructs agy to cleanly exit its input loop, flush DB, print resume command, and drop to shell
-				os.kill(pid, signal.SIGINT)
-				print(f"  \033[1;33m[CULLED]\033[0m Closed idle agy (PID {pid}, idle {idle_hr:.1f}h): {title_disp} (tab remains open)")
+				method, surface_id, socket_path = graceful_exit_agy(pid)
+				print(f"  \033[1;33m[CULLED]\033[0m Closed idle agy (PID {pid}, idle {idle_hr:.1f}h, via {method}): {title_disp} (tab remains open)")
 				culled_count += 1
 				signaled_pids.add(pid)
+				culled_sessions.append((pid, cid, title, idle_hr, tty, cwd, surface_id, socket_path))
 			except ProcessLookupError:
 				pass
 			except Exception as e:
@@ -927,6 +1173,9 @@ def cmd_cull(args: argparse.Namespace) -> int:
 					continue
 			if not still_running:
 				break
+		time.sleep(0.25)
+		for pid, cid, title, idle_hr, tty, cwd, surface_id, socket_path in culled_sessions:
+			write_tty_recap(tty, cid, title, cwd, idle_hr, get_session_recap(cid), surface_id, socket_path)
 		cmd_save(argparse.Namespace(quiet=True))
 		print(f"\nSuccessfully culled {culled_count} idle session(s). Tabs remain open with resume command ready.")
 	return 0
