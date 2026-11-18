@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -339,6 +340,29 @@ def graceful_exit_opencode(pid: int, tty: str) -> str:
 	return "SIGTERM"
 
 
+def get_cmux_env(pid: int) -> tuple[str, str]:
+	"""Inspect process environment via ps eww for CMUX_SURFACE_ID / CMUX_SOCKET_PATH."""
+	try:
+		out = subprocess.check_output(
+			["ps", "eww", "-o", "command=", "-p", str(pid)],
+			text=True,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception:
+		return "", ""
+	surf_m = re.search(r"(?:^|\s)CMUX_SURFACE_ID=([^\s]+)", out)
+	sock_m = re.search(r"(?:^|\s)CMUX_SOCKET_PATH=([^\s]+)", out)
+	return (surf_m.group(1) if surf_m else ""), (sock_m.group(1) if sock_m else "")
+
+
+def resolve_cmux_bin() -> str:
+	found = shutil.which("cmux")
+	if found:
+		return found
+	bundled = Path("/Applications/cmux.app/Contents/Resources/bin/cmux")
+	return str(bundled) if bundled.exists() else ""
+
+
 def _wrap_field(label: str, text: str, width: int = 84) -> list[str]:
 	wrapped = textwrap.wrap(text, width=width) or [text]
 	out = [f"  \033[1;34m{label:<13}\033[0m {wrapped[0]}"]
@@ -347,7 +371,7 @@ def _wrap_field(label: str, text: str, width: int = 84) -> list[str]:
 	return out
 
 
-def write_tty_recap(tty: str, proc: dict, idle_hr: float, recap: dict) -> None:
+def write_tty_recap(tty: str, proc: dict, idle_hr: float, recap: dict, surface_id: str = "", socket_path: str = "") -> None:
 	"""Write the session summary into the tab's TTY after the TUI exits."""
 	ses = proc.get("session") or {}
 	if not tty or not os.path.exists(tty):
@@ -401,6 +425,18 @@ def write_tty_recap(tty: str, proc: dict, idle_hr: float, recap: dict) -> None:
 			tf.write("\r\n".join(lines) + "\r\n")
 	except OSError:
 		return
+
+	# The cursor now sits below the recap while the shell prompt above is stale.
+	# A fresh Enter re-prompts; cmux send-key is the only portable injection
+	# available (TIOCSTI is denied on macOS). Best-effort, cmux-optional.
+	if surface_id:
+		cmux_bin = resolve_cmux_bin()
+		if cmux_bin:
+			cmd = [cmux_bin]
+			if socket_path:
+				cmd.extend(["--socket", socket_path])
+			cmd.extend(["send-key", "--surface", surface_id, "enter"])
+			subprocess.run(cmd, capture_output=True, text=True, timeout=5)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -518,6 +554,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		if args.dry_run:
 			print(f"  [DRY-RUN] Would cull PID {proc['pid']} (idle {idle_hr:.1f}h): {title_disp}")
 			continue
+		proc["surface_id"], proc["socket_path"] = get_cmux_env(proc["pid"])
 		method = graceful_exit_opencode(proc["pid"], proc["tty"])
 		print(f"  \033[1;33m[CULLED]\033[0m Closed idle opencode (PID {proc['pid']}, idle {idle_hr:.1f}h, via {method}): {title_disp}")
 		culled.append((proc, idle_hr))
@@ -526,7 +563,14 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		time.sleep(0.5)
 		for proc, idle_hr in culled:
 			recap = get_recap(cur, (proc.get("session") or {}).get("id", ""))
-			write_tty_recap(proc["tty"], proc, idle_hr, recap)
+			write_tty_recap(
+				proc["tty"],
+				proc,
+				idle_hr,
+				recap,
+				proc.get("surface_id", ""),
+				proc.get("socket_path", ""),
+			)
 		if not args.quiet:
 			print(f"\nSuccessfully culled {len(culled)} idle session(s). Tabs remain open with resume command ready.")
 	cur.close()
