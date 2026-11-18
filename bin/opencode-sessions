@@ -252,36 +252,35 @@ def get_recap(cur: sqlite3.Cursor, sid: str) -> dict:
 	if not sid:
 		return recap
 
-	def _text_part(data: str) -> str:
+	def _extract(kind: str, data: str, limit: int) -> str:
 		try:
 			obj = json.loads(data)
 		except Exception:
 			return ""
-		if obj.get("type") == "user":
-			return _clean_text(obj.get("text", ""))
-		if obj.get("type") == "assistant":
+		if kind == "user":
+			return _clean_text(obj.get("text", ""), limit)
+		if kind == "assistant":
 			parts = [
 				p.get("text", "")
 				for p in obj.get("content", [])
 				if isinstance(p, dict) and p.get("type") == "text"
 			]
-			return _clean_text(" ".join(parts))
+			return _clean_text(" ".join(parts), limit)
 		return ""
 
 	try:
-		for dtype, order in (("user", "ASC"), ("user", "DESC")):
-			row = cur.execute(
-				"SELECT data FROM session_message WHERE session_id = ? AND type = ? ORDER BY seq "
-				+ order
-				+ " LIMIT 1",
-				(sid, dtype),
-			).fetchone()
-			if row:
-				text = _text_part(row[0])
-				if order == "ASC":
-					recap["first_user"] = text
-				else:
-					recap["last_user"] = text
+		row = cur.execute(
+			"SELECT data FROM session_message WHERE session_id = ? AND type = 'user' ORDER BY seq ASC LIMIT 1",
+			(sid,),
+		).fetchone()
+		if row:
+			recap["first_user"] = _extract("user", row[0], 240)
+		row = cur.execute(
+			"SELECT data FROM session_message WHERE session_id = ? AND type = 'user' ORDER BY seq DESC LIMIT 1",
+			(sid,),
+		).fetchone()
+		if row:
+			recap["last_user"] = _extract("user", row[0], 240)
 		recap["turns"] = cur.execute(
 			"SELECT COUNT(*) FROM session_message WHERE session_id = ? AND type = 'user'",
 			(sid,),
@@ -292,7 +291,7 @@ def get_recap(cur: sqlite3.Cursor, sid: str) -> dict:
 			(sid,),
 		).fetchone()
 		if row:
-			recap["last_agent"] = _text_part(row[0])
+			recap["last_agent"] = _extract("assistant", row[0], 480)
 	except Exception:
 		pass
 	return recap
@@ -318,21 +317,11 @@ def _format_ts(ms: int) -> str:
 
 
 def graceful_exit_opencode(pid: int, tty: str) -> str:
-	"""Quit the TUI: ctrl+c to the tty (twice), then SIGINT, then SIGTERM."""
-	for attempt in ("tty-ctrl-c", "tty-ctrl-c-2"):
-		if tty and os.path.exists(tty):
-			try:
-				with open(tty, "w", encoding="utf-8", errors="replace") as tf:
-					tf.write("\x03")
-					tf.flush()
-			except OSError:
-				pass
-		for _ in range(20):
-			time.sleep(0.1)
-			try:
-				os.kill(pid, 0)
-			except ProcessLookupError:
-				return attempt
+	"""Quit the TUI: SIGINT (clean for opencode, session persists), SIGTERM fallback.
+
+	Note: writing \\x03 to the tty does NOT quit opencode's raw-mode TUI (it is
+	consumed as an input byte), so go straight to SIGINT.
+	"""
 	try:
 		os.kill(pid, signal.SIGINT)
 	except ProcessLookupError:
@@ -378,6 +367,12 @@ def write_tty_recap(tty: str, proc: dict, idle_hr: float, recap: dict) -> None:
 	stats = []
 	if recap.get("turns"):
 		stats.append(f"{recap['turns']} turns")
+	if ses.get("model"):
+		try:
+			model = json.loads(ses["model"])
+			stats.append(f"{model.get('id', '?')}#{model.get('variant', '')}" if model.get("variant") else model.get("id", "?"))
+		except Exception:
+			pass
 	tok_in = ses.get("tokens_in") or 0
 	tok_out = ses.get("tokens_out") or 0
 	if tok_in or tok_out:
