@@ -411,6 +411,9 @@ def write_tty_recap(tty: str, proc: dict, idle_hr: float, recap: dict) -> None:
 def cmd_status(args: argparse.Namespace) -> int:
 	procs = get_live_processes()
 	if not procs:
+		if args.json:
+			print(json.dumps({"captured_at": _format_ts(_now_ms()), "sessions": []}))
+			return 0
 		print("No live opencode TUI sessions found.")
 		return 0
 	cur = db_readonly()
@@ -419,8 +422,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 		return 1
 	attribute_sessions(cur, procs)
 	now_ms = _now_ms()
-	print(f"{'PID':<7} | {'Conv':<9} | {'Proc':<9} | {'TTY':<9} | {'Eff':<9} | Session")
-	print("-" * 84)
+	rows = []
 	for proc in procs:
 		ses = proc.get("session") or {}
 		conv_hr = (
@@ -429,12 +431,31 @@ def cmd_status(args: argparse.Namespace) -> int:
 		proc_hr = proc["elapsed_sec"] / 3600 if proc["elapsed_sec"] != float("inf") else float("inf")
 		tty_hr = get_tty_idle_sec(proc["tty"]) / 3600
 		eff = min(conv_hr, proc_hr, tty_hr)
-		label = f"{ses.get('title') or ses.get('id', '?')}"
-		if ses and not ses.get("certain"):
-			label += " (?)"
-		print(
-			f"{proc['pid']:<7} | {conv_hr:5.1f}h | {proc_hr:5.1f}h | {tty_hr:5.1f}h | {eff:5.1f}h | {label}"
-		)
+		rows.append({
+			"pid": proc["pid"],
+			"tty": proc["tty"],
+			"cwd": proc["cwd"],
+			"argv_sid": proc["argv_sid"],
+			"session_id": ses.get("id", ""),
+			"session_title": ses.get("title", ""),
+			"certain": bool(ses.get("certain")),
+			"conv_idle_hr": round(conv_hr, 2),
+			"proc_idle_hr": round(proc_hr, 2),
+			"tty_idle_hr": round(tty_hr, 2),
+			"eff_idle_hr": round(eff, 2),
+		})
+	if args.json:
+		print(json.dumps({"captured_at": _format_ts(_now_ms()), "sessions": rows}, indent=2))
+	else:
+		print(f"{'PID':<7} | {'Conv':<9} | {'Proc':<9} | {'TTY':<9} | {'Eff':<9} | Session")
+		print("-" * 84)
+		for row in rows:
+			label = row["session_title"] or row["session_id"] or "?"
+			if not row["certain"] and row["session_id"]:
+				label += " (?)"
+			print(
+				f"{row['pid']:<7} | {row['conv_idle_hr']:5.1f}h | {row['proc_idle_hr']:5.1f}h | {row['tty_idle_hr']:5.1f}h | {row['eff_idle_hr']:5.1f}h | {label}"
+			)
 	cur.close()
 	return 0
 
@@ -525,6 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
 	sub = parser.add_subparsers(dest="subcommand", required=True)
 
 	p_status = sub.add_parser("status", help="Show live opencode TUIs with idle breakdown")
+	p_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 	p_status.add_argument("-q", "--quiet", action="store_true", help="Suppress output")
 	p_status.set_defaults(func=cmd_status)
 
