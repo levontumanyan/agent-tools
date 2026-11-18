@@ -24,6 +24,7 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
 | [`stealth-browser`](bin/stealth-browser) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in standalone stealth Chromium or via CDP. |
 | [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, auto-restore, and gracefully cull stale (>6h) `agy` sessions in iTerm2 while keeping tabs open. |
+| [`opencode-sessions`](bin/opencode-sessions) | CLI | Any terminal (macOS) | Inspect and gracefully cull idle (>2h) `opencode` TUI sessions; terminal-agnostic, writes recap + resume command into the tab. |
 | [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
 | [`airbnb`](airbnb/) | CLI | Airbnb API + Climate/Sentiment Engine | Search, score, and benchmark listings against nomad criteria (Wi-Fi, kitchen, climate/heating, noise, discounts). |
 | [`download-video`](bin/download-video) | CLI | yt-dlp + gallery-dl + Apple Vision OCR | Download Instagram reels/stories and YouTube videos/shorts to Google Drive, transcode to WhatsApp-native H.264/AAC MP4, extract frame OCR/hashtags, and embed metadata. |
