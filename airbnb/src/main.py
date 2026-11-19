@@ -449,16 +449,15 @@ def main():
 			check_in=args.check_in,
 			check_out=args.check_out,
 		)
-		lp = details.get(
-			"exact_price",
-			{
+		lp = details.get("exact_price")
+		if not lp:
+			lp = {
 				"amount": 0,
 				"orig_amount": 0,
 				"discount_pct": 0.0,
 				"nightly": 0,
 				"currency": args.currency,
-			},
-		)
+			}
 		details["price"] = lp
 		wifi_info = scorer.detect_fast_wifi(details)
 		review_evidence = scorer.extract_review_evidence(details)
@@ -930,16 +929,27 @@ def main():
 				len(cat.get("values", [])) for cat in details.get("amenities", [])
 			)
 
-			lp = details.get("exact_price") or listing_prices.get(
-				listing_id,
-				{
-					"amount": 0,
-					"orig_amount": 0,
-					"discount_pct": 0.0,
-					"nightly": 0,
-					"currency": args.currency,
-				},
-			)
+			exact = details.get("exact_price")
+			exact_error = details.get("exact_price_error")
+			if exact:
+				details["price_source"] = "pdp_exact"
+				lp = exact
+			else:
+				if exact_error:
+					logger.warning(
+						f"Listing {listing_id}: exact checkout price unavailable ({exact_error}); using search-API estimate"
+					)
+				details["price_source"] = "search_estimate"
+				lp = listing_prices.get(
+					listing_id,
+					{
+						"amount": 0,
+						"orig_amount": 0,
+						"discount_pct": 0.0,
+						"nightly": 0,
+						"currency": args.currency,
+					},
+				)
 			details["price"] = lp
 
 			wifi_info = scorer.detect_fast_wifi(details)
@@ -965,6 +975,7 @@ def main():
 					"orig_price": lp.get("orig_amount", lp["amount"]),
 					"discount_pct": lp.get("discount_pct", 0.0),
 					"currency": lp["currency"],
+					"price_source": details.get("price_source"),
 					"bedrooms": details.get("bedrooms", 1),
 					"person_capacity": details.get("person_capacity", 2),
 					"coordinates": details.get("coordinates") or {},

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -408,16 +408,16 @@ wheels = [
 
 [[package]]
 name = "pyairbnb"
-version = "2.2.1"
+version = "2.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "bs4" },
     { name = "curl-cffi" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d6/6c/43207f48ad55e9fb18c40c57e1405137afad58ea64ed3f6402f34ae42751/pyairbnb-2.2.1.tar.gz", hash = "sha256:98a09ae6e66945d76a33b7b108e47ee1d42e0337b176386740bfe0d1e1f3fd3b", size = 21579, upload-time = "2026-02-03T12:27:40.326Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/84/5b/349222c6f0590fbed86524e81a2eb57f3444293aec32cf2d4d2bae35c556/pyairbnb-2.2.2.tar.gz", hash = "sha256:5e053c056824ab0f2618c6aeefe6e92a2ca6474cf9cf320b0eae29f869dd5aff", size = 23283, upload-time = "2026-08-01T23:21:44.8Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/c4/c7910b3b2c95a2119d5c62b7b3e4f7ce1434d65efc8018bef82147bf2ee7/pyairbnb-2.2.1-py3-none-any.whl", hash = "sha256:4872f199b45aa4f7bf76b44f0a3e8de2c71f1b85882c18073e574572be38e48d", size = 26220, upload-time = "2026-02-03T12:27:38.867Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/3f/a10795ab43a71db09339a99cfd22e0552a7f5c616ff347f753bd47001d11/pyairbnb-2.2.2-py3-none-any.whl", hash = "sha256:bcc581a1dcf42a1d41b5a4963ba55fa9e85878bd502fe3568e946a21c5b3aa27", size = 27788, upload-time = "2026-08-01T23:21:43.65Z" },
 ]
 
 [[package]]

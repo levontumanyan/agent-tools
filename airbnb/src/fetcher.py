@@ -1,7 +1,11 @@
 import json
 import logging
+import random
 import re
+import string
 import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -181,6 +185,214 @@ def _refresh_operation_hash(operation_name):
 
 pyairbnb.price.BASE_URL = "https://www.airbnb.ca/api/v3/StaysPdpSections"
 pyairbnb.price.PERSISTED_QUERY_HASH = _get_operation_hash("StaysPdpSections")
+
+
+def _new_pdp_exact_price(
+	listing_id,
+	check_in,
+	check_out,
+	adults,
+	currency="CAD",
+	language="en",
+):
+	"""
+	Fetch the checkout-grade price via the modern StaysPdpSections GraphQL endpoint.
+
+	Airbnb's persisted-query document now requires a POST body with a redesigned
+	variables schema (top-level dateRange/guestCounts, p3ImpressionId, fragment
+	flags) plus specific GraphQL platform headers. The legacy GET format used by
+	pyairbnb's price module fails with a GraphQL ValidationError and returns an
+	empty response, so this local implementation replaces it.
+
+	Raises RuntimeError with the GraphQL error text on failure.
+	Returns dict: {amount, orig_amount, discount_pct, nightly, currency, source}.
+	"""
+	room_id = str(listing_id)
+	op_hash = _get_operation_hash("StaysPdpSections")
+	if not op_hash:
+		raise RuntimeError("No StaysPdpSections operation hash available")
+
+	p3_impression = (
+		f"p3_{int(time.time() * 1000)}_"
+		+ "".join(random.choices(string.ascii_letters + string.digits, k=15))
+	)
+	trace_id = uuid.uuid4().hex + uuid.uuid4().hex[:17]
+	client_req_id = uuid.uuid4().hex[:25]
+
+	variables = {
+		"id": standardize.encode_room_id(room_id=room_id, prefix="StayListing"),
+		"demandStayListingId": standardize.encode_room_id(
+			room_id=room_id, prefix="DemandStayListing"
+		),
+		"pdpSectionsRequest": {
+			"adults": str(adults),
+			"amenityFilters": None,
+			"bypassTargetings": False,
+			"categoryTag": None,
+			"causeId": None,
+			"children": None,
+			"disasterId": None,
+			"discountedGuestFeeVersion": None,
+			"federatedSearchId": None,
+			"forceBoostPriorityMessageType": None,
+			"guestAges": None,
+			"hostPreview": False,
+			"infants": None,
+			"interactionType": None,
+			"layouts": ["SIDEBAR", "SINGLE_COLUMN"],
+			"pets": 0,
+			"pdpTypeOverride": None,
+			"photoId": None,
+			"preview": False,
+			"previousStateCheckIn": None,
+			"previousStateCheckOut": None,
+			"priceDropSource": None,
+			"partner": None,
+			"partnerProgram": None,
+			"directBookingParams": None,
+			"privateBooking": False,
+			"promotionUuid": None,
+			"relaxedAmenityIds": None,
+			"searchId": None,
+			"selectedCancellationPolicyId": None,
+			"selectedRatePlanId": None,
+			"splitStays": None,
+			"staysBookingMigrationEnabled": False,
+			"translateUgc": None,
+			"useNewSectionWrapperApi": False,
+			"sectionIds": [
+				"CANCELLATION_POLICY_PICKER_MODAL",
+				"POLICIES_DEFAULT",
+				"BOOK_IT_SIDEBAR",
+				"BOOK_IT_NAV",
+				"BOOK_IT_FLOATING_FOOTER",
+				"BOOK_IT_CALENDAR_SHEET",
+			],
+			"checkIn": check_in,
+			"checkOut": check_out,
+			"p3ImpressionId": p3_impression,
+			"targetPromotion": None,
+			"logPricingViewEvent": True,
+		},
+		"categoryTag": None,
+		"federatedSearchId": None,
+		"federatedSearchSessionId": None,
+		"p3ImpressionId": p3_impression,
+		"photoId": None,
+		"includePdpLayoutPipelineInputs": False,
+		"amenityIds": None,
+		"causeId": None,
+		"dateRange": {"startDate": check_in, "endDate": check_out},
+		"guestCounts": {"numberOfAdults": int(adults)},
+		"targetPromotion": None,
+		"numberOfChildren": None,
+		"numberOfInfants": None,
+		"numberOfPets": None,
+		"includePdpMigrationBookItNavFragment": True,
+		"includeGpBookItFragment": True,
+		"includePdpMigrationBookItFloatingFooterFragment": True,
+		"includePdpMigrationBookItSidebarFragment": True,
+		"includePdpMigrationBookItCalendarSheetFragment": True,
+		"includePdpMigrationPropertyAvailableRoomsFragment": False,
+		"includeGpPropertyAvailableRoomsFragment": False,
+		"includePdpOffers": False,
+	}
+	body = {
+		"operationName": "StaysPdpSections",
+		"variables": variables,
+		"extensions": {"persistedQuery": {"version": 1, "sha256Hash": op_hash}},
+	}
+	url = (
+		f"https://www.airbnb.ca/api/v3/StaysPdpSections/{op_hash}"
+		f"?operationName=StaysPdpSections&locale={language}&currency={currency}"
+	)
+	headers = {
+		"Accept": "application/json",
+		"Content-Type": "application/json",
+		"User-Agent": (
+			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+		),
+		"X-Airbnb-Api-Key": "d306zoyjsyarp7ifhu67rjxn52tv0t20",
+		"X-Airbnb-Operation-Id": "StaysPdpSections",
+		"X-Airbnb-GraphQL-Platform": "web",
+		"X-Airbnb-GraphQL-Platform-Client": "minimalist-niobe",
+		"X-Client-Version": "1c7fabdcdf93caaf2354e7e22f2e367207f81450",
+		"X-Airbnb-Supports-Airlock-V2": "true",
+		"X-CSRF-Without-Token": "1",
+		"X-CSRF-Token": "",
+		"X-Client-Request-Id": client_req_id,
+		"X-Airbnb-Client-Trace-Id": trace_id,
+		"Referer": f"https://www.airbnb.ca/rooms/{room_id}",
+	}
+
+	with requests.Session(impersonate="chrome120") as session:
+		if ACTIVE_COOKIES_DICT:
+			session.cookies.update(ACTIVE_COOKIES_DICT)
+		resp = session.post(url, headers=headers, json=body, timeout=60)
+
+	resp.raise_for_status()
+	data = resp.json()
+	errs = data.get("errors") or []
+	presentation = (data.get("data") or {}).get("presentation")
+	if not presentation:
+		err_msg = (errs[0].get("message") if errs else "empty response") + " "
+		cls = (
+			(errs[0].get("extensions", {}).get("classification") if errs else "")
+			or ""
+		)
+		raise RuntimeError(f"StaysPdpSections failed: {err_msg}{cls}".strip())
+
+	sections = (
+		presentation.get("stayProductDetailPage", {})
+		.get("sections", {})
+		.get("sections", [])
+	)
+	for section in sections:
+		section_data = section.get("section") or {}
+		if section.get("sectionId") == "BOOK_IT_SIDEBAR" and section_data.get(
+			"localizedUnavailabilityMessage"
+		):
+			raise RuntimeError(
+				"Listing unavailable for dates: "
+				f"{section_data.get('localizedUnavailabilityMessage')}"
+			)
+		price_data = section_data.get("structuredDisplayPrice") or {}
+		primary_line = price_data.get("primaryLine") or {}
+		disc_str = primary_line.get("discountedPrice") or primary_line.get(
+			"originalPrice"
+		)
+		orig_str = primary_line.get("originalPrice") or disc_str
+		if not disc_str:
+			continue
+		clean = lambda s: (s or "").replace("\xa0", "").replace(" ", "")
+		m_disc = re.search(r"[\d,]+(?:\.\d+)?", clean(disc_str))
+		m_orig = re.search(r"[\d,]+(?:\.\d+)?", clean(orig_str))
+		if not m_disc:
+			continue
+		amount = float(m_disc.group(0).replace(",", ""))
+		orig_amount = float(m_orig.group(0).replace(",", "")) if m_orig else amount
+		try:
+			num_days = max(
+				1,
+				(
+					datetime.strptime(check_out, "%Y-%m-%d")
+					- datetime.strptime(check_in, "%Y-%m-%d")
+				).days,
+			)
+		except ValueError:
+			num_days = 28
+		return {
+			"amount": amount,
+			"orig_amount": orig_amount,
+			"discount_pct": round(((orig_amount - amount) / orig_amount) * 100, 1)
+			if orig_amount > amount
+			else 0.0,
+			"nightly": round(amount / num_days, 2),
+			"currency": currency,
+			"source": "pdp_exact",
+		}
+	raise RuntimeError("StaysPdpSections returned no BOOK_IT_SIDEBAR price")
 
 
 def _reviews_get_from_offset(
@@ -461,83 +673,46 @@ def get_listing_details(
 	# Fetch exact authenticated pricing if dates provided
 	if details and check_in and check_out:
 		try:
-			import re
-
-			d_in = datetime.strptime(check_in, "%Y-%m-%d").date()
-			d_out = datetime.strptime(check_out, "%Y-%m-%d").date()
-			num_days = max(1, (d_out - d_in).days)
-
 			try:
-				p_resp = pyairbnb.price.get(
-					room_id=listing_id,
-					check_in=d_in,
-					check_out=d_out,
-					adults=adults,
+				exact = _new_pdp_exact_price(
+					listing_id,
+					check_in,
+					check_out,
+					adults,
 					currency=currency,
-					api_key="d306zoyjsyarp7ifhu67rjxn52tv0t20",
-					cookies=ACTIVE_COOKIES_DICT or None,
 				)
 			except Exception as price_err:
-				if "400" in str(price_err):
-					pyairbnb.price.PERSISTED_QUERY_HASH = _refresh_operation_hash(
-						"StaysPdpSections"
-					)
-					p_resp = pyairbnb.price.get(
-						room_id=listing_id,
-						check_in=d_in,
-						check_out=d_out,
-						adults=adults,
-						currency=currency,
-						api_key="d306zoyjsyarp7ifhu67rjxn52tv0t20",
-						cookies=ACTIVE_COOKIES_DICT or None,
-					)
-				else:
-					raise
-			main = p_resp.get("main", {})
-			p_details = main.get("details", {}) or {}
-			disc_str = (
-				main.get("discountedPrice")
-				or main.get("price")
-				or p_details.get("Price after discount")
-				or p_details.get("Total")
-				or ""
-			)
-			orig_str = main.get("originalPrice") or ""
-			nights_val = None
-			for k, v in p_details.items():
-				if " x " in k or "nights" in k.lower():
-					nights_val = v
-					break
-
-			if not orig_str and nights_val:
-				orig_str = nights_val
-
-			if not disc_str and nights_val:
-				disc_str = nights_val
-
-			if not orig_str:
-				orig_str = disc_str
-			if disc_str:
-				m_disc = re.search(r"[\d,]+(?:\.\d+)?", disc_str.replace("\xa0", ""))
-				m_orig = re.search(r"[\d,]+(?:\.\d+)?", orig_str.replace("\xa0", ""))
-				tot_amt = float(m_disc.group(0).replace(",", "")) if m_disc else 0.0
-				orig_amt = (
-					float(m_orig.group(0).replace(",", "")) if m_orig else tot_amt
+				# Refresh the persisted-query hash once (Airbnb rotates it) and retry
+				logger.warning(
+					f"Exact price fetch failed for {listing_id} ({price_err}); refreshing GraphQL hash and retrying once"
 				)
-				disc_pct = (
-					round(((orig_amt - tot_amt) / orig_amt) * 100, 1)
-					if orig_amt > tot_amt
-					else 0.0
+				_refresh_operation_hash("StaysPdpSections")
+				exact = _new_pdp_exact_price(
+					listing_id,
+					check_in,
+					check_out,
+					adults,
+					currency=currency,
 				)
+
+			if exact:
 				details["exact_price"] = {
-					"amount": tot_amt,
-					"orig_amount": orig_amt,
-					"discount_pct": disc_pct,
-					"nightly": round(tot_amt / num_days, 2),
-					"currency": currency,
+					"amount": exact["amount"],
+					"orig_amount": exact.get("orig_amount", exact["amount"]),
+					"discount_pct": exact.get("discount_pct", 0.0),
+					"nightly": exact["nightly"],
+					"currency": exact["currency"],
+					"source": "pdp_exact",
 				}
+				logger.info(
+					f"Exact checkout price for {listing_id}: {currency} {exact['amount']} "
+					f"(orig {exact.get('orig_amount')}, disc {exact.get('discount_pct')}%)"
+				)
 		except Exception as e:
-			logger.debug(f"Could not fetch exact price for {listing_id}: {e}")
+			# Loud, non-silent failure: record the error and warn
+			logger.warning(f"Could not fetch exact price for {listing_id}: {e}")
+			details["exact_price"] = None
+			details["exact_price_error"] = str(e)
 
 	return details
 
