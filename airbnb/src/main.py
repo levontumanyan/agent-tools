@@ -346,6 +346,20 @@ def main():
 
 	args = parser.parse_args()
 
+	# Criteria guardrail (airbnb/AGENTS.md + travel/criteria.md): prices must be
+	# evaluated in CAD on airbnb.ca. Non-CAD runs silently mismatch the page
+	# prices the user sees, so make the deviation impossible to miss.
+	if str(args.currency).upper() != "CAD":
+		sys.stderr.write(
+			f"\n!!! CURRENCY GUARDRAIL: running with --currency {args.currency}. "
+			"Standards mandate CAD on airbnb.ca — totals will NOT match the page prices the user sees. "
+			"Only proceed if the user explicitly requested this currency.\n\n"
+		)
+		logger.warning(
+			"Currency guardrail: non-CAD currency '%s' requested; totals will mismatch airbnb.ca page prices",
+			args.currency,
+		)
+
 	# Configure logging (redirect to stderr when --json is used so stdout stays clean)
 	log_level = logging.INFO if args.verbose else logging.WARNING
 	log_stream = sys.stderr if args.json else sys.stdout
