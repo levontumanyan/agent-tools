@@ -461,7 +461,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 		)
 		proc_hr = proc["elapsed_sec"] / 3600 if proc["elapsed_sec"] != float("inf") else float("inf")
 		tty_hr = get_tty_idle_sec(proc["tty"]) / 3600
-		eff = min(conv_hr, proc_hr, tty_hr)
+		eff = min(conv_hr, proc_hr)
+		in_use = tty_hr * 3600 < 15 * 60
 		rows.append({
 			"pid": proc["pid"],
 			"tty": proc["tty"],
@@ -474,6 +475,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 			"proc_idle_hr": round(proc_hr, 2),
 			"tty_idle_hr": round(tty_hr, 2),
 			"eff_idle_hr": round(eff, 2),
+			"in_use": in_use,
 		})
 	if args.json:
 		print(json.dumps({"captured_at": _format_ts(_now_ms()), "sessions": rows}, indent=2))
@@ -484,6 +486,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 			label = row["session_title"] or row["session_id"] or "?"
 			if not row["certain"] and row["session_id"]:
 				label += " (?)"
+			if row["in_use"]:
+				label += " [in-use]"
 			print(
 				f"{row['pid']:<7} | {row['conv_idle_hr']:5.1f}h | {row['proc_idle_hr']:5.1f}h | {row['tty_idle_hr']:5.1f}h | {row['eff_idle_hr']:5.1f}h | {label}"
 			)
@@ -508,6 +512,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 
 	now_ms = _now_ms()
 	threshold_sec = args.hours * 3600.0
+	grace_sec = args.tty_grace_min * 60.0
 	candidates = []
 	stats = []
 	seen_sessions: set[str] = set()
@@ -516,13 +521,20 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		conv_sec = (now_ms - ses["updated_ms"]) / 1000 if ses.get("updated_ms") else float("inf")
 		proc_sec = proc["elapsed_sec"]
 		tty_sec = get_tty_idle_sec(proc["tty"])
-		idle_sec = min(conv_sec, proc_sec, tty_sec)
+		# TTY mtime measures the last write to the terminal — including
+		# SIGWINCH redraws and focus events fired by any layout change in
+		# cmux (opening/closing/switching tabs). It cannot distinguish
+		# "user is in this tab" from "user touched the app elsewhere", so it
+		# is a short in-use grace, not a full-threshold gate: a tab counts
+		# as idle once conv+proc are idle AND nobody wrote to it recently.
+		idle_sec = min(conv_sec, proc_sec)
 		idle_hr = idle_sec / 3600
-		stats.append((proc, conv_sec / 3600, proc_sec / 3600, tty_sec / 3600, idle_hr))
+		in_use = tty_sec < grace_sec
+		stats.append((proc, conv_sec / 3600, proc_sec / 3600, tty_sec / 3600, idle_hr, in_use))
 		# Never cull two TUIs attributed to the same session.
 		if ses.get("id") and ses["id"] in seen_sessions:
 			continue
-		if idle_sec >= threshold_sec:
+		if idle_sec >= threshold_sec and not in_use:
 			if ses.get("id"):
 				seen_sessions.add(ses["id"])
 			candidates.append((proc, idle_hr))
@@ -530,11 +542,13 @@ def cmd_cull(args: argparse.Namespace) -> int:
 	if args.verbose and not args.quiet:
 		print(f"{'PID':<7} | {'Conv':<9} | {'Proc':<9} | {'TTY':<9} | {'Eff':<9} | Session")
 		print("-" * 84)
-		for proc, c_hr, p_hr, t_hr, e_hr in stats:
+		for proc, c_hr, p_hr, t_hr, e_hr, in_use in stats:
 			ses = proc.get("session") or {}
 			label = ses.get("title") or ses.get("id", "?")
 			if ses and not ses.get("certain"):
 				label += " (?)"
+			if in_use:
+				label += " [in-use]"
 			print(
 				f"{proc['pid']:<7} | {c_hr:5.1f}h | {p_hr:5.1f}h | {t_hr:5.1f}h | {e_hr:5.1f}h | {label}"
 			)
@@ -591,6 +605,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 	p_cull = sub.add_parser("cull", help="Gracefully close opencode TUIs idle for more than --hours")
 	p_cull.add_argument("--hours", type=float, default=2.0, help="Idle hour threshold to trigger culling (default: 2)")
+	p_cull.add_argument(
+		"--tty-grace-min",
+		type=float,
+		default=15.0,
+		help="Protect tabs with tty activity within this many minutes (default: 15)",
+	)
 	p_cull.add_argument("--pid", type=int, help="Only consider this TUI process (for targeted culls)")
 	p_cull.add_argument("-n", "--dry-run", action="store_true", help="Preview which sessions would be culled")
 	p_cull.add_argument("-v", "--verbose", action="store_true", help="Show the idle breakdown for every live session")
