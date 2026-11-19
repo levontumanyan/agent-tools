@@ -268,6 +268,12 @@ def main() -> None:
 
 			status_proc = subprocess.run(["git", "status", "--porcelain"], cwd=worktree_dir, capture_output=True, text=True)
 			changes = status_proc.stdout.strip()
+			if not changes:
+				# Worker may have committed its own work (clean status but commits on the branch)
+				ahead_proc = subprocess.run(["git", "rev-list", "--count", f"origin/{args.base_branch}..HEAD"], cwd=worktree_dir, capture_output=True, text=True)
+				if ahead_proc.stdout.strip().lstrip("0"):
+					log_fh.write("[*] Worktree clean but worker left commits on the branch. Treating as changes.\n")
+					changes = "committed-by-worker"
 
 			if not changes:
 				duration = time.time() - start_time
@@ -298,8 +304,12 @@ def main() -> None:
 				receipt = f"Evidence Gate Passed: `{' '.join(gate_argv)}` exited 0."
 
 			short_title = re.sub(r"[^\w\s-]", "", args.prompt)[:60].strip() or task_id
-			subprocess.run(["git", "add", "-A"], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
-			subprocess.run(["git", "commit", "-m", f"feat(agent): {short_title}"], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
+			commit_proc = subprocess.run(["git", "add", "-A"], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
+			status_after_add = subprocess.run(["git", "status", "--porcelain"], cwd=worktree_dir, capture_output=True, text=True).stdout.strip()
+			if status_after_add:
+				subprocess.run(["git", "commit", "-m", f"feat(agent): {short_title}"], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
+			else:
+				log_fh.write("[*] Nothing to commit after add; worker already committed its work.\n")
 
 			if not args.no_push:
 				subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=worktree_dir, stdout=log_fh, stderr=log_fh, check=True)
