@@ -665,7 +665,8 @@ func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
 	let wan = json["wan"] as? [String: Any] ?? [:]
 	let wg = json["wg"] as? [String: Any] ?? [:]
 
-	let isRepeaterConnected = (repeater["state_name"] as? String) == "connected"
+	let stateStr = (repeater["state_name"] as? String) ?? (repeater["state_s"] as? String)
+	let isRepeaterConnected = stateStr == "connected" || (repeater["state"] as? Int) == 2
 	let isWanUp = (wan["up"] as? Bool) ?? false
 	let isWgUp = (wg["up"] as? Bool) ?? false
 
@@ -680,7 +681,9 @@ func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
 		mode = "Wi-Fi Repeater"
 		ssid = repeater["ssid"] as? String
 		bssid = repeater["bssid"] as? String
-		if let freq = repeater["frequency"] as? Int {
+		if let ch = repeater["channel"] as? Int {
+			channel = ch
+		} else if let freq = repeater["frequency"] as? Int {
 			channel = freq >= 5000 ? (freq - 5000) / 5 : (freq - 2407) / 5
 		}
 		if let sig = repeater["signal"] as? Int {
