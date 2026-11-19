@@ -7,9 +7,10 @@
 Inspect and gracefully cull idle OpenCode TUI sessions in any terminal.
 
 Terminal-agnostic: works in iTerm2, cmux, Ghostty, Terminal.app, tmux, etc.
-Idle time is min(conversation idle, process elapsed, tty idle); a session is
-only culled when ALL THREE exceed --hours. The tab stays open with a recap and
-the resume command printed into it.
+A session is culled when conversation and process idle both exceed --hours and
+nothing wrote to its tty within --tty-grace-min (default 15) — tty mtime is an
+in-use grace, not a gate, since terminal redraws from layout changes reset it.
+The tab stays open with a recap and the resume command printed into it.
 """
 
 import argparse
@@ -331,11 +332,22 @@ def graceful_exit_opencode(pid: int, tty: str) -> str:
 		time.sleep(0.1)
 		try:
 			os.kill(pid, 0)
-		except ProcessLookupError:
+		except OSError:
 			return "SIGINT"
+	# Guard against PID reuse: only escalate if the pid is still an opencode TUI.
+	try:
+		still_ours = "opencode" in subprocess.check_output(
+			["ps", "-o", "command=", "-p", str(pid)],
+			text=True,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception:
+		still_ours = False
+	if not still_ours:
+		return "SIGINT"
 	try:
 		os.kill(pid, signal.SIGTERM)
-	except ProcessLookupError:
+	except OSError:
 		return "already-exited"
 	return "SIGTERM"
 
@@ -436,7 +448,10 @@ def write_tty_recap(tty: str, proc: dict, idle_hr: float, recap: dict, surface_i
 			if socket_path:
 				cmd.extend(["--socket", socket_path])
 			cmd.extend(["send-key", "--surface", surface_id, "enter"])
-			subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+			try:
+				subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+			except Exception:
+				pass
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -462,7 +477,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 		proc_hr = proc["elapsed_sec"] / 3600 if proc["elapsed_sec"] != float("inf") else float("inf")
 		tty_hr = get_tty_idle_sec(proc["tty"]) / 3600
 		eff = min(conv_hr, proc_hr)
-		in_use = tty_hr * 3600 < 15 * 60
+		in_use = tty_hr * 3600 < getattr(args, "tty_grace_min", 15.0) * 60
 		rows.append({
 			"pid": proc["pid"],
 			"tty": proc["tty"],
@@ -600,6 +615,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 	p_status = sub.add_parser("status", help="Show live opencode TUIs with idle breakdown")
 	p_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+	p_status.add_argument(
+		"--tty-grace-min",
+		type=float,
+		default=15.0,
+		help="Mark tabs with tty activity within this many minutes as in-use (default: 15)",
+	)
 	p_status.add_argument("-q", "--quiet", action="store_true", help="Suppress output")
 	p_status.set_defaults(func=cmd_status)
 
