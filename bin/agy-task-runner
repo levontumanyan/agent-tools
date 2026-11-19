@@ -104,7 +104,7 @@ def build_worker_prompt(args, task_id: str) -> str:
 	)
 
 
-def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_file: str, interactive: bool, log_file: str) -> tuple[str, str]:
+def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_file: str, interactive: bool, log_file: str, model: str = "") -> tuple[str, str]:
 	"""Start agy -i inside a detached tmux session with zero keybinding friction."""
 	exit_file = os.path.join(TMP_BASE, f"exit-{task_id}")
 	wait_channel = f"agy-done-{task_id}"
@@ -112,11 +112,12 @@ def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_f
 		os.remove(exit_file)
 
 	perm_flag = "" if interactive else "--dangerously-skip-permissions "
+	model_flag = f"--model {shlex.quote(model)} " if model else ""
 	# Read prompt inside bash without exposing it in process args; signal tmux wait-for on exit
 	inner_cmd = (
 		f"cd {shlex.quote(worktree_dir)} && "
 		f"{shlex.quote(AGY_BIN)} -i \"$(cat {shlex.quote(prompt_file)})\" "
-		f"{perm_flag}--effort high; "
+		f"{model_flag}{perm_flag}--effort high; "
 		f"rc=$?; echo $rc > {shlex.quote(exit_file)}; "
 		f"{shlex.quote(TMUX_BIN)} wait-for -S {shlex.quote(wait_channel)} 2>/dev/null || true"
 	)
@@ -210,6 +211,7 @@ def main() -> None:
 	parser.add_argument("--task-id", default="", help="Custom task ID (default: auto-generated)")
 	parser.add_argument("--run-id", default="", help="Coordinator run ID grouping related workers")
 	parser.add_argument("--worker-name", default="", help="Logical worker name for peer messaging")
+	parser.add_argument("--model", default="", help="Model for the agy session (e.g. gemini-4-neon-high); empty = agy default")
 
 	args = parser.parse_args()
 
@@ -260,7 +262,7 @@ def main() -> None:
 			log_fh.write(f"[*] Launching agy in tmux session {tmux_session}...\n")
 			log_fh.flush()
 
-			exit_file, wait_channel = launch_tmux_agy(task_id, tmux_session, worktree_dir, prompt_file, args.interactive, log_file)
+			exit_file, wait_channel = launch_tmux_agy(task_id, tmux_session, worktree_dir, prompt_file, args.interactive, log_file, model=args.model)
 			exit_code = wait_for_tmux_exit(tmux_session, exit_file, wait_channel, args.timeout)
 			log_fh.write(f"\n[*] agy exited with code {exit_code}\n")
 

@@ -71,6 +71,7 @@ class DispatchTaskRequest(BaseModel):
 	timeout: int = Field(default=3600, ge=0, le=86400)
 	run_id: str = Field(default="", max_length=64)
 	worker_name: str = Field(default="", max_length=64)
+	model: str = Field(default="", max_length=64)
 
 
 class SendMessageRequest(BaseModel):
@@ -275,6 +276,8 @@ def _dispatch_task_impl(req: DispatchTaskRequest) -> dict[str, Any]:
 		cmd.extend(["--run-id", req.run_id])
 	if req.worker_name:
 		cmd.extend(["--worker-name", req.worker_name])
+	if req.model:
+		cmd.extend(["--model", req.model])
 
 	with open(out_log, "w", encoding="utf-8") as out_fh, open(os.devnull, "r") as devnull:
 		subprocess.Popen(

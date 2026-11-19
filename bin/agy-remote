@@ -137,6 +137,7 @@ def cmd_dispatch(args) -> None:
 		"timeout": args.timeout,
 		"run_id": args.run_id,
 		"worker_name": args.worker_name,
+		"model": args.model,
 	}
 	res = api_request(base_url, "/api/tasks", payload)
 	task_id = res["task_id"]
@@ -271,7 +272,8 @@ def main() -> None:
 	p_dispatch.add_argument("--pr-draft", action="store_true", help="Create PR as draft")
 	p_dispatch.add_argument("--timeout", type=int, default=3600, help="Max timeout in seconds (0 = unlimited)")
 	p_dispatch.add_argument("--run-id", default="", help="Coordinator run ID")
-	p_dispatch.add_argument("--worker-name", default="", help="Logical worker name")
+	p_dispatch.add_argument("--worker-name", default="", dest="worker_name", help="Logical worker name")
+	p_dispatch.add_argument("--model", default="", help="Model for the worker's agy session (e.g. gemini-4-neon-high)")
 
 	p_attach = subparsers.add_parser("attach", help="Attach to a live worker's tmux TUI")
 	p_attach.add_argument("task_id", help="Task ID")
