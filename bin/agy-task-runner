@@ -138,6 +138,14 @@ def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_f
 	for opt, val in [("status", "off"), ("prefix", "None"), ("prefix2", "None"), ("mouse", "on")]:
 		subprocess.run([TMUX_BIN, "set-option", "-t", target, opt, val], capture_output=True)
 
+	# Pass wheel events to TUI apps that request mouse; otherwise scroll pane history
+	# (agy renders inline, so pane history IS the chat transcript). Server-global: fine,
+	# this tmux server hosts only agy task sessions.
+	wheel_up = 'if-shell -F -t= "#{mouse_any_flag}" "send-keys -M" "if -F -t= \\"#{pane_in_mode}\\" \\"send-keys -X\\" \\"copy-mode -e\\""'
+	wheel_down = 'if-shell -F -t= "#{mouse_any_flag}" "send-keys -M" "if -F -t= \\"#{pane_in_mode}\\" \\"send-keys -X\\" \\"send-keys -M\\""'
+	for args in (["bind-key", "-n", "WheelUpPane"] + shlex.split(wheel_up), ["bind-key", "-n", "WheelDownPane"] + shlex.split(wheel_down)):
+		subprocess.run([TMUX_BIN] + args, capture_output=True)
+
 	subprocess.run(
 		[TMUX_BIN, "pipe-pane", "-t", target, "-o", f"cat >> {shlex.quote(log_file)}"],
 		capture_output=True,
