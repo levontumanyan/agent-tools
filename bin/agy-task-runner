@@ -35,6 +35,11 @@ from agy_dispatch_common import (
 AGY_BIN = os.environ.get("AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
 GH_BIN = os.environ.get("GH_BIN", "/home/linuxbrew/.linuxbrew/bin/gh")
 
+# Completion poll cadence, and how long the worktree must be quiet after submit_report
+# before the runner treats the report as final and runs the handoff.
+TASK_POLL_SECONDS = 5
+REPORT_QUIET_SECONDS = 30
+
 
 def record_task_start(args, task_id: str, repo_name: str, branch_name: str, worktree_dir: str, tmux_session: str) -> None:
 	"""Insert or update initial running task record in SQLite."""
@@ -99,8 +104,9 @@ def build_worker_prompt(args, task_id: str) -> str:
 		f"Worker Metadata: task_id=`{task_id}`, worker_name=`{worker_id}`{run_note}.\n"
 		f"If you have `fibonacci-dispatch` MCP tools available:\n"
 		f"- Call `read_messages(agent_name='{worker_id}')` if you expect peer/coordinator updates.\n"
-		f"- Call `submit_report(task_id='{task_id}', summary='...', report_md='...')` as soon as your work is complete.\n"
-		f"- Leave the session open afterward unless instructed to exit, so the user can inspect or ask follow-ups."
+		f"- Call `submit_report(task_id='{task_id}', summary='...', report_md='...')` as soon as your work is complete — the runner ships your branch and opens the PR automatically once the report lands.\n"
+		f"- After submitting, stay open and idle so the user can inspect your work or send follow-ups. NEVER exit or send /exit on your own; only end the session when the user explicitly tells you to (directly or via the dispatcher).\n"
+		f"- For follow-up work requested after your report, commit and push to your own branch `{task_id}` yourself; the PR updates automatically."
 	)
 
 
@@ -153,30 +159,96 @@ def launch_tmux_agy(task_id: str, tmux_session: str, worktree_dir: str, prompt_f
 	return exit_file, wait_channel
 
 
-def wait_for_tmux_exit(tmux_session: str, exit_file: str, wait_channel: str, timeout: int) -> int:
-	"""Block on tmux wait-for channel (zero polling) until agy exits or timeout expires."""
-	target = tmux_session
-	if not os.path.exists(exit_file):
-		chk = subprocess.run([TMUX_BIN, "has-session", "-t", target], capture_output=True)
-		if chk.returncode == 0:
-			try:
-				subprocess.run(
-					[TMUX_BIN, "wait-for", wait_channel],
-					timeout=timeout if timeout > 0 else None,
-					capture_output=True,
-				)
-			except subprocess.TimeoutExpired:
-				subprocess.run([TMUX_BIN, "kill-session", "-t", target], capture_output=True)
-				raise
+def tmux_session_alive(tmux_session: str) -> bool:
+	"""Check whether the task's tmux session is still running."""
+	try:
+		res = subprocess.run([TMUX_BIN, "has-session", "-t", tmux_session], capture_output=True)
+	except OSError:
+		return False
+	return res.returncode == 0
 
+
+def report_submitted(task_id: str) -> bool:
+	"""Check whether the worker has submitted its final report via submit_report."""
+	with get_db_conn() as conn:
+		row = conn.execute(
+			"SELECT 1 FROM tasks WHERE task_id = ? AND (report_md IS NOT NULL OR summary IS NOT NULL) LIMIT 1;",
+			(task_id,),
+		).fetchone()
+	return row is not None
+
+
+def worktree_signature(worktree_dir: str) -> str:
+	"""Snapshot the worktree's git status so we can tell whether the worker is still writing."""
+	try:
+		res = subprocess.run(["git", "status", "--porcelain"], cwd=worktree_dir, capture_output=True, text=True)
+	except OSError:
+		return ""
+	return res.stdout.strip()
+
+
+def wait_for_task_completion(tmux_session: str, exit_file: str, task_id: str, worktree_dir: str, timeout: int) -> tuple[str, int]:
+	"""Wait until the worker submits its report, exits, or the timeout expires.
+
+	Returns (mode, exit_code): 'report' means the report landed, the worktree has been quiet
+	for REPORT_QUIET_SECONDS, and the worker stays live (the user ends it, not the runner);
+	'exit' means the agy session ended (exit_code read from the exit file); 'timeout' means
+	the session was killed at --timeout.
+	"""
+	deadline = (time.monotonic() + timeout) if timeout > 0 else None
+	quiet_sig: str | None = None
+	quiet_since: float | None = None
+	while True:
+		if os.path.exists(exit_file):
+			try:
+				with open(exit_file, "r", encoding="utf-8") as f:
+					raw = f.read().strip()
+				return "exit", (int(raw) if raw else 0)
+			except Exception:
+				return "exit", 0
+		if not tmux_session_alive(tmux_session):
+			return "exit", 0  # session died without writing the exit file
+		if deadline is not None and time.monotonic() >= deadline:
+			subprocess.run([TMUX_BIN, "kill-session", "-t", tmux_session], capture_output=True)
+			return "timeout", 0
+		if report_submitted(task_id):
+			# Report landed: only hand off once the worktree stops changing (worker done writing).
+			sig = worktree_signature(worktree_dir)
+			if sig == quiet_sig and quiet_since is not None and time.monotonic() - quiet_since >= REPORT_QUIET_SECONDS:
+				return "report", 0
+			if sig != quiet_sig:
+				quiet_sig = sig
+				quiet_since = time.monotonic()
+		else:
+			quiet_sig = None
+			quiet_since = None
+		time.sleep(TASK_POLL_SECONDS)
+
+
+def cleanup_after_worker_exit(repo_path: str, worktree_dir: str, branch_name: str, task_id: str, tmux_session: str, exit_file: str, log_fh) -> None:
+	"""After the report handoff, wait (unbounded) for the user-initiated worker exit, then clean up.
+
+	The worker is left live and inspectable until the user ends it (directly, or via stop);
+	only then is the worktree removed. The local branch is deleted only when the recorded
+	status says the task produced nothing worth keeping.
+	"""
+	log_fh.write("[*] Handoff complete; worker left live for user inspection — deferring cleanup until its session ends.\n")
+	log_fh.flush()
+	while tmux_session_alive(tmux_session):
+		time.sleep(15)
 	if os.path.exists(exit_file):
-		try:
-			with open(exit_file, "r", encoding="utf-8") as f:
-				raw = f.read().strip()
-			return int(raw) if raw else 0
-		except Exception:
-			return 0
-	return 0
+		os.remove(exit_file)
+	status_sig = worktree_signature(worktree_dir)
+	if status_sig:
+		log_fh.write(f"[!] Uncommitted changes at worker exit; leaving worktree in place for manual review:\n{status_sig}\n")
+		return
+	delete_branch = False
+	with get_db_conn() as conn:
+		row = conn.execute("SELECT status FROM tasks WHERE task_id = ?;", (task_id,)).fetchone()
+	if row and row["status"] in ("no_changes", "failed", "timeout"):
+		delete_branch = True
+	log_fh.write("[*] Worker session ended (user-initiated); removing worktree.\n")
+	cleanup_worktree(repo_path, worktree_dir, branch_name, delete_branch=delete_branch)
 
 
 def detect_gate(worktree_dir: str, explicit_gate: str) -> list[str]:
@@ -255,6 +327,7 @@ def main() -> None:
 	print(f"[+] Log File:     {log_file}")
 
 	delete_branch = False
+	worker_left_live = False
 	with open(log_file, "w", encoding="utf-8") as log_fh:
 		log_fh.write(f"=== Task {task_id} Started at {utc_now_iso()} ===\n")
 		log_fh.write(f"Repo: {repo_name}\nPrompt: {args.prompt}\n\n")
@@ -270,9 +343,20 @@ def main() -> None:
 			log_fh.write(f"[*] Launching agy in tmux session {tmux_session}...\n")
 			log_fh.flush()
 
-			exit_file, wait_channel = launch_tmux_agy(task_id, tmux_session, worktree_dir, prompt_file, args.interactive, log_file, model=args.model)
-			exit_code = wait_for_tmux_exit(tmux_session, exit_file, wait_channel, args.timeout)
-			log_fh.write(f"\n[*] agy exited with code {exit_code}\n")
+			exit_file, _ = launch_tmux_agy(task_id, tmux_session, worktree_dir, prompt_file, args.interactive, log_file, model=args.model)
+			mode, exit_code = wait_for_task_completion(tmux_session, exit_file, task_id, worktree_dir, args.timeout)
+			worker_left_live = mode == "report" and tmux_session_alive(tmux_session)
+			if mode == "timeout":
+				duration = time.time() - start_time
+				delete_branch = True
+				err = f"Task timed out after {args.timeout}s"
+				log_fh.write(f"[!] {err}\n")
+				record_task_finish(task_id, "timeout", branch=branch_name, error=err, duration=duration)
+				return
+			if mode == "report":
+				log_fh.write("[*] Worker submitted its report and is still live — running gate/push/PR handoff now.\n")
+			else:
+				log_fh.write(f"\n[*] agy exited with code {exit_code}\n")
 
 			status_proc = subprocess.run(["git", "status", "--porcelain"], cwd=worktree_dir, capture_output=True, text=True)
 			changes = status_proc.stdout.strip()
@@ -358,12 +442,6 @@ def main() -> None:
 			duration = time.time() - start_time
 			record_task_finish(task_id, "passed", branch=branch_name, pr_url=pr_url or None, receipt=receipt, duration=duration)
 
-		except subprocess.TimeoutExpired:
-			duration = time.time() - start_time
-			delete_branch = True
-			err = f"Task timed out after {args.timeout}s"
-			log_fh.write(f"[!] {err}\n")
-			record_task_finish(task_id, "timeout", branch=branch_name, error=err, duration=duration)
 		except Exception as e:
 			duration = time.time() - start_time
 			delete_branch = True
@@ -374,8 +452,12 @@ def main() -> None:
 			for p in (prompt_file, exit_file):
 				if p and os.path.exists(p):
 					os.remove(p)
-			log_fh.write("[*] Cleaning up ephemeral worktree...\n")
-			cleanup_worktree(repo_path, worktree_dir, branch_name, delete_branch=delete_branch)
+			if worker_left_live:
+				# Worker is still live per the user's wish: no worktree removal now; wait for its exit.
+				cleanup_after_worker_exit(repo_path, worktree_dir, branch_name, task_id, tmux_session, exit_file, log_fh)
+			else:
+				log_fh.write("[*] Cleaning up ephemeral worktree...\n")
+				cleanup_worktree(repo_path, worktree_dir, branch_name, delete_branch=delete_branch)
 
 
 if __name__ == "__main__":

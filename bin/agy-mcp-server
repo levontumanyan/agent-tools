@@ -386,7 +386,7 @@ def _read_messages_impl(agent_name: str, since_id: int = 0, limit: int = 50) -> 
 
 
 def _stop_task_impl(task_id: str, graceful: bool = True) -> dict[str, Any]:
-	"""Stop a running worker either by sending /exit or killing its tmux session."""
+	"""Stop a live worker at the user's explicit request: /exit (graceful) or kill its tmux session."""
 	validate_safe_id(task_id, "task_id")
 	session = resolve_tmux_for_target(task_id) or f"agy-{task_id}"
 	if not tmux_has_session(session):
@@ -516,7 +516,7 @@ def submit_report(task_id: str, summary: str, report_md: str, conversation_id: s
 
 @mcp.tool()
 def stop_task(task_id: str, graceful: bool = True) -> dict[str, Any]:
-	"""Stop a running task (sends /exit so git gate & PR run, or kills tmux session if graceful=False)."""
+	"""Stop a live worker — ONLY when the user explicitly asks (workers stay live after reporting). Graceful sends /exit (the runner finishes gate & PR if not already done); graceful=False kills the tmux session."""
 	return _stop_task_impl(task_id=task_id, graceful=graceful)
 
 
