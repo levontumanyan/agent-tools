@@ -212,9 +212,8 @@ def _new_pdp_exact_price(
 	if not op_hash:
 		raise RuntimeError("No StaysPdpSections operation hash available")
 
-	p3_impression = (
-		f"p3_{int(time.time() * 1000)}_"
-		+ "".join(random.choices(string.ascii_letters + string.digits, k=15))
+	p3_impression = f"p3_{int(time.time() * 1000)}_" + "".join(
+		random.choices(string.ascii_letters + string.digits, k=15)
 	)
 	trace_id = uuid.uuid4().hex + uuid.uuid4().hex[:17]
 	client_req_id = uuid.uuid4().hex[:25]
@@ -302,17 +301,11 @@ def _new_pdp_exact_price(
 		"variables": variables,
 		"extensions": {"persistedQuery": {"version": 1, "sha256Hash": op_hash}},
 	}
-	url = (
-		f"https://www.airbnb.ca/api/v3/StaysPdpSections/{op_hash}"
-		f"?operationName=StaysPdpSections&locale={language}&currency={currency}"
-	)
+	url = f"https://www.airbnb.ca/api/v3/StaysPdpSections/{op_hash}?operationName=StaysPdpSections&locale={language}&currency={currency}"
 	headers = {
 		"Accept": "application/json",
 		"Content-Type": "application/json",
-		"User-Agent": (
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
-		),
+		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
 		"X-Airbnb-Api-Key": "d306zoyjsyarp7ifhu67rjxn52tv0t20",
 		"X-Airbnb-Operation-Id": "StaysPdpSections",
 		"X-Airbnb-GraphQL-Platform": "web",
@@ -338,9 +331,8 @@ def _new_pdp_exact_price(
 	if not presentation:
 		err_msg = (errs[0].get("message") if errs else "empty response") + " "
 		cls = (
-			(errs[0].get("extensions", {}).get("classification") if errs else "")
-			or ""
-		)
+			errs[0].get("extensions", {}).get("classification") if errs else ""
+		) or ""
 		raise RuntimeError(f"StaysPdpSections failed: {err_msg}{cls}".strip())
 
 	sections = (
@@ -354,8 +346,7 @@ def _new_pdp_exact_price(
 			"localizedUnavailabilityMessage"
 		):
 			raise RuntimeError(
-				"Listing unavailable for dates: "
-				f"{section_data.get('localizedUnavailabilityMessage')}"
+				f"Listing unavailable for dates: {section_data.get('localizedUnavailabilityMessage')}"
 			)
 		price_data = section_data.get("structuredDisplayPrice") or {}
 		primary_line = price_data.get("primaryLine") or {}
@@ -365,7 +356,10 @@ def _new_pdp_exact_price(
 		orig_str = primary_line.get("originalPrice") or disc_str
 		if not disc_str:
 			continue
-		clean = lambda s: (s or "").replace("\xa0", "").replace(" ", "")
+
+		def clean(s):
+			return (s or "").replace("\xa0", "").replace(" ", "")
+
 		m_disc = re.search(r"[\d,]+(?:\.\d+)?", clean(disc_str))
 		m_orig = re.search(r"[\d,]+(?:\.\d+)?", clean(orig_str))
 		if not m_disc:
@@ -705,8 +699,7 @@ def get_listing_details(
 					"source": "pdp_exact",
 				}
 				logger.info(
-					f"Exact checkout price for {listing_id}: {currency} {exact['amount']} "
-					f"(orig {exact.get('orig_amount')}, disc {exact.get('discount_pct')}%)"
+					f"Exact checkout price for {listing_id}: {currency} {exact['amount']} (orig {exact.get('orig_amount')}, disc {exact.get('discount_pct')}%)"
 				)
 		except Exception as e:
 			# Loud, non-silent failure: record the error and warn

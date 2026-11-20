@@ -61,6 +61,7 @@ def test_generate_new_csv(tmp_path, mock_listings):
 			"Orig Total Price",
 			"Discount %",
 			"Currency",
+			"Price Source",
 			"Bedrooms",
 			"Guests",
 			"Review Count",
@@ -266,8 +267,16 @@ def test_format_calendar_view():
 			"days": [
 				{"calendarDate": "2026-11-01", "available": False},
 				{"calendarDate": "2026-11-02", "available": False},
-				{"calendarDate": "2026-11-03", "available": True, "price": {"localPriceFormatted": "$50"}},
-				{"calendarDate": "2026-11-04", "available": True, "price": {"localPriceFormatted": "$50"}},
+				{
+					"calendarDate": "2026-11-03",
+					"available": True,
+					"price": {"localPriceFormatted": "$50"},
+				},
+				{
+					"calendarDate": "2026-11-04",
+					"available": True,
+					"price": {"localPriceFormatted": "$50"},
+				},
 			],
 		}
 	]
@@ -278,4 +287,3 @@ def test_format_calendar_view():
 	assert "2 available, 28 blocked" in rendered
 	assert "Open Window(s):" in rendered
 	assert "2026-11-03" in rendered
-

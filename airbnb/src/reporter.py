@@ -361,7 +361,9 @@ def format_calendar_view(calendar_months, use_color=True):
 
 		month_name = calendar.month_name[month]
 		days_list = m.get("days", [])
-		days_map = {d.get("calendarDate"): d for d in days_list if d.get("calendarDate")}
+		days_map = {
+			d.get("calendarDate"): d for d in days_list if d.get("calendarDate")
+		}
 
 		cal = calendar.Calendar(firstweekday=0)  # Monday first
 		weeks = cal.monthdayscalendar(year, month)
@@ -434,7 +436,9 @@ def format_calendar_view(calendar_months, use_color=True):
 				d2 = datetime.strptime(end_dt, "%Y-%m-%d")
 				nights = max(1, (d2 - d1).days)
 				pr_note = f", ~{p_fmt}/nt" if p_fmt else ""
-				summary_lines.append(f"  • {start_dt} → {end_dt} ({nights} nights{pr_note})")
+				summary_lines.append(
+					f"  • {start_dt} → {end_dt} ({nights} nights{pr_note})"
+				)
 			except Exception:
 				summary_lines.append(f"  • {start_dt} → {end_dt}")
 	else:
@@ -443,4 +447,3 @@ def format_calendar_view(calendar_months, use_color=True):
 		)
 
 	return "\n".join(output) + "\n" + "\n".join(summary_lines)
-

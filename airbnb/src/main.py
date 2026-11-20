@@ -237,8 +237,8 @@ def main():
 	parser.add_argument(
 		"--currency",
 		type=str,
-		default=defaults.get("currency", "USD"),
-		help="Currency code (e.g., 'USD', 'MXN')",
+		default=defaults.get("currency", "CAD"),
+		help="Currency code (only CAD is supported; standards mandate CAD on airbnb.ca)",
 	)
 	parser.add_argument(
 		"--limit",
@@ -346,19 +346,16 @@ def main():
 
 	args = parser.parse_args()
 
-	# Criteria guardrail (airbnb/AGENTS.md + travel/criteria.md): prices must be
-	# evaluated in CAD on airbnb.ca. Non-CAD runs silently mismatch the page
-	# prices the user sees, so make the deviation impossible to miss.
+	# Criteria guardrail (airbnb/AGENTS.md + travel/criteria.md): all prices must
+	# be evaluated in CAD on airbnb.ca so totals match the listing pages the user
+	# sees. Passing --currency with anything else produced totals in another
+	# currency that silently mismatched the pages, so it is rejected outright.
+	# Passing --currency CAD explicitly remains valid.
 	if str(args.currency).upper() != "CAD":
 		sys.stderr.write(
-			f"\n!!! CURRENCY GUARDRAIL: running with --currency {args.currency}. "
-			"Standards mandate CAD on airbnb.ca — totals will NOT match the page prices the user sees. "
-			"Only proceed if the user explicitly requested this currency.\n\n"
+			f"Error: currency '{args.currency}' is not supported by this tool. All prices are evaluated in CAD on airbnb.ca by standard (travel/criteria.md, airbnb/AGENTS.md) so reported totals match the listing page prices the user sees. Do not override the currency: rerun without --currency or with --currency CAD.\n"
 		)
-		logger.warning(
-			"Currency guardrail: non-CAD currency '%s' requested; totals will mismatch airbnb.ca page prices",
-			args.currency,
-		)
+		sys.exit(2)
 
 	# Configure logging (redirect to stderr when --json is used so stdout stays clean)
 	log_level = logging.INFO if args.verbose else logging.WARNING
