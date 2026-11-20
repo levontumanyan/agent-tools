@@ -25,7 +25,7 @@ dev = [
 requires-dist = [
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "geopy", specifier = ">=2.4.1" },
-    { name = "pyairbnb", specifier = ">=0.0.12" },
+    { name = "pyairbnb", specifier = ">=2.2.7" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "tqdm", specifier = ">=4.66.0" },
 ]
