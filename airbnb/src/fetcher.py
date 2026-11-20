@@ -15,7 +15,6 @@ import pyairbnb.reviews
 import pyairbnb.search
 import pyairbnb.standardize as standardize
 import pyairbnb.start
-import pyairbnb.utils as pyairbnb_utils
 from curl_cffi import requests
 
 from auth import get_brave_cookies
@@ -248,74 +247,8 @@ def _new_pdp_exact_price(
 	}
 
 
-def _reviews_get_from_offset(
-	api_key: str,
-	offset: int,
-	product_id: str,
-	currency: str = "USD",
-	language: str = "en",
-	proxy_url: str = None,
-	timeout: int = 60,
-	**kwargs,
-):
-	"""Fetch listing reviews via StaysPdpReviewsQuery on airbnb.ca with hash auto-refresh."""
-	headers = {
-		"Accept": "application/json",
-		"Content-Type": "application/json",
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"X-Airbnb-Api-Key": api_key,
-	}
-	variables_data = {
-		"id": product_id,
-		"pdpReviewsRequest": {
-			"fieldSelector": "for_p3_translation_only",
-			"forPreview": False,
-			"limit": 50,
-			"offset": f"{offset}",
-			"showingTranslationButton": False,
-			"first": 50,
-			"sortingPreference": "MOST_RECENT",
-			"numberOfAdults": "1",
-			"numberOfChildren": "0",
-			"numberOfInfants": "0",
-			"numberOfPets": "0",
-			"after": None,
-		},
-	}
-	proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
-	op_hash = _get_operation_hash("StaysPdpReviewsQuery")
-
-	for attempt in range(2):
-		extension = {"persistedQuery": {"version": 1, "sha256Hash": op_hash}}
-		query = {
-			"operationName": "StaysPdpReviewsQuery",
-			"locale": language,
-			"currency": currency,
-			"variables": json.dumps(variables_data),
-			"extensions": json.dumps(extension),
-		}
-		url = f"https://www.airbnb.ca/api/v3/StaysPdpReviewsQuery/{op_hash}/?{urlencode(query)}"
-		response = requests.get(
-			url,
-			headers=headers,
-			proxies=proxies,
-			timeout=timeout,
-			impersonate="chrome124",
-		)
-		if response.status_code == 400 and attempt == 0:
-			refreshed = _refresh_operation_hash("StaysPdpReviewsQuery")
-			if refreshed and refreshed != op_hash:
-				op_hash = refreshed
-				continue
-		response.raise_for_status()
-		data = response.json()
-		return pyairbnb_utils.get_nested_value(
-			data, "data.presentation.stayProductDetailPage.reviews.reviews", []
-		)
-	return []
-
-
-pyairbnb.reviews.get_from_offset = _reviews_get_from_offset
+# Reviews: no local patch needed — upstream pyairbnb >=2.2.7 (PRs #71/#72) ships the
+# StaysPdpReviewsQuery hash-rotation fix with live hash refresh and error hardening.
 
 _thread_local = threading.local()
 
