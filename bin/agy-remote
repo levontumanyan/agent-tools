@@ -210,7 +210,7 @@ def cmd_msg(args) -> None:
 
 
 def cmd_stop(args) -> None:
-	"""Stop a running task gracefully (/exit) or force-kill its tmux session."""
+	"""Stop a live worker at the user's request: /exit (graceful, lets the runner finish gate & PR) or force-kill."""
 	task_id = validate_task_id(args.task_id)
 	base_url = get_base_url(args)
 	res = api_request(base_url, f"/api/tasks/{urllib.parse.quote(task_id)}/stop", {"graceful": not args.kill})
@@ -292,7 +292,7 @@ def main() -> None:
 	p_msg.add_argument("--from", dest="sender", default="coordinator", help="Sender identity")
 	p_msg.add_argument("--run-id", default="", help="Coordinator run ID")
 
-	p_stop = subparsers.add_parser("stop", help="Stop a running task")
+	p_stop = subparsers.add_parser("stop", help="Stop a live worker (user-requested only): /exit or force-kill")
 	p_stop.add_argument("task_id", help="Task ID")
 	p_stop.add_argument("--kill", action="store_true", help="Force-kill tmux session instead of sending /exit")
 
