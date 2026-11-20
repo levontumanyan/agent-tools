@@ -21,6 +21,15 @@
 - **Nightly Rate Requirement**: **ALWAYS** explicitly output and report the nightly rate (e.g. CAD $XX.XX/night or /nt) alongside total prices in CLI outputs and agent summaries, whether presenting a single listing or multiple listings.
 - **Visitor Policy**: **ALWAYS** flag listings whose house rules explicitly ban visitors (e.g. "no visitors", "only registered guests may enter") — the user wants to bring an occasional date over.
 
+# pyairbnb Upgrades
+
+Local patches in `src/fetcher.py` override the upstream package at import time; upgrades swap the venv package and never clobber them. When upstream absorbs a patch (merged PR), delete the local copy.
+
+1. `uv lock --upgrade-package pyairbnb && uv sync`
+2. `make test` — `tests/test_patch_inventory.py` fails loudly if a local patch stopped applying after the upgrade.
+3. Live smoke: `uv run airbnb --room <id> --check_in YYYY-MM-DD --check_out YYYY-MM-DD` — price and reviews must return.
+4. `uv tool install --force ~/repos/agent-tools/airbnb` — the installed CLI is a snapshot with its own venv.
+
 # Development Workflow Mandates
 
 After every major code change, the following steps MUST be performed in order:
