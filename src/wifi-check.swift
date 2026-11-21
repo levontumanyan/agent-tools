@@ -133,6 +133,8 @@ struct ScanReport: Codable {
 	var networks: [WifiDetails]
 	var fiveGHzBlocks: [BlockCongestion]
 	var advice: ChannelAdvice
+	var ownRouterAdvice: TargetedChannelAdvice?
+	var upstreamAdvice: TargetedChannelAdvice?
 	var best24GHzChannel: Int?
 	var best24GHzSummary: String
 }
@@ -161,17 +163,17 @@ func printUsage() {
 
 	Features:
 	  • Wi-Fi Link Health: RSSI, SNR, MIMO streams, transmit link rate, and channel width
-	  • VPN & Stealth Audit: Validates home residential IP, tests for DNS leaks, and checks IPv6
+	  • VPN & Stealth Audit: Detects tunnels (travel router, home IP/ISP match, or VPN Wi-Fi names from config), tests for DNS leaks, and checks IPv6
 	  • Latency Route Map: Hop-by-hop breakdown (Local Airwaves ➔ Subsea Tunnel ➔ Home LAN ➔ Edge)
 	  • Internet Capacity: Download/upload bandwidth and loaded bufferbloat responsiveness (RPM)
 	  • Travel Router Uplink: Auto-detects Beryl AX upstream Wi-Fi (Airbnb SSID, RSSI, channel)
 	  • Channel Congestion Analysis: Scores all 5 GHz 80-MHz blocks from the air scan, marks yours,
-	    and recommends which channel to move the router to (with `-s`; machine-readable in `-s -j`)
+	    and recommends channels for both your travel router and the upstream (with `-s`; machine-readable in `-s -j`)
 
 	Options:
 	  -q, --quick          Quick mode (skip ~15s throughput test; runs Wi-Fi + VPN + hops + ping)
 	  -d, --deep           Deep hardware mode (reads airtime congestion, MIMO streams, MCS via sudo wdutil)
-	  -s, --scan           Scan and display nearby Wi-Fi networks and signal strengths
+	  -s, --scan           Scan nearby networks; recommend channels for your travel router and the upstream
 	  -j, --json           Output raw JSON for automation, logging, or Grafana dashboards
 	      --ship           Ship test results to InfluxDB / Grafana dashboard
 	  -c, --count <N>      Number of ping probe packets (default: 5)
@@ -183,6 +185,9 @@ func printUsage() {
 	    "Comcast,Vodafone", and country names). Nothing personal is hardcoded.
 	  WIFI_CHECK_ROUTER_KEY
 	    SSH key for travel-router discovery; otherwise all ~/.ssh/id_* keys are tried.
+	  WIFI_CHECK_VPN_SSIDS / WIFI_CHECK_VPN_LABEL
+	    Wi-Fi network names (comma-separated) that route through your VPN;
+	    joining one marks the run as tunneled. Optional label names the tunnel.
 	  WIFI_CHECK_INFLUX_URL / TOKEN / ORG / BUCKET
 	    Telemetry shipping; all four required to ship.
 	"""
@@ -508,6 +513,158 @@ func analyzeFiveGHzBlocks(networks: [WifiDetails], currentChannel: Int?) -> (blo
 	}
 
 	return (blocks, advice)
+}
+
+struct TargetedChannelAdvice: Codable {
+	var subject: String
+	var advice: ChannelAdvice
+	var note: String?
+}
+
+// One identified AP to discount from a target's congestion verdict. Modern
+// macOS anonymizes SSID/BSSID of scanned networks, so identification is by name
+// where available and by scan-entry index otherwise (resolved in
+// computeDualChannelAdvice from same-radio RSSI proximity).
+struct ScanExclusion {
+	var bssid: String?
+	var ssid: String?
+	var entryIndex: Int?
+}
+
+// Per-target 5 GHz advice. The target's own beacon never counts as congestion
+// in its current block (moving away is the point), APs already advised to move
+// (the user's other router) are discounted, and recommended blocks never
+// collide: the second target cannot claim the first target's new block.
+func targetedChannelAdvice(
+	networks: [WifiDetails],
+	blocks: [BlockCongestion],
+	subject: String,
+	currentChannel: Int?,
+	exclusions: [ScanExclusion],
+	excludedRanges: [String],
+	note: String?
+) -> TargetedChannelAdvice? {
+	guard let cc = currentChannel, (36...177).contains(cc),
+	      let def = fiveGHzBlockDefs.first(where: { $0.channels.contains(cc) }) else { return nil }
+
+	let foreign: [WifiDetails] = networks.enumerated().compactMap { idx, net in
+		guard net.band == "5 GHz", def.channels.contains(net.channel), net.rssi > -90 else { return nil }
+		for ex in exclusions {
+			if let i = ex.entryIndex, i == idx { return nil }
+			if let b = ex.bssid, let nb = net.bssid, b.lowercased() == nb.lowercased() { return nil }
+			if let s = ex.ssid, s.lowercased() != "(hidden)", let ns = net.ssid, ns != "(Hidden)", s.lowercased() == ns.lowercased() { return nil }
+		}
+		return net
+	}
+	let strongest = foreign.map(\.rssi).max()
+	let verdict = congestionVerdict(apCount: foreign.count, strongestRssi: strongest)
+	let currentLabel = "\(def.channels.first!)-\(def.channels.last!)"
+
+	var advice = ChannelAdvice(
+		currentChannel: cc,
+		currentVerdict: verdict,
+		recommendedChannel: nil,
+		recommendedRange: nil,
+		action: "unknown",
+		summary: ""
+	)
+	let foreignDesc = "\(foreign.count) other AP\(foreign.count == 1 ? "" : "s"), strongest \(strongest.map { "\($0) dBm" } ?? "—")"
+
+	if verdict == "Congested" || verdict == "Moderate" {
+		let candidates = blocks.filter { $0.rangeLabel != currentLabel && !excludedRanges.contains($0.rangeLabel) && $0.verdict != "Congested" }
+		if let best = candidates.sorted(by: blockLess).first {
+			advice.action = "move"
+			advice.recommendedChannel = best.primaryChannel
+			advice.recommendedRange = best.rangeLabel
+			advice.summary = "\(subject) is on channel \(cc) (block \(currentLabel)) — \(verdict.lowercased()): \(foreignDesc). Move it to channel \(best.primaryChannel) (block \(best.rangeLabel), \(best.verdict.lowercased())\(best.isDfs ? ", DFS radar-shared" : "")). Set manually, not Auto; keep 80 MHz width."
+		} else {
+			advice.action = "stay"
+			advice.summary = "\(subject) is on channel \(cc) (block \(currentLabel)) — \(verdict.lowercased()), but no cleaner block remains."
+		}
+	} else {
+		advice.action = "stay"
+		advice.summary = "No change needed — \(subject) stays on channel \(cc) (block \(currentLabel)): \(verdict.lowercased()), \(foreignDesc)."
+	}
+	return TargetedChannelAdvice(subject: subject, advice: advice, note: note)
+}
+
+// Dual channel advice: the user's own travel-router AP is evaluated first
+// (fully under their control); the upstream router's evaluation then
+// discounts the own AP when it has been advised to move, so one real cause of
+// congestion never produces two conflicting move recommendations.
+// macOS anonymizes scanned SSID/BSSID, so the user's APs are pinned down by
+// position in the scan list: the own AP matches the Mac's link channel with
+// RSSI a few dB off the link RSSI (same radio, near-simultaneous), and the
+// upstream's own AP is the strongest usable entry on its channel besides
+// the travel router itself.
+func computeDualChannelAdvice(
+	networks: [WifiDetails],
+	blocks: [BlockCongestion]?,
+	currentWifi: WifiDetails?,
+	router: RouterUpstreamDetails?
+) -> (own: TargetedChannelAdvice?, upstream: TargetedChannelAdvice?) {
+	let computed = blocks ?? analyzeFiveGHzBlocks(networks: networks, currentChannel: nil).blocks
+
+	var ownApIndex: Int? = nil
+	if let cur = currentWifi, cur.band == "5 GHz", (36...177).contains(cur.channel) {
+		ownApIndex = networks.firstIndex { net in
+			net.band == "5 GHz" && net.channel == cur.channel && abs(net.rssi - cur.rssi) <= 6
+		}
+	}
+	var upstreamSelfIndex: Int? = nil
+	if let up = router?.upstreamChannel {
+		upstreamSelfIndex = networks.indices
+			.filter { networks[$0].band == "5 GHz" && networks[$0].channel == up && networks[$0].rssi >= -70 && $0 != ownApIndex }
+			.max { networks[$0].rssi < networks[$1].rssi }
+	}
+
+	var own: TargetedChannelAdvice? = nil
+	if router != nil, let cur = currentWifi, cur.band == "5 GHz", (36...177).contains(cur.channel) {
+		let mode = router?.uplinkMode ?? ""
+		var pinNote: String? = nil
+		if let up = router?.upstreamChannel, up == cur.channel, mode.contains("standby") {
+			pinNote = "Its 5 GHz radio is pinned to channel \(up) by the standby repeater (still associated with the upstream) — disable Wi-Fi repeater mode first; the uplink already runs on Ethernet WAN."
+		} else if mode.contains("Repeater") {
+			pinNote = "In repeater mode the AP channel follows the upstream — switch the uplink to Ethernet WAN before setting a channel."
+		}
+		own = targetedChannelAdvice(
+			networks: networks, blocks: computed,
+			subject: "Your travel router (\"\(cur.ssid ?? "5 GHz LAN")\")",
+			currentChannel: cur.channel,
+			exclusions: [ScanExclusion(bssid: cur.bssid, ssid: cur.ssid, entryIndex: ownApIndex)],
+			excludedRanges: [], note: pinNote
+		)
+		if own?.advice.action != "move" { own?.note = nil }
+	}
+
+	var upstream: TargetedChannelAdvice? = nil
+	if let up = router?.upstreamChannel, (36...177).contains(up) {
+		var exclusions = [ScanExclusion(bssid: router?.upstreamBssid, ssid: router?.upstreamSsid, entryIndex: upstreamSelfIndex)]
+		if own?.advice.action == "move" {
+			exclusions.append(ScanExclusion(bssid: currentWifi?.bssid, ssid: currentWifi?.ssid, entryIndex: ownApIndex))
+		}
+		upstream = targetedChannelAdvice(
+			networks: networks, blocks: computed,
+			subject: "Upstream router \"\(router?.upstreamSsid ?? "?")\"",
+			currentChannel: up,
+			exclusions: exclusions,
+			excludedRanges: own?.advice.action == "move" ? [own?.advice.recommendedRange].compactMap { $0 } : [],
+			note: "Only applicable if you control the upstream router (own home/apartment); at a rental, share this with your host instead."
+		)
+	}
+	return (own, upstream)
+}
+
+func renderTargetedAdviceLine(_ target: TargetedChannelAdvice) {
+	if target.advice.action == "move" {
+		print("  \(Colors.red)→ \(target.subject): move its 5 GHz channel to \(target.advice.recommendedChannel ?? -1) (block \(target.advice.recommendedRange ?? "?")) — set manually, not Auto, keep 80 MHz width.\(Colors.reset)")
+		print("  \(Colors.dim)\(target.advice.summary)\(Colors.reset)")
+	} else {
+		print("  \(Colors.green)✔ \(target.advice.summary)\(Colors.reset)")
+	}
+	if let note = target.note, !note.isEmpty {
+		print("  \(Colors.yellow)ℹ \(note)\(Colors.reset)")
+	}
 }
 
 func best24GHzChannel(networks: [WifiDetails]) -> (channel: Int, count: Int, strongestRssi: Int?)? {
@@ -1052,7 +1209,7 @@ func shipTelemetryToInflux(report: DiagnosticReport, pingGw: PingResult?, pingEd
 	_ = sema.wait(timeout: .now() + 2.5)
 }
 
-func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status: String, isTravelRouter: Bool) -> VpnAuditResult {
+func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status: String, isTravelRouter: Bool, currentSsid: String?) -> VpnAuditResult {
 	let env = ProcessInfo.processInfo.environment
 	let homeIp = env["WIFI_CHECK_HOME_IP"] ?? readConfigEnv("WIFI_CHECK_HOME_IP")
 	// Home identity comes from config, never hardcoded: comma-separated fragments.
@@ -1060,15 +1217,27 @@ func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status
 		.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
 	let homeCountries = (env["WIFI_CHECK_HOME_COUNTRY"] ?? readConfigEnv("WIFI_CHECK_HOME_COUNTRY") ?? "")
 		.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+	// VPN Wi-Fi names from config: joining any of these networks means traffic
+	// is expected to ride a tunnel, even if router SSH discovery fails.
+	let vpnSsidNames = (env["WIFI_CHECK_VPN_SSIDS"] ?? readConfigEnv("WIFI_CHECK_VPN_SSIDS") ?? "")
+		.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+	let vpnLabel = (env["WIFI_CHECK_VPN_LABEL"] ?? readConfigEnv("WIFI_CHECK_VPN_LABEL") ?? "")
+		.trimmingCharacters(in: .whitespaces)
 
 	let orgLower = (ip.org ?? "").lowercased()
 	let ispMatched = !ispFragments.isEmpty && ispFragments.contains { orgLower.contains($0) }
 	let isHomeMatched = (homeIp != nil && ip.publicIp == homeIp) || ispMatched
-	let isVpn = isTravelRouter || isHomeMatched
+	let ssidLower = currentSsid?.lowercased() ?? ""
+	let ssidMatched = !vpnSsidNames.isEmpty && vpnSsidNames.contains(ssidLower)
+	let isVpn = isTravelRouter || isHomeMatched || ssidMatched
 
 	let tunnelName: String
 	if isHomeMatched, let org = ip.org, !org.isEmpty {
 		tunnelName = "WireGuard Tunnel to Home ISP (\(org))"
+	} else if ssidMatched, !vpnLabel.isEmpty {
+		tunnelName = vpnLabel
+	} else if ssidMatched {
+		tunnelName = "Active VPN Tunnel (via \"\(currentSsid ?? "")\")"
 	} else if isVpn {
 		tunnelName = "Active VPN Tunnel"
 	} else {
@@ -1288,19 +1457,20 @@ while i < args.count {
 if isScan {
 	let networks = scanNearbyNetworks()
 
-	// Context: which 5 GHz channel does the user actually depend on?
-	// Travel-router uplink wins; else the Mac's own 5 GHz link.
+	// Context: which 5 GHz channels does the user actually depend on?
+	// With a travel router: its own LAN AP (the Mac's link) AND the upstream.
 	let currentWifi = inspectCurrentWifi()
 	let gateway = getLocalGateway()
 	let router = fetchTravelRouterTelemetry(gateway: gateway)
 	var currentChannel: Int? = nil
-	if let upstream = router?.upstreamChannel, upstream >= 36, upstream <= 177 {
-		currentChannel = upstream
-	} else if let cur = currentWifi, cur.band == "5 GHz", cur.channel >= 36, cur.channel <= 177 {
+	if let cur = currentWifi, cur.band == "5 GHz", cur.channel >= 36, cur.channel <= 177 {
 		currentChannel = cur.channel
+	} else if let upstream = router?.upstreamChannel, upstream >= 36, upstream <= 177 {
+		currentChannel = upstream
 	}
 
 	let (blocks, advice) = analyzeFiveGHzBlocks(networks: networks, currentChannel: currentChannel)
+	let dual = computeDualChannelAdvice(networks: networks, blocks: blocks, currentWifi: currentWifi, router: router)
 	let best24 = best24GHzChannel(networks: networks)
 	let best24Summary: String
 	if let b24 = best24 {
@@ -1310,7 +1480,7 @@ if isScan {
 	}
 
 	if isJson {
-		let report = ScanReport(networks: networks, fiveGHzBlocks: blocks, advice: advice, best24GHzChannel: best24?.channel, best24GHzSummary: best24Summary)
+		let report = ScanReport(networks: networks, fiveGHzBlocks: blocks, advice: advice, ownRouterAdvice: dual.own, upstreamAdvice: dual.upstream, best24GHzChannel: best24?.channel, best24GHzSummary: best24Summary)
 		let encoder = JSONEncoder()
 		encoder.outputFormatting = .prettyPrinted
 		if let data = try? encoder.encode(report), let str = String(data: data, encoding: .utf8) {
@@ -1331,6 +1501,9 @@ if isScan {
 			)
 			print(row)
 		}
+		if networks.contains(where: { $0.ssid == "(Hidden)" }) {
+			print("\n  \(Colors.dim)SSID names are hidden by macOS privacy for non-joined networks; anonymous entries are keyed by band, channel, and signal.\(Colors.reset)")
+		}
 
 		print("\n\(Colors.bold)5 GHz Channel Congestion (80 MHz blocks):\(Colors.reset)\n")
 		let header = "  " + pad("Block", to: 10) + pad("APs", to: 4) + pad("Strongest", to: 12) + "Verdict"
@@ -1346,16 +1519,22 @@ if isScan {
 		print("\n  \(Colors.dim)Blocks 52-64 / 100-128 / 132-144 are DFS (radar-shared); 36-48 and 149-161 are always-open. Only APs above -90 dBm are scored.\(Colors.reset)")
 
 		print("\n\(Colors.bold)Recommendation:\(Colors.reset)")
-		switch advice.action {
-		case "move":
-			print("  \(Colors.red)→ Move the router's 5 GHz channel to \(advice.recommendedChannel ?? -1) (block \(advice.recommendedRange ?? "?")) — set manually, not Auto, keep 80 MHz width.\(Colors.reset)")
-			print("  \(Colors.dim)\(advice.summary)\(Colors.reset)")
-		case "consider":
-			print("  \(Colors.yellow)~ \(advice.summary)\(Colors.reset)")
-		case "stay":
-			print("  \(Colors.green)✔ \(advice.summary)\(Colors.reset)")
-		default:
-			print("  \(Colors.yellow)~ \(advice.summary)\(Colors.reset)")
+		if dual.own != nil || dual.upstream != nil {
+			for target in [dual.own, dual.upstream].compactMap({ $0 }) {
+				renderTargetedAdviceLine(target)
+			}
+		} else {
+			switch advice.action {
+			case "move":
+				print("  \(Colors.red)→ Move the router's 5 GHz channel to \(advice.recommendedChannel ?? -1) (block \(advice.recommendedRange ?? "?")) — set manually, not Auto, keep 80 MHz width.\(Colors.reset)")
+				print("  \(Colors.dim)\(advice.summary)\(Colors.reset)")
+			case "consider":
+				print("  \(Colors.yellow)~ \(advice.summary)\(Colors.reset)")
+			case "stay":
+				print("  \(Colors.green)✔ \(advice.summary)\(Colors.reset)")
+			default:
+				print("  \(Colors.yellow)~ \(advice.summary)\(Colors.reset)")
+			}
 		}
 		print("  \(Colors.dim)\(best24Summary)\(Colors.reset)\n")
 	}
@@ -1425,6 +1604,17 @@ queue.async {
 	group.leave()
 }
 
+// Full human-readable runs also scan the air concurrently: the channel
+// congestion advisory reuses it, and the cost hides under the other probes.
+var scanNetworks: [WifiDetails]? = nil
+if !isQuick && !isJson {
+	group.enter()
+	queue.async {
+		scanNetworks = scanNearbyNetworks()
+		group.leave()
+	}
+}
+
 var pingGw: PingResult? = nil
 if let gw = gateway {
 	group.enter()
@@ -1457,11 +1647,25 @@ queue.async {
 
 // Wait for all concurrent network queries to complete
 group.wait()
+routerGroup.wait()
 
 // 3. Assemble Audit & Ping Results
 let isTravelRouter = routerDetails?.isBeryl ?? false
-let vpn = auditVpnAndDns(ip: ipDetails, dnsGeo: ednsData.dnsGeo, ednsGeo: ednsData.ednsGeo, ipv6Status: ipv6Status, isTravelRouter: isTravelRouter)
+let vpn = auditVpnAndDns(ip: ipDetails, dnsGeo: ednsData.dnsGeo, ednsGeo: ednsData.ednsGeo, ipv6Status: ipv6Status, isTravelRouter: isTravelRouter, currentSsid: wifi?.ssid)
 let pings: [PingResult] = [pingGw, pingCloudflare, pingGoogle, pingQuad9].compactMap { $0 }
+
+// Channel congestion advisory (full runs): travel-router AP + upstream,
+// or the current network when no travel router is in play.
+var channelAdvisory: (own: TargetedChannelAdvice?, upstream: TargetedChannelAdvice?, single: ChannelAdvice?)? = nil
+if let nets = scanNetworks {
+	if isTravelRouter {
+		let dual = computeDualChannelAdvice(networks: nets, blocks: nil, currentWifi: wifi, router: routerDetails)
+		channelAdvisory = (dual.own, dual.upstream, nil)
+	} else if let cur = wifi, cur.band == "5 GHz", cur.channel >= 36, cur.channel <= 177 {
+		let (_, single) = analyzeFiveGHzBlocks(networks: nets, currentChannel: cur.channel)
+		channelAdvisory = (nil, nil, single)
+	}
+}
 
 // 4. Run Throughput Speed Test (if not quick mode)
 var speed: SpeedResult? = nil
@@ -1584,6 +1788,21 @@ if let r = routerDetails, r.isBeryl {
 	if let wg = r.wireguardActive {
 		let wgStatus = wg ? "\(Colors.green)Connected (Tunnel Up)\(Colors.reset)" : "\(Colors.red)Down\(Colors.reset)"
 		print("  • WireGuard Tunnel: \(wgStatus)")
+	}
+}
+
+// Channel Congestion Advisory (full runs; silent when everything is clean)
+if let adv = channelAdvisory {
+	let needsAdvice = adv.own?.advice.action == "move" || adv.upstream?.advice.action == "move" || adv.single?.action == "move"
+	if needsAdvice {
+		print("\n\(Colors.bold)Channel Congestion Advisory:\(Colors.reset)")
+		if let own = adv.own { renderTargetedAdviceLine(own) }
+		if let up = adv.upstream { renderTargetedAdviceLine(up) }
+		if let s = adv.single, s.action == "move" {
+			print("  \(Colors.red)→ Move this network's 5 GHz channel to \(s.recommendedChannel ?? -1) (block \(s.recommendedRange ?? "?")) — set manually, not Auto, keep 80 MHz width.\(Colors.reset)")
+			print("  \(Colors.dim)\(s.summary)\(Colors.reset)")
+			print("  \(Colors.yellow)ℹ Only applicable if you control this router; at a rental, share this with your host instead.\(Colors.reset)")
+		}
 	}
 }
 
