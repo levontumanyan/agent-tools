@@ -18,9 +18,9 @@ import pyairbnb.start
 import src.fetcher as fetcher
 
 
-def test_api_get_patch_is_applied():
-	"""api.get must be wrapped: falls back to a default key instead of raising."""
-	assert pyairbnb.api.get.__name__ == "_robust_pyairbnb_api_get"
+def test_api_get_runs_pure_upstream():
+	"""No local api.get patch: upstream (>=2.2.8, PR #73) owns the fallback key path."""
+	assert pyairbnb.api.get.__module__ == "pyairbnb.api"
 
 
 def test_perf_stubs_are_applied():
@@ -53,6 +53,6 @@ def test_reviews_run_pure_upstream():
 
 
 def test_upstream_floor_is_respected():
-	"""Upstream must be new enough to carry PRs #70/#71/#72 (price + reviews fixes)."""
+	"""Upstream must be new enough to carry PRs #70-#74 (price, reviews, api key, details fallbacks)."""
 	major, minor, patch = (int(x) for x in version("pyairbnb").split("."))
-	assert (major, minor, patch) >= (2, 2, 7)
+	assert (major, minor, patch) >= (2, 2, 8)

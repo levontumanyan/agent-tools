@@ -20,25 +20,8 @@ from curl_cffi import requests
 from auth import get_brave_cookies
 from config import AIRBNB_COOKIE, CACHE_DIR, LISTING_CACHE
 
-# Robustly patch pyairbnb.api.get to fallback to airbnb.ca or default key if airbnb.com redirects
-_orig_pyairbnb_api_get = pyairbnb.api.get
-
-
-def _robust_pyairbnb_api_get(*args, **kwargs):
-	try:
-		return _orig_pyairbnb_api_get(*args, **kwargs)
-	except Exception:
-		try:
-			r = requests.get("https://www.airbnb.ca", impersonate="chrome120")
-			m = re.search(r'"api_config":\{"key":"([^"]+)"', r.text)
-			if m:
-				return m.group(1)
-		except Exception:
-			pass
-		return "d306zoyjsyarp7ifhu67rjxn52tv0t20"
-
-
-pyairbnb.api.get = _robust_pyairbnb_api_get
+# api.get: no local patch needed — upstream pyairbnb >=2.2.8 (PR #73) falls back
+# to the public web API key when the homepage parse fails.
 
 # Fast-path: stub out heavy calendar & host details fetches that aren't used in scoring
 pyairbnb.start.get_calendar = lambda *args, **kwargs: {}
@@ -310,77 +293,7 @@ def _authenticated_details_get(room_url, language, proxy_url, timeout=None, **kw
 	data_formatted, price_dependency_input = parse.parse_body_details_wrapper(
 		response.text
 	)
-	try:
-		data_raw, _, _ = parse.parse_body_details(response.text)
-		pdp = (
-			data_raw.get("data", {})
-			.get("presentation", {})
-			.get("stayProductDetailPage", {})
-			.get("sections", {})
-		)
-		meta = pdp.get("metadata", {})
-		seo_title = (meta.get("seoFeatures") or {}).get("title") or ""
-		share_title = (meta.get("sharingConfig") or {}).get("title") or ""
-		if not data_formatted.get("title"):
-			data_formatted["title"] = (
-				seo_title.split(" - ")[0].strip() if seo_title else share_title
-			)
-		if share_title and not data_formatted.get("sub_description", {}).get("title"):
-			data_formatted.setdefault("sub_description", {"title": "", "items": []})[
-				"title"
-			] = share_title
-		if not data_formatted.get("description"):
-			desc_parts = []
-			for sec in pdp.get("sections", []) or []:
-				if sec.get("sectionId") == "DESCRIPTION_MODAL":
-					for it in (sec.get("section") or {}).get("items") or []:
-						hdr = it.get("title")
-						txt = ((it.get("html") or {}).get("htmlText") or "").strip()
-						if txt:
-							desc_parts.append(f"{hdr}: {txt}" if hdr else txt)
-			if desc_parts:
-				data_formatted["description"] = "\n\n".join(desc_parts)
-
-		# Primary extraction for amenities from pdpPresentation
-		node_amenities = (
-			data_raw.get("data", {})
-			.get("node", {})
-			.get("pdpPresentation", {})
-			.get("amenities", {})
-		)
-		groups_raw = (
-			node_amenities.get("seeAllAmenitiesGroups")
-			or node_amenities.get("previewAmenitiesGroups")
-			or []
-		)
-		if groups_raw:
-			formatted_groups = []
-			for g in groups_raw:
-				g_title = g.get("title") or ""
-				is_not_included = "not included" in g_title.lower()
-				val_list = []
-				for am in g.get("amenities") or []:
-					val_list.append(
-						{
-							"title": am.get("title") or "",
-							"subtitle": am.get("subtitle") or "",
-							"icon": am.get("icon") or "",
-							"available": False
-							if is_not_included
-							else am.get("available", True),
-						}
-					)
-				if val_list:
-					formatted_groups.append(
-						{
-							"title": g_title,
-							"values": val_list,
-						}
-					)
-			if formatted_groups:
-				data_formatted["amenities"] = formatted_groups
-	except Exception:
-		pass
+	# Title/description/amenities fallbacks are upstream since pyairbnb 2.2.8 (PR #74).
 	cookies = response.cookies
 	return data_formatted, price_dependency_input, cookies
 
@@ -604,7 +517,7 @@ def get_listing_calendar(room_id, month=None, year=None, count=3, currency="CAD"
 		year, month = now.year, now.month
 	count = int(count) if count else 3
 
-	api_key = _robust_pyairbnb_api_get()
+	api_key = pyairbnb.api.get("")
 	headers = {
 		"Accept": "application/json",
 		"Content-Type": "application/json",
