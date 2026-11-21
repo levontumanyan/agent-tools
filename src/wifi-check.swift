@@ -800,7 +800,7 @@ func sshPortOpen(_ host: String) -> Bool {
 	let pipe = Pipe()
 	let proc = Process()
 	proc.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
-	proc.arguments = ["-z", "-G", "1", "-w", "2", host, "22"]
+	proc.arguments = ["-z", "-G", "1", "-w", "1", host, "22"]
 	proc.standardOutput = pipe
 	proc.standardError = pipe
 	do {
