@@ -110,6 +110,33 @@ struct RouterUpstreamDetails: Codable {
 	var wireguardActive: Bool?
 }
 
+struct BlockCongestion: Codable {
+	var rangeLabel: String
+	var primaryChannel: Int
+	var apCount: Int
+	var strongestRssiDbm: Int?
+	var isDfs: Bool
+	var verdict: String
+	var isCurrent: Bool
+}
+
+struct ChannelAdvice: Codable {
+	var currentChannel: Int?
+	var currentVerdict: String?
+	var recommendedChannel: Int?
+	var recommendedRange: String?
+	var action: String
+	var summary: String
+}
+
+struct ScanReport: Codable {
+	var networks: [WifiDetails]
+	var fiveGHzBlocks: [BlockCongestion]
+	var advice: ChannelAdvice
+	var best24GHzChannel: Int?
+	var best24GHzSummary: String
+}
+
 struct DiagnosticReport: Codable {
 	var timestamp: String
 	var wifi: WifiDetails?
@@ -138,6 +165,8 @@ func printUsage() {
 	  • Latency Route Map: Hop-by-hop breakdown (Local Airwaves ➔ Subsea Tunnel ➔ Home LAN ➔ Edge)
 	  • Internet Capacity: Download/upload bandwidth and loaded bufferbloat responsiveness (RPM)
 	  • Travel Router Uplink: Auto-detects Beryl AX upstream Wi-Fi (Airbnb SSID, RSSI, channel)
+	  • Channel Congestion Analysis: Scores all 5 GHz 80-MHz blocks from the air scan, marks yours,
+	    and recommends which channel to move the router to (with `-s`; machine-readable in `-s -j`)
 
 	Options:
 	  -q, --quick          Quick mode (skip ~15s throughput test; runs Wi-Fi + VPN + hops + ping)
@@ -147,6 +176,15 @@ func printUsage() {
 	      --ship           Ship test results to InfluxDB / Grafana dashboard
 	  -c, --count <N>      Number of ping probe packets (default: 5)
 	  -h, --help           Show this help message
+
+	Configuration (~/.config/wifi-check/config.env or ~/.config/agent-tools/.env):
+	  WIFI_CHECK_HOME_IP / WIFI_CHECK_HOME_ISP / WIFI_CHECK_HOME_COUNTRY
+	    Home identity for the VPN/stealth audit (public IP, ISP fragments like
+	    "Comcast,Vodafone", and country names). Nothing personal is hardcoded.
+	  WIFI_CHECK_ROUTER_KEY
+	    SSH key for travel-router discovery; otherwise all ~/.ssh/id_* keys are tried.
+	  WIFI_CHECK_INFLUX_URL / TOKEN / ORG / BUCKET
+	    Telemetry shipping; all four required to ship.
 	"""
 	print(usage)
 }
@@ -367,6 +405,126 @@ func scanNearbyNetworks() -> [WifiDetails] {
 	}
 	return results.sorted { $0.rssi > $1.rssi }
 }
+
+// MARK: - 5 GHz Channel Congestion Analysis
+
+let fiveGHzBlockDefs: [(primary: Int, channels: [Int], dfs: Bool)] = [
+	(36, [36, 40, 44, 48], false),
+	(52, [52, 56, 60, 64], true),
+	(100, [100, 104, 108, 112], true),
+	(116, [116, 120, 124, 128], true),
+	(132, [132, 136, 140, 144], true),
+	(149, [149, 153, 157, 161], false)
+]
+
+func congestionVerdict(apCount: Int, strongestRssi: Int?) -> String {
+	guard let strongest = strongestRssi, apCount > 0 else { return "Empty" }
+	if strongest >= -55 || (apCount >= 3 && strongest >= -70) { return "Congested" }
+	if strongest >= -67 { return "Moderate" }
+	if strongest >= -80 { return "Light" }
+	return "Clean"
+}
+
+func verdictRank(_ verdict: String) -> Int {
+	switch verdict {
+	case "Empty": return 0
+	case "Clean": return 1
+	case "Light": return 2
+	case "Moderate": return 3
+	default: return 4
+	}
+}
+
+func verdictColor(_ verdict: String) -> String {
+	switch verdict {
+	case "Congested": return Colors.red
+	case "Moderate": return Colors.yellow
+	case "Light": return Colors.cyan
+	default: return Colors.green
+	}
+}
+
+func linearPower(_ rssi: Int) -> Double {
+	return pow(10.0, Double(rssi) / 10.0)
+}
+
+func blockLess(_ a: BlockCongestion, _ b: BlockCongestion) -> Bool {
+	// DFS blocks carry a +2 rank penalty: radar-sharing can force channel vacate,
+	// so an "Empty" DFS block loses to a "Clean" always-open block.
+	let ra = verdictRank(a.verdict) + (a.isDfs ? 2 : 0)
+	let rb = verdictRank(b.verdict) + (b.isDfs ? 2 : 0)
+	if ra != rb { return ra < rb }
+	if a.isDfs != b.isDfs { return !a.isDfs }
+	let pa = a.strongestRssiDbm.map { linearPower($0) } ?? 0
+	let pb = b.strongestRssiDbm.map { linearPower($0) } ?? 0
+	return pa < pb
+}
+
+func analyzeFiveGHzBlocks(networks: [WifiDetails], currentChannel: Int?) -> (blocks: [BlockCongestion], advice: ChannelAdvice) {
+	var blocks: [BlockCongestion] = []
+	for def in fiveGHzBlockDefs {
+		let aps = networks.filter { $0.band == "5 GHz" && def.channels.contains($0.channel) && $0.rssi > -90 }
+		let strongest = aps.map(\.rssi).max()
+		blocks.append(BlockCongestion(
+			rangeLabel: "\(def.channels.first!)-\(def.channels.last!)",
+			primaryChannel: def.primary,
+			apCount: aps.count,
+			strongestRssiDbm: strongest,
+			isDfs: def.dfs,
+			verdict: congestionVerdict(apCount: aps.count, strongestRssi: strongest),
+			isCurrent: currentChannel.map { def.channels.contains($0) } ?? false
+		))
+	}
+
+	let currentBlock = blocks.first(where: { $0.isCurrent })
+	var advice = ChannelAdvice(
+		currentChannel: currentChannel,
+		currentVerdict: currentBlock?.verdict,
+		recommendedChannel: nil,
+		recommendedRange: nil,
+		action: "unknown",
+		summary: "Current 5 GHz channel unknown and all blocks look busy — inspect manually."
+	)
+
+	if let cur = currentBlock, let cc = currentChannel {
+		let needsMove = cur.verdict == "Congested" || cur.verdict == "Moderate"
+		if !needsMove {
+			advice.action = "stay"
+			advice.summary = "No change needed — your 5 GHz channel \(cc) (block \(cur.rangeLabel)) is \(cur.verdict.lowercased()): \(cur.apCount) AP\(cur.apCount == 1 ? "" : "s") in range, strongest \(cur.strongestRssiDbm.map { "\($0) dBm" } ?? "—")."
+		} else if let best = blocks.filter({ !$0.isCurrent }).sorted(by: blockLess).first {
+			advice.recommendedChannel = best.primaryChannel
+			advice.recommendedRange = best.rangeLabel
+			advice.action = "move"
+			advice.summary = "Your 5 GHz channel \(cc) (block \(cur.rangeLabel)) is \(cur.verdict.lowercased()): \(cur.apCount) AP\(cur.apCount == 1 ? "" : "s"), strongest \(cur.strongestRssiDbm.map { "\($0) dBm" } ?? "—"). Move the router to channel \(best.primaryChannel) (block \(best.rangeLabel), \(best.verdict.lowercased())\(best.isDfs ? ", DFS radar-shared" : "")). Set it manually, not Auto; keep 80 MHz width."
+		} else {
+			advice.action = "stay"
+			advice.summary = "Every 5 GHz block is congested — no cleaner channel available; consider 6 GHz hardware or wired backhaul."
+		}
+	} else if let best = blocks.sorted(by: blockLess).first, best.verdict != "Congested" {
+		advice.recommendedChannel = best.primaryChannel
+		advice.recommendedRange = best.rangeLabel
+		advice.action = "consider"
+		advice.summary = "Current 5 GHz channel unknown. Cleanest block is \(best.rangeLabel) — primary channel \(best.primaryChannel) (\(best.verdict.lowercased()))."
+	}
+
+	return (blocks, advice)
+}
+
+func best24GHzChannel(networks: [WifiDetails]) -> (channel: Int, count: Int, strongestRssi: Int?)? {
+	var best: (channel: Int, count: Int, strongestRssi: Int?)? = nil
+	for c in [1, 6, 11] {
+		let aps = networks.filter { $0.band == "2.4 GHz" && abs($0.channel - c) <= 2 && $0.rssi > -90 }
+		let strongest = aps.map(\.rssi).max()
+		let currentBest = best
+		if currentBest == nil
+			|| aps.count < currentBest!.count
+			|| (aps.count == currentBest!.count && (strongest ?? -100) < (currentBest!.strongestRssi ?? -100)) {
+			best = (c, aps.count, strongest)
+		}
+	}
+	return best
+}
+
 
 func getLocalGateway() -> String? {
 	let pipe = Pipe()
@@ -629,23 +787,76 @@ func readConfigEnv(_ key: String) -> String? {
 	return nil
 }
 
-func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
-	guard gateway == "192.168.8.1" else { return nil }
+func isPrivateLanAddress(_ ip: String) -> Bool {
+	let parts = ip.split(separator: ".")
+	guard parts.count == 4, let o1 = Int(parts[0]), let o2 = Int(parts[1]) else { return false }
+	if o1 == 10 { return true }
+	if o1 == 192 && o2 == 168 { return true }
+	if o1 == 172 && (16...31).contains(o2) { return true }
+	return false
+}
 
-	let keyPath = NSString(string: ProcessInfo.processInfo.environment["WIFI_CHECK_SSH_KEY"] ?? "~/.ssh/id_beryl").expandingTildeInPath
-	guard FileManager.default.fileExists(atPath: keyPath) else { return nil }
+func sshPortOpen(_ host: String) -> Bool {
+	let pipe = Pipe()
+	let proc = Process()
+	proc.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+	proc.arguments = ["-z", "-G", "1", "-w", "2", host, "22"]
+	proc.standardOutput = pipe
+	proc.standardError = pipe
+	do {
+		try proc.run()
+		proc.waitUntilExit()
+		return proc.terminationStatus == 0
+	} catch {
+		return false
+	}
+}
+
+func candidateRouterSshKeys() -> [String] {
+	let env = ProcessInfo.processInfo.environment
+	var keys: [String] = []
+	for key in [env["WIFI_CHECK_ROUTER_KEY"], env["WIFI_CHECK_SSH_KEY"]] {
+		if let k = key, !k.isEmpty {
+			let p = NSString(string: k).expandingTildeInPath
+			if FileManager.default.fileExists(atPath: p) && !keys.contains(p) {
+				keys.append(p)
+			}
+		}
+	}
+	if keys.isEmpty {
+		let sshDir = NSString(string: "~/.ssh").expandingTildeInPath
+		let names = (try? FileManager.default.contentsOfDirectory(atPath: sshDir)) ?? []
+		for name in names.sorted() {
+			if name.hasPrefix("id_") && !name.hasSuffix(".pub") && !name.contains(".") {
+				keys.append(sshDir + "/" + name)
+			}
+		}
+	}
+	return keys
+}
+
+// Auto-discovers a GL.iNet travel router acting as the default gateway:
+// probes the gateway's SSH port, tries the user's own SSH keys, and only
+// proceeds once the router's system board identifies it as GL.iNet hardware.
+func fetchTravelRouterTelemetry(gateway: String?) -> RouterUpstreamDetails? {
+	guard let gw = gateway, isPrivateLanAddress(gw) else { return nil }
+	guard sshPortOpen(gw) else { return nil }
+	let keys = candidateRouterSshKeys()
+	guard !keys.isEmpty else { return nil }
+
+	var args = keys.flatMap { ["-i", $0] }
+	args += [
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=1",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"root@\(gw)",
+		"echo \"{\\\"board\\\": $(ubus call system board 2>/dev/null || echo \\\"{}\\\"), \\\"repeater\\\": $(ubus call repeater status 2>/dev/null || echo \\\"{}\\\"), \\\"wan\\\": $(ubus call network.interface.wan status 2>/dev/null || echo \\\"{}\\\"), \\\"wg\\\": $(ubus call network.interface.wgclient1 status 2>/dev/null || ubus call network.interface.wgclient status 2>/dev/null || echo \\\"{}\\\")}\""
+	]
 
 	let pipe = Pipe()
 	let proc = Process()
 	proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-	proc.arguments = [
-		"-i", keyPath,
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=1",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"root@192.168.8.1",
-		"echo \"{\\\"repeater\\\": $(ubus call repeater status 2>/dev/null || echo \\\"{}\\\"), \\\"wan\\\": $(ubus call network.interface.wan status 2>/dev/null || echo \\\"{}\\\"), \\\"wg\\\": $(ubus call network.interface.wgclient status 2>/dev/null || echo \\\"{}\\\")}\""
-	]
+	proc.arguments = args
 	proc.standardOutput = pipe
 	proc.standardError = Pipe()
 
@@ -661,13 +872,29 @@ func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
 	let data = pipe.fileHandleForReading.readDataToEndOfFile()
 	guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
 
+	// Only GL.iNet hardware is profiled; any other SSH-reachable gateway is ignored.
+	let board = json["board"] as? [String: Any] ?? [:]
+	let release = board["release"] as? [String: Any] ?? [:]
+	let idents = [
+		board["hostname"] as? String,
+		board["model"] as? String,
+		board["board_name"] as? String,
+		release["description"] as? String
+	].compactMap { $0?.lowercased() }
+	guard idents.contains(where: { $0.contains("glinet") || $0.contains("gl-inet") || $0.hasPrefix("gl-") }) else { return nil }
+
 	let repeater = json["repeater"] as? [String: Any] ?? [:]
 	let wan = json["wan"] as? [String: Any] ?? [:]
 	let wg = json["wg"] as? [String: Any] ?? [:]
 
 	let stateStr = (repeater["state_name"] as? String) ?? (repeater["state_s"] as? String)
 	let isRepeaterConnected = stateStr == "connected" || (repeater["state"] as? Int) == 2
-	let isWanUp = (wan["up"] as? Bool) ?? false
+	// Ethernet WAN counts only with a live IPv4 on the physical device — an "up" WAN
+	// interface without an address would mislabel pure-repeater mode.
+	let wanUp = (wan["up"] as? Bool) ?? false
+	let wanDevice = wan["l3_device"] as? String
+	let wanAddrs = (wan["ipv4-address"] as? [[String: Any]]) ?? []
+	let isWanUp = wanUp && !wanAddrs.isEmpty && (wanDevice == nil || wanDevice == "eth0")
 	let isWgUp = (wg["up"] as? Bool) ?? false
 
 	var mode = "Disconnected / Local Only"
@@ -677,8 +904,15 @@ func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
 	var rssi: Int? = nil
 	var quality: String? = nil
 
-	if isRepeaterConnected {
+	if isWanUp && isRepeaterConnected {
+		mode = "Ethernet WAN (repeater standby)"
+	} else if isRepeaterConnected {
 		mode = "Wi-Fi Repeater"
+	} else if isWanUp {
+		mode = "Ethernet WAN"
+	}
+
+	if isRepeaterConnected {
 		ssid = repeater["ssid"] as? String
 		bssid = repeater["bssid"] as? String
 		if let ch = repeater["channel"] as? Int {
@@ -690,8 +924,6 @@ func fetchBerylUpstreamTelemetry(gateway: String?) -> RouterUpstreamDetails? {
 			rssi = sig
 			quality = getSignalQuality(rssi: sig).rating
 		}
-	} else if isWanUp {
-		mode = "Ethernet WAN"
 	}
 
 	return RouterUpstreamDetails(
@@ -713,13 +945,15 @@ func shipTelemetryToInflux(report: DiagnosticReport, pingGw: PingResult?, pingEd
 		return
 	}
 
-	let org = env["WIFI_CHECK_INFLUX_ORG"] ?? readConfigEnv("WIFI_CHECK_INFLUX_ORG") ?? "fibonacci"
-	let bucket = env["WIFI_CHECK_INFLUX_BUCKET"] ?? readConfigEnv("WIFI_CHECK_INFLUX_BUCKET") ?? "market_data"
+	let org = env["WIFI_CHECK_INFLUX_ORG"] ?? readConfigEnv("WIFI_CHECK_INFLUX_ORG")
+	let bucket = env["WIFI_CHECK_INFLUX_BUCKET"] ?? readConfigEnv("WIFI_CHECK_INFLUX_BUCKET")
+	guard let orgValue = org, !orgValue.isEmpty,
+	      let bucketValue = bucket, !bucketValue.isEmpty else { return }
 
 	guard var components = URLComponents(string: urlString) else { return }
 	components.queryItems = [
-		URLQueryItem(name: "org", value: org),
-		URLQueryItem(name: "bucket", value: bucket),
+		URLQueryItem(name: "org", value: orgValue),
+		URLQueryItem(name: "bucket", value: bucketValue),
 		URLQueryItem(name: "precision", value: "s")
 	]
 	guard let targetUrl = components.url else { return }
@@ -818,15 +1052,23 @@ func shipTelemetryToInflux(report: DiagnosticReport, pingGw: PingResult?, pingEd
 	_ = sema.wait(timeout: .now() + 2.5)
 }
 
-func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status: String) -> VpnAuditResult {
-	let isBeryl = ip.localGateway == "192.168.8.1"
-	let homeIp = ProcessInfo.processInfo.environment["WIFI_CHECK_HOME_IP"] ?? readConfigEnv("WIFI_CHECK_HOME_IP")
-	let isHomeMatched = (homeIp != nil && ip.publicIp == homeIp) || (ip.org?.contains("Rogers") ?? false)
-	let isVpn = isBeryl || isHomeMatched
+func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status: String, isTravelRouter: Bool) -> VpnAuditResult {
+	let env = ProcessInfo.processInfo.environment
+	let homeIp = env["WIFI_CHECK_HOME_IP"] ?? readConfigEnv("WIFI_CHECK_HOME_IP")
+	// Home identity comes from config, never hardcoded: comma-separated fragments.
+	let ispFragments = (env["WIFI_CHECK_HOME_ISP"] ?? readConfigEnv("WIFI_CHECK_HOME_ISP") ?? "")
+		.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+	let homeCountries = (env["WIFI_CHECK_HOME_COUNTRY"] ?? readConfigEnv("WIFI_CHECK_HOME_COUNTRY") ?? "")
+		.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+
+	let orgLower = (ip.org ?? "").lowercased()
+	let ispMatched = !ispFragments.isEmpty && ispFragments.contains { orgLower.contains($0) }
+	let isHomeMatched = (homeIp != nil && ip.publicIp == homeIp) || ispMatched
+	let isVpn = isTravelRouter || isHomeMatched
 
 	let tunnelName: String
-	if isHomeMatched {
-		tunnelName = "WireGuard Tunnel to Toronto Home (Rogers)"
+	if isHomeMatched, let org = ip.org, !org.isEmpty {
+		tunnelName = "WireGuard Tunnel to Home ISP (\(org))"
 	} else if isVpn {
 		tunnelName = "Active VPN Tunnel"
 	} else {
@@ -834,9 +1076,9 @@ func auditVpnAndDns(ip: IpDetails, dnsGeo: String?, ednsGeo: String?, ipv6Status
 	}
 
 	var isDnsSecure = true
-	if let dns = dnsGeo {
-		if isHomeMatched && !dns.contains("Canada") && !dns.contains("United States") {
-			isDnsSecure = false
+	if isHomeMatched && !homeCountries.isEmpty {
+		if let dns = dnsGeo {
+			isDnsSecure = homeCountries.contains { dns.contains($0) }
 		}
 	}
 
@@ -916,17 +1158,15 @@ func mapLatencyHops(gateway: String?, isVpn: Bool) -> [HopResult] {
 
 				let desc: String
 				if hopNum == 1 {
-					if ip == "192.168.8.1" {
-						desc = "Local Airwaves (Mac ➔ Beryl AX Wi-Fi 6)"
+					if isVpn {
+						desc = "Local Airwaves (Mac ➔ Travel Router Wi-Fi)"
 					} else {
 						desc = "Local Airwaves (Device ➔ Local Wi-Fi Router)"
 					}
-				} else if (isVpn || ip == "192.168.89.1") && ip == "192.168.89.1" {
-					desc = "Subsea Optical Cable (Tunnel to Toronto ER605)"
-				} else if (isVpn || ip == "10.0.0.1") && ip == "10.0.0.1" {
-					desc = "Home LAN (ER605 ➔ Rogers Ignite Modem)"
-				} else if (isVpn || ip.hasPrefix("99.241.") || ip.hasPrefix("24.156.")) && (ip.hasPrefix("99.241.") || ip.hasPrefix("24.156.")) {
-					desc = "Rogers Last Mile / Regional Node (Toronto)"
+				} else if isVpn && isPrivateLanAddress(ip) && delta > 40 {
+					desc = "Encrypted Tunnel (Remote Home Router)"
+				} else if isVpn && isPrivateLanAddress(ip) {
+					desc = "Remote Home LAN (ISP Modem)"
 				} else if isVpn && hopNum >= 6 {
 					desc = "Internet Exchange / Cloudflare Peering"
 				} else {
@@ -991,11 +1231,11 @@ func evaluateNomadRating(wifi: WifiDetails?, deep: DeepDiagnostics?, ping: PingR
 		return "⚠️ Low Upload (<2 Mbps) - Video calls may degrade"
 	}
 	if isVpn && !(vpn?.homeIpMatch ?? false) {
-		return "⚠️ VPN Alert: Public IP does not match Canadian Homebase"
+		return "⚠️ VPN Alert: Public IP does not match Homebase"
 	}
 	if (speed == nil || upload >= 10.0) && loss == 0.0 {
 		if isVpn {
-			return "✅ Optimal for HD Zoom Calls & Remote Work (Protected Canadian Tunnel)"
+			return "✅ Optimal for HD Zoom Calls & Remote Work (Protected Home Tunnel)"
 		} else {
 			return "✅ Optimal for HD Zoom Calls & Remote Work"
 		}
@@ -1047,10 +1287,33 @@ while i < args.count {
 
 if isScan {
 	let networks = scanNearbyNetworks()
+
+	// Context: which 5 GHz channel does the user actually depend on?
+	// Travel-router uplink wins; else the Mac's own 5 GHz link.
+	let currentWifi = inspectCurrentWifi()
+	let gateway = getLocalGateway()
+	let router = fetchTravelRouterTelemetry(gateway: gateway)
+	var currentChannel: Int? = nil
+	if let upstream = router?.upstreamChannel, upstream >= 36, upstream <= 177 {
+		currentChannel = upstream
+	} else if let cur = currentWifi, cur.band == "5 GHz", cur.channel >= 36, cur.channel <= 177 {
+		currentChannel = cur.channel
+	}
+
+	let (blocks, advice) = analyzeFiveGHzBlocks(networks: networks, currentChannel: currentChannel)
+	let best24 = best24GHzChannel(networks: networks)
+	let best24Summary: String
+	if let b24 = best24 {
+		best24Summary = "Best 2.4 GHz channel: \(b24.channel) (\(b24.count) overlapping AP\(b24.count == 1 ? "" : "s"), strongest \(b24.strongestRssi.map { "\($0) dBm" } ?? "none"))"
+	} else {
+		best24Summary = "No 2.4 GHz networks detected"
+	}
+
 	if isJson {
+		let report = ScanReport(networks: networks, fiveGHzBlocks: blocks, advice: advice, best24GHzChannel: best24?.channel, best24GHzSummary: best24Summary)
 		let encoder = JSONEncoder()
 		encoder.outputFormatting = .prettyPrinted
-		if let data = try? encoder.encode(networks), let str = String(data: data, encoding: .utf8) {
+		if let data = try? encoder.encode(report), let str = String(data: data, encoding: .utf8) {
 			print(str)
 		}
 	} else {
@@ -1068,7 +1331,33 @@ if isScan {
 			)
 			print(row)
 		}
-		print("")
+
+		print("\n\(Colors.bold)5 GHz Channel Congestion (80 MHz blocks):\(Colors.reset)\n")
+		let header = "  " + pad("Block", to: 10) + pad("APs", to: 4) + pad("Strongest", to: 12) + "Verdict"
+		print(header)
+		for b in blocks {
+			let vcol = verdictColor(b.verdict)
+			let strongStr = b.strongestRssiDbm.map { "\($0) dBm" } ?? "—"
+			let marker = b.isCurrent ? "  \(Colors.cyan)← your current block\(Colors.reset)" : ""
+			let row = "  " + pad(b.rangeLabel, to: 10) + pad("\(b.apCount)", to: 4) + pad(strongStr, to: 12)
+				+ vcol + pad(b.verdict, to: 12) + Colors.reset + marker
+			print(row)
+		}
+		print("\n  \(Colors.dim)Blocks 52-64 / 100-128 / 132-144 are DFS (radar-shared); 36-48 and 149-161 are always-open. Only APs above -90 dBm are scored.\(Colors.reset)")
+
+		print("\n\(Colors.bold)Recommendation:\(Colors.reset)")
+		switch advice.action {
+		case "move":
+			print("  \(Colors.red)→ Move the router's 5 GHz channel to \(advice.recommendedChannel ?? -1) (block \(advice.recommendedRange ?? "?")) — set manually, not Auto, keep 80 MHz width.\(Colors.reset)")
+			print("  \(Colors.dim)\(advice.summary)\(Colors.reset)")
+		case "consider":
+			print("  \(Colors.yellow)~ \(advice.summary)\(Colors.reset)")
+		case "stay":
+			print("  \(Colors.green)✔ \(advice.summary)\(Colors.reset)")
+		default:
+			print("  \(Colors.yellow)~ \(advice.summary)\(Colors.reset)")
+		}
+		print("  \(Colors.dim)\(best24Summary)\(Colors.reset)\n")
 	}
 	exit(0)
 }
@@ -1076,19 +1365,19 @@ if isScan {
 // 1. Gather Wi-Fi Link Details & Local Gateway
 let wifi = inspectCurrentWifi()
 let gateway = getLocalGateway()
-let isBeryl = gateway == "192.168.8.1"
 
 // 2. Run Diagnostics & Network Probes Concurrently
 let group = DispatchGroup()
 let queue = DispatchQueue.global(qos: .userInitiated)
 
+// Travel-router discovery runs in its own group: hop mapping and the VPN audit
+// wait on its result, while every other probe proceeds in parallel.
+let routerGroup = DispatchGroup()
 var routerDetails: RouterUpstreamDetails? = nil
-if isBeryl {
-	group.enter()
-	queue.async {
-		routerDetails = fetchBerylUpstreamTelemetry(gateway: gateway)
-		group.leave()
-	}
+routerGroup.enter()
+queue.async {
+	routerDetails = fetchTravelRouterTelemetry(gateway: gateway)
+	routerGroup.leave()
 }
 
 var deep: DeepDiagnostics? = nil
@@ -1131,7 +1420,8 @@ queue.async {
 var hops: [HopResult] = []
 group.enter()
 queue.async {
-	hops = mapLatencyHops(gateway: gateway, isVpn: isBeryl)
+	routerGroup.wait()
+	hops = mapLatencyHops(gateway: gateway, isVpn: routerDetails?.isBeryl ?? false)
 	group.leave()
 }
 
@@ -1169,7 +1459,8 @@ queue.async {
 group.wait()
 
 // 3. Assemble Audit & Ping Results
-let vpn = auditVpnAndDns(ip: ipDetails, dnsGeo: ednsData.dnsGeo, ednsGeo: ednsData.ednsGeo, ipv6Status: ipv6Status)
+let isTravelRouter = routerDetails?.isBeryl ?? false
+let vpn = auditVpnAndDns(ip: ipDetails, dnsGeo: ednsData.dnsGeo, ednsGeo: ednsData.ednsGeo, ipv6Status: ipv6Status, isTravelRouter: isTravelRouter)
 let pings: [PingResult] = [pingGw, pingCloudflare, pingGoogle, pingQuad9].compactMap { $0 }
 
 // 4. Run Throughput Speed Test (if not quick mode)
@@ -1301,7 +1592,7 @@ if vpn.isVpnDetected {
 	print("\n\(Colors.bold)VPN & Stealth Audit:\(Colors.reset)")
 	let statusColor = vpn.homeIpMatch ? Colors.green : Colors.yellow
 	print("  • Tunnel Status:    \(statusColor)🔒 \(vpn.tunnelName)\(Colors.reset)")
-	let matchTag = vpn.homeIpMatch ? "\(Colors.green)[MATCH: Canadian Homebase]\(Colors.reset)" : "\(Colors.yellow)[Unmatched]\(Colors.reset)"
+	let matchTag = vpn.homeIpMatch ? "\(Colors.green)[MATCH: Homebase]\(Colors.reset)" : "\(Colors.yellow)[Unmatched]\(Colors.reset)"
 	print("  • Residential IP:   \(matchTag)")
 	if let dns = vpn.dnsResolverGeo {
 		let dnsCol = vpn.isDnsSecure ? Colors.green : Colors.red
