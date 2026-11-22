@@ -1,3 +1,4 @@
+import collections
 import importlib.machinery
 import importlib.util
 import json
@@ -24,7 +25,7 @@ def make_sess_state() -> dict:
 		"overflows": 0,
 		"shared_execute_outputs": 0,
 		"domains": set(),
-		"tools": __import__("collections").Counter(),
+		"tools": collections.Counter(),
 		"date": "",
 		"prev_tool": None,
 		"prev_errored": False,
@@ -32,7 +33,7 @@ def make_sess_state() -> dict:
 	}
 
 
-def make_execute_item(call_id: str, nested: list[tuple[str, str, dict]], out_text: str, status: str = "completed") -> dict:
+def make_execute_item(call_id: str, nested: list[tuple[str, str, dict]], out_text: str, status: str = "completed", error: str | None = None) -> dict:
 	return {
 		"id": call_id,
 		"name": "execute",
@@ -40,7 +41,7 @@ def make_execute_item(call_id: str, nested: list[tuple[str, str, dict]], out_tex
 			"status": status,
 			"input": {"code": 'return await tools["stealth-browser"].navigate({url: "https://example.com"});'},
 			"content": [{"type": "text", "text": out_text}],
-			"error": None,
+			"error": error,
 			"metadata": {
 				"toolCalls": [
 					{"tool": f"stealth-browser.{tool}", "status": tc_status, "input": inp}
@@ -67,6 +68,19 @@ class TestClassifyOutcome:
 		wrapped = '{"result":"Error clicking element \'#x\': Locator.click: Timeout 10000ms exceeded."}'
 		assert sba.classify_outcome("click", wrapped) is None
 		assert sba.classify_outcome("click", sba.unwrap_result_json(wrapped)) == "click_error"
+
+
+class TestParseValidationSignature:
+	def test_wrapped_json_validation_error(self):
+		wrapped = '{"result":"1 validation error for navigateArgs\\nurl\\n  Field required [type=missing]"}'
+		assert sba.classify_outcome("navigate", sba.unwrap_result_json(wrapped)) == "validation_error"
+		sig = sba.parse_validation_signature("navigate", sba.unwrap_result_json(wrapped), {"timeout_ms": 5000})
+		assert "field 'url'" in sig
+		assert "passed: timeout_ms" in sig
+
+	def test_pretty_printed_result_json_unwraps(self):
+		pretty = '{\n  "result": "Wait timed out after 30000ms waiting for selector \'table\'"\n}'
+		assert sba.unwrap_result_json(pretty) == "Wait timed out after 30000ms waiting for selector 'table'"
 
 
 class TestUnwrapResultJson:
@@ -102,7 +116,8 @@ class TestKnownTools:
 
 
 class TestAgyOverflow:
-	def test_expand_overflow_reads_saved_file(self, tmp_path):
+	def test_expand_overflow_reads_saved_file(self, tmp_path, monkeypatch):
+		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
 		out_file = tmp_path / "steps" / "24" / "output.txt"
 		out_file.parent.mkdir(parents=True)
 		out_file.write_text("S" * 15591, encoding="utf-8")
@@ -111,15 +126,43 @@ class TestAgyOverflow:
 		assert overflowed is True
 		assert len(body) == 15591
 
-	def test_expand_overflow_truncated_variant(self, tmp_path):
-		out_file = tmp_path / "output.txt"
+	def test_expand_overflow_truncated_variant_with_trailing_prose(self, tmp_path, monkeypatch):
+		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
+		out_file = tmp_path / "steps" / "10" / "output.txt"
+		out_file.parent.mkdir(parents=True)
 		out_file.write_text("full content here", encoding="utf-8")
-		stub = f"The tool's output was truncated due to being too long. You can find the full output in a file at file://{out_file}"
+		stub = (
+			f"The tool's output was truncated due to being too long. "
+			f"You can find the full output in a file at file://{out_file}."
+			"\n\nHere is a preview of the output:"
+		)
 		body, overflowed = sba.expand_agy_overflow(stub)
 		assert overflowed is True
 		assert body == "full content here"
 
-	def test_missing_file_keeps_stub(self, tmp_path):
+	def test_overflow_path_outside_brain_dir_rejected(self, tmp_path, monkeypatch):
+		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path / "brain")
+		(tmp_path / "brain").mkdir()
+		out_file = tmp_path / "outside" / "secret.txt"
+		out_file.parent.mkdir(parents=True)
+		out_file.write_text("should not be read", encoding="utf-8")
+		stub = f"The output was large and was saved to: file://{out_file}"
+		body, overflowed = sba.expand_agy_overflow(stub)
+		assert overflowed is False
+		assert body == stub
+
+	def test_empty_overflow_file_keeps_stub(self, tmp_path, monkeypatch):
+		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
+		out_file = tmp_path / "steps" / "1" / "output.txt"
+		out_file.parent.mkdir(parents=True)
+		out_file.write_text("", encoding="utf-8")
+		stub = f"The output was large and was saved to: file://{out_file}"
+		body, overflowed = sba.expand_agy_overflow(stub)
+		assert overflowed is False
+		assert body == stub
+
+	def test_missing_file_keeps_stub(self, tmp_path, monkeypatch):
+		monkeypatch.setattr(sba, "BRAIN_DIR", tmp_path)
 		stub = f"The output was large and was saved to: file://{tmp_path}/missing/output.txt"
 		body, overflowed = sba.expand_agy_overflow(stub)
 		assert overflowed is False
@@ -213,6 +256,24 @@ class TestNestedErrorAttribution:
 		assert sum(c.tool_errors["navigate"].values()) == 0
 		assert sum(c.tool_errors["snapshot"].values()) == 1
 
+	def test_earlier_errored_call_not_doubled_on_last(self):
+		c = self._collector()
+		sess = make_sess_state()
+		item = make_execute_item(
+			"c7",
+			[
+				("click", "error", {"selector": "#x"}),
+				("get_content", "completed", {"selector": "body"}),
+			],
+			'{"result":"Content of body ..."}',
+			error="execute failed: click step returned error",
+		)
+		c._record_nested_calls("s1", "t", "execute", 'await tools["stealth-browser"].click({});', item, None, None, sess)
+		assert sess["errors"] == 1
+		assert sum(c.tool_errors["click"].values()) == 1
+		assert sum(c.tool_errors["get_content"].values()) == 0
+		assert c.error_counts.get("other_error", 0) == 1
+
 	def test_per_call_status_error_respected(self):
 		c = self._collector()
 		sess = make_sess_state()
@@ -229,6 +290,58 @@ class TestNestedErrorAttribution:
 		assert sum(c.tool_errors["click"].values()) == 1
 		assert sum(c.tool_errors["navigate"].values()) == 0
 		assert sum(c.tool_errors["snapshot"].values()) == 0
+
+
+class TestComputeDiff:
+	def _baseline(self, legacy: bool) -> dict:
+		snapshot = {
+			"generated_at": "2026-11-20T00:00:00+00:00",
+			"filters": {"since": None},
+			"summary": {
+				"sessions": 2,
+				"total_calls": 100,
+				"schema_reads_per_session": 2.0,
+				"schema_reads_in_browser_sessions": 4,
+				"mcp_timeouts_3m": 0,
+				"slow_non_timeout_calls": 0,
+				"validation_errors_total": 0,
+				"silent_param_mismatches_total": 0,
+			},
+			"tools": {},
+			"evaluate_js": {"total": 0, "intents": {}},
+		}
+		if not legacy:
+			snapshot["summary"]["schema_reads_per_agy_session"] = 4.0
+			snapshot["summary"]["sessions_by_source"] = {"agy": 1, "opencode": 1}
+		else:
+			snapshot["summary"]["sessions_by_source"] = {"agy": 1, "opencode": 1}
+		return snapshot
+
+	def test_agy_rate_from_explicit_baseline(self):
+		diff = sba.compute_diff(self._baseline(legacy=False), self._baseline(legacy=False))
+		row = next(k for k in diff["kpis"] if k["metric"] == "Schema reads / AGY session")
+		assert row["before"] == 4.0 and row["after"] == 4.0 and row["delta"] == 0.0
+
+	def test_agy_rate_derived_from_legacy_baseline(self):
+		legacy = self._baseline(legacy=True)
+		del legacy["summary"]["schema_reads_per_session"]
+		diff = sba.compute_diff(legacy, self._baseline(legacy=False))
+		row = next(k for k in diff["kpis"] if k["metric"] == "Schema reads / AGY session")
+		assert row["before"] == 4.0
+
+	def test_schema_read_regression_flagged(self):
+		current = self._baseline(legacy=False)
+		current["summary"]["schema_reads_per_agy_session"] = 8.0
+		diff = sba.compute_diff(self._baseline(legacy=False), current)
+		row = next(k for k in diff["kpis"] if k["metric"] == "Schema reads / AGY session")
+		assert row["delta"] == 4.0 and row["status"] == "regressed"
+
+	def test_schema_read_improvement_flagged(self):
+		current = self._baseline(legacy=False)
+		current["summary"]["schema_reads_per_agy_session"] = 1.0
+		diff = sba.compute_diff(self._baseline(legacy=False), current)
+		row = next(k for k in diff["kpis"] if k["metric"] == "Schema reads / AGY session")
+		assert row["delta"] == -3.0 and row["status"] == "improved"
 
 
 class TestInputCharTracking:
@@ -260,22 +373,33 @@ def agy_env(tmp_path, monkeypatch):
 	return tmp_path
 
 
-def _write_agy_session(root: Path, cid: str, compact_output: str, full_output: str, overflow_file: Path | None = None) -> None:
+def _write_agy_session(root: Path, cid: str, compact_output: str, full_output: str, overflow_file: Path | None = None, schema_reads: int = 0) -> None:
 	log_dir = root / cid / ".system_generated" / "logs"
 	log_dir.mkdir(parents=True)
 	if overflow_file is not None:
 		overflow_file.parent.mkdir(parents=True, exist_ok=True)
 		overflow_file.write_text(full_output, encoding="utf-8")
-		full_output = f"The output was large and was saved to: file://{overflow_file}"
+		full_output = f"The output was large and was saved to: file://{overflow_file}."
 	args = {"ServerName": "stealth-browser", "ToolName": "snapshot", "Arguments": {"max_elements": 80}}
+	tool_calls = [
+		{"name": "read_file", "args": {"Path": "/mcp/stealth-browser/navigate.json"}, "created_at": "2026-11-20T09:59:00Z"}
+		for _ in range(schema_reads)
+	]
+	tool_calls.append({"name": "call_mcp_tool", "args": args, "created_at": "2026-11-20T10:00:00Z"})
+	schema_generic = [
+		json.dumps({"type": "GENERIC", "content": 'Created At: 2026-11-20T09:59:05Z\n{"name":"navigate"} schema body'})
+		for _ in range(schema_reads)
+	]
 	full_lines = [
-		json.dumps({"tool_calls": [{"name": "call_mcp_tool", "args": args, "created_at": "2026-11-20T10:00:00Z"}]}),
+		json.dumps({"tool_calls": tool_calls}),
+		*schema_generic,
 		json.dumps({"type": "GENERIC", "content": f"Created At: 2026-11-20T10:00:05Z\nCompleted At: 2026-11-20T10:00:06Z\n{full_output}"}),
 		json.dumps({"type": "PLANNER_RESPONSE", "content": "done"}),
 	]
 	(log_dir / "transcript_full.jsonl").write_text("\n".join(full_lines), encoding="utf-8")
 	compact_lines = [
-		json.dumps({"tool_calls": [{"name": "call_mcp_tool", "args": args, "created_at": "2026-11-20T10:00:00Z"}]}),
+		json.dumps({"tool_calls": tool_calls}),
+		*schema_generic,
 		json.dumps({"type": "GENERIC", "content": f"Created At: 2026-11-20T10:00:05Z\nCompleted At: 2026-11-20T10:00:06Z\n{compact_output}"}),
 		json.dumps({"type": "PLANNER_RESPONSE", "content": "done"}),
 	]
@@ -299,7 +423,9 @@ class TestCollectAgy:
 
 	def test_falls_back_to_compact_transcript(self, agy_env):
 		compact_output = "C" * 4000
-		_write_agy_session(agy_env, "cid-compact-22", compact_output, compact_output)
+		full_output = "F" * 9000
+		_write_agy_session(agy_env, "cid-compact-22", compact_output, full_output)
+		(agy_env / "cid-compact-22" / ".system_generated" / "logs" / "transcript_full.jsonl").unlink()
 
 		collector = sba.AuditCollector(since=None, includes=["cid-compact-22"], excludes=[], slow_threshold=20.0, max_samples=2)
 		collector.collect_agy()
@@ -333,7 +459,7 @@ class TestCollectAgy:
 
 class TestSnapshotSummary:
 	def test_schema_reads_per_agy_session_uses_agy_denominator(self, agy_env):
-		_write_agy_session(agy_env, "cid-agy-4444", "out", "out")
+		_write_agy_session(agy_env, "cid-agy-4444", "out", "out", schema_reads=4)
 		collector = sba.AuditCollector(since=None, includes=["cid-agy-4444"], excludes=[], slow_threshold=20.0, max_samples=2)
 		collector.collect_agy()
 
@@ -347,5 +473,25 @@ class TestSnapshotSummary:
 		snap = collector.build_snapshot(None, "all")
 		assert snap["summary"]["sessions"] == 2
 		assert snap["summary"]["sessions_by_source"] == {"agy": 1, "opencode": 1}
-		assert snap["summary"]["schema_reads_per_session"] == 0.0
-		assert snap["summary"]["schema_reads_per_agy_session"] == 0.0
+		assert snap["summary"]["schema_reads_total"] == 4
+		assert snap["summary"]["schema_reads_per_session"] == 2.0
+		assert snap["summary"]["schema_reads_per_agy_session"] == 4.0
+
+	def test_schema_reads_per_agy_session_excludes_opencode_reads(self, agy_env):
+		_write_agy_session(agy_env, "cid-agy-6666", "out", "out", schema_reads=2)
+		collector = sba.AuditCollector(since=None, includes=["cid-agy-6666"], excludes=[], slow_threshold=20.0, max_samples=2)
+		collector.collect_agy()
+
+		oc_sess = make_sess_state()
+		oc_sess["calls"] = 1
+		oc_sess["chars"] = 10
+		oc_sess["schema_reads"] = 3
+		oc_sess["schema_chars"] = 300
+		oc_sess["tools"]["click"] = 1
+		oc_sess["date"] = "2026-11-20"
+		collector._finalize_session("opencode", "ses_oc_7777", "t", oc_sess, "")
+
+		snap = collector.build_snapshot(None, "all")
+		assert snap["summary"]["schema_reads_total"] == 5
+		assert snap["summary"]["schema_reads_per_session"] == 2.5
+		assert snap["summary"]["schema_reads_per_agy_session"] == 2.0
