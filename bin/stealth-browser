@@ -59,7 +59,7 @@ mcp = FastMCP(
 		"- click(selector, tab=-1, timeout_ms=5000) | type(selector, text, clear_first=True, press_enter=False, tab=-1, timeout_ms=5000)\n"
 		"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1)\n"
 		"- batch(actions=[{action, selector, text, key, value, state, ms, expression, timeout_ms}], tab=-1)\n"
-		"- evaluate_js(expression='', tab=-1, timeout_ms=15000, max_length=40000) (alias: script=...)\n"
+		"- evaluate_js(expression='', tab=-1, timeout_ms=15000, max_length=40000, main_world=False) (alias: script=...; main_world=True for page globals)\n"
 		"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000)\n"
 		"- state(framework='auto', selector='', tab=-1) | set_media(enable_media=True, tab=-1)\n"
 		"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None)\n"
@@ -2112,7 +2112,7 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 	- {"action": "press", "key": "Enter"}
 	- {"action": "wait_for", "selector": ".modal", "ref": "e7", "timeout_ms": 3000, "state": "visible"}
 	- {"action": "sleep", "ms": 500}
-	- {"action": "evaluate", "expression": "window.scrollTo(0, 500)"}
+	- {"action": "evaluate", "expression": "window.scrollTo(0, 500)", "main_world": False}
 	"""
 	t0 = time.perf_counter()
 	try:
@@ -2216,7 +2216,11 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 
 			elif act == "evaluate":
 				expr = item.get("expression") or item.get("code") or item.get("js", "")
-				res = await asyncio.wait_for(page.evaluate(expr), timeout=timeout / 1000.0)
+				main_world = bool(item.get("main_world", False))
+				res = await asyncio.wait_for(
+					page.evaluate(expr, isolated_context=not main_world),
+					timeout=timeout / 1000.0,
+				)
 				results.append(f"[{idx}] evaluate: {res}")
 
 			else:
@@ -3562,11 +3566,16 @@ async def state(
 			return results;
 		}"""
 		try:
+			# Patchright defaults to an isolated world where window.__NEXT_DATA__/Redux/Fiber expandos are invisible
 			results = await asyncio.wait_for(
-				page.evaluate(js_script, {
-					"targetFramework": framework,
-					"selector": selector,
-				}),
+				page.evaluate(
+					js_script,
+					{
+						"targetFramework": framework,
+						"selector": selector,
+					},
+					isolated_context=False,
+				),
 				timeout=10.0,
 			)
 		except asyncio.TimeoutError:
@@ -3588,7 +3597,8 @@ async def state(
 					key_preview += f" ... (+{len(item['keys']) - 20} more)"
 				lines.append(f"- **Top-Level Keys ({len(item['keys'])} total)**: {key_preview}")
 
-			dumped = json.dumps(item.get("data") or {"props": item.get("props"), "state": item.get("state")}, indent=2)
+			payload = item["data"] if "data" in item else {"props": item.get("props"), "state": item.get("state")}
+			dumped = json.dumps(payload, indent=2)
 			if len(dumped) > 40000:
 				dumped = dumped[:40000] + f"\n... [Truncated: {len(dumped)} total characters]"
 			lines.append("```json")
@@ -3607,14 +3617,22 @@ async def evaluate_js(
 	timeout_ms: int = 15000,
 	script: str = "",
 	max_length: int = 40000,
+	main_world: bool = False,
 ) -> str:
-	"""Evaluate a JavaScript expression in the active page or specified tab index and return the result."""
+	"""Evaluate a JavaScript expression in the active page or specified tab index and return the result.
+
+	Runs in Patchright's isolated world by default (stealthy; full DOM access). Set main_world=True
+	to access page-world globals (e.g. window.__NEXT_DATA__, window.store, React/Vue internals).
+	"""
 	code = expression if expression and expression.strip() else script
 	if not code or not code.strip():
 		return "JavaScript execution error: 'expression' (or alias 'script') must be non-empty."
 	try:
 		page = await session.resolve_page(tab)
-		result = await asyncio.wait_for(page.evaluate(code), timeout=timeout_ms / 1000.0)
+		result = await asyncio.wait_for(
+			page.evaluate(code, isolated_context=not main_world),
+			timeout=timeout_ms / 1000.0,
+		)
 		if isinstance(result, (dict, list)):
 			formatted = json.dumps(result, indent=2, default=str)
 		else:

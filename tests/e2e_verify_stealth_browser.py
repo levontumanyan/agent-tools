@@ -67,6 +67,10 @@ FIXTURE_HTML = """<!doctype html>
 		document.getElementById('pdf-embed').src = window.__blobUrl;
 		document.body.dataset.blob = window.__blobUrl;
 
+		window.__NEXT_DATA__ = { page: '/portal', props: { pageProps: { user: 'levon', tier: 'gold' } } };
+		window.store = { getState: () => ({ portfolio: { cash: 12345, currency: 'CAD' } }) };
+		window.__CUSTOM_PAGE_GLOBAL__ = { secretToken: 'main-world-ok' };
+
 		console.log('portal-boot-ok');
 		console.warn('portal-minor-warn');
 		console.error('portal-test-error');
@@ -213,6 +217,27 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 					# Truncation guard on huge string
 					ev_big = await call("evaluate_js", {"expression": "'x'.repeat(50000)", "max_length": 500})
 					check("evaluate_js max_length truncation", "Truncated" in ev_big or "truncated" in ev_big.lower(), ev_big[:200])
+
+					st_res = await call("state", {"framework": "auto"})
+					check(
+						"state() reads page-world __NEXT_DATA__ and window.store",
+						"Next.js (__NEXT_DATA__)" in st_res
+						and '"user": "levon"' in st_res
+						and "Redux (window.store)" in st_res
+						and '"cash": 12345' in st_res,
+						st_res[:500],
+					)
+					ev_iso = await call("evaluate_js", {"expression": "window.__CUSTOM_PAGE_GLOBAL__?.secretToken ?? 'isolated'"})
+					check("evaluate_js defaults to isolated world", "isolated" in ev_iso and "main-world-ok" not in ev_iso, ev_iso)
+					ev_main = await call("evaluate_js", {
+						"expression": "window.__CUSTOM_PAGE_GLOBAL__?.secretToken ?? 'isolated'",
+						"main_world": True,
+					})
+					check("evaluate_js(main_world=True) reads page globals", "main-world-ok" in ev_main, ev_main)
+					ev_batch = await call("batch", {"actions": [
+						{"action": "evaluate", "expression": "window.__CUSTOM_PAGE_GLOBAL__?.secretToken ?? 'isolated'", "main_world": True},
+					]})
+					check("batch evaluate(main_world=True) reads page globals", "main-world-ok" in ev_batch, ev_batch)
 
 					# Dialog auto-handler (must NOT hang!)
 					dlg_click = await call("click", {"selector": "#alert-btn"})

@@ -73,6 +73,7 @@ class FakePage:
 		self.title_impl = None
 		self.close_impl = None
 		self.evaluate_impl = None
+		self.evaluate_calls = []
 		self.bring_to_front_impl = None
 		self.wait_for_load_state_impl = None
 
@@ -110,7 +111,8 @@ class FakePage:
 		self._closed = True
 		await self.emit("close")
 
-	async def evaluate(self, expression, arg=None):
+	async def evaluate(self, expression, arg=None, *, isolated_context=True):
+		self.evaluate_calls.append((expression, arg, isolated_context))
 		if self.evaluate_impl is not None:
 			return await self.evaluate_impl(expression, arg)
 		return None
@@ -182,6 +184,7 @@ def test_fastmcp_instructions_cheatsheet(sb):
 	for token in (
 		"evaluate_js(expression=",
 		"script=",
+		"main_world=",
 		"wait_for(",
 		"batch(",
 		"fetch(",
@@ -719,7 +722,7 @@ def test_mcp_tool_schemas_accept_expected_params(sb):
 		assert set(tools["wait_for"].inputSchema["properties"].keys()) >= {
 			"selector", "text", "url_contains", "state", "timeout_ms", "tab",
 		}
-		assert {"expression", "script", "max_length", "tab", "timeout_ms"} <= set(
+		assert {"expression", "script", "max_length", "tab", "timeout_ms", "main_world"} <= set(
 			tools["evaluate_js"].inputSchema["properties"].keys()
 		)
 		assert {"tab", "index"} <= set(tools["switch_tab"].inputSchema["properties"].keys())
@@ -878,5 +881,60 @@ def test_status_surfaces_recent_dialog_history(sb, monkeypatch):
 		assert "Recent dialogs" not in out_clean
 
 	asyncio.run(scenario())
+
+
+def test_state_evaluates_in_main_world_and_formats_stores(sb, monkeypatch):
+	async def scenario():
+		page = FakePage(url="https://app.example/dashboard")
+
+		async def fake_eval(expr, arg=None):
+			assert arg == {"targetFramework": "auto", "selector": ""}
+			return [
+				{
+					"source": "Next.js (__NEXT_DATA__)",
+					"keys": ["page", "props"],
+					"data": {"page": "/dashboard", "props": {"user": "levon"}},
+				},
+				{
+					"source": "Redux (window.store)",
+					"keys": [],
+					"data": {},
+				},
+			]
+
+		page.evaluate_impl = fake_eval
+		monkeypatch.setattr(sb.session, "resolve_page", AsyncMock(return_value=page))
+
+		out = await sb.state()
+		assert len(page.evaluate_calls) == 1
+		assert page.evaluate_calls[0][2] is False
+		assert "Next.js (__NEXT_DATA__)" in out
+		assert '"user": "levon"' in out
+		assert "Redux (window.store)" in out
+		assert "```json\n{}\n```" in out
+
+	asyncio.run(scenario())
+
+
+def test_evaluate_js_and_batch_respect_main_world_flag(sb, monkeypatch):
+	async def scenario():
+		page = FakePage(url="https://app.example/home")
+		page.evaluate_impl = AsyncMock(return_value="ok")
+		monkeypatch.setattr(sb.session, "resolve_page", AsyncMock(return_value=page))
+
+		res_default = await sb.evaluate_js(expression="document.title")
+		res_main = await sb.evaluate_js(expression="window.__NEXT_DATA__", main_world=True)
+		assert res_default == "Result: ok"
+		assert res_main == "Result: ok"
+		assert page.evaluate_calls[0][2] is True
+		assert page.evaluate_calls[1][2] is False
+
+		batch_res = await sb.batch(actions=[
+			{"action": "evaluate", "expression": "document.title"},
+			{"action": "evaluate", "expression": "window.store.getState()", "main_world": True},
+		])
+		assert "Batch completed (2 steps" in batch_res
+		assert page.evaluate_calls[2][2] is True
+		assert page.evaluate_calls[3][2] is False
 
 	asyncio.run(scenario())
