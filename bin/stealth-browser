@@ -462,6 +462,11 @@ async def _network_route_handler(route, request):
 			frame_url = ""
 		res_type = request.resource_type or "other"
 
+		if res_type == "document":
+			handled = True
+			await route.continue_()
+			return
+
 		engine = get_adblock_engine()
 		if engine is not None:
 			try:
@@ -1126,7 +1131,7 @@ async def status() -> str:
 @mcp.tool()
 async def keep_alive(
 	enable: bool = True,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	min_seconds: int = 45,
 	max_seconds: int = 90,
 	ping_url: Optional[str] = None,
@@ -1175,7 +1180,7 @@ async def navigate(
 	url: str,
 	block_media: Optional[bool] = None,
 	new_tab: bool = False,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	timeout_ms: int = 30000,
 	wait_until: str = "domcontentloaded",
 ) -> str:
@@ -1193,12 +1198,7 @@ async def navigate(
 	try:
 		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 		if new_tab:
-			pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
-			blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
-			if blank_pages:
-				page = blank_pages[0]
-			else:
-				page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+			page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 			session.set_active_page(page)
 		else:
 			page = await session.resolve_page(tab)
@@ -1432,7 +1432,7 @@ async def wait_for_human(
 
 
 @mcp.tool()
-async def set_media(enable_media: bool = True, tab: int = -1) -> str:
+async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str:
 	"""Toggle media loading (images, videos, web fonts) on the current or specified tab.
 
 	Parameters:
@@ -1452,7 +1452,7 @@ async def set_media(enable_media: bool = True, tab: int = -1) -> str:
 
 _SB_REF_SELECTOR_RE = re.compile(r'^\[data-sb-ref=["\']([^"\']+)["\']\]$')
 
-_SNAPSHOT_JS = r"""({ targetSelector, maxElements, includeShadow, includeIframes }) => {
+_SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeIframes }) => {
 	const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'HEAD', 'TITLE', 'TEMPLATE']);
 	const INTERACTIVE_SEL = 'button, input, select, textarea, a[href], summary, [role="button"], [role="link"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"]';
 	const limit = Math.max(1, Number(maxElements) || 80);
@@ -1555,6 +1555,25 @@ _SNAPSHOT_JS = r"""({ targetSelector, maxElements, includeShadow, includeIframes
 			}
 		}
 	};
+
+	if (includeIframes) {
+		const frameNeedsLoad = (f) => {
+			try {
+				const d = f.contentDocument;
+				if (d === null) return true;
+				return d.readyState === 'loading';
+			} catch (_) {
+				return false;
+			}
+		};
+		const pendingFrames = () => [...document.querySelectorAll('iframe, frame')].filter(frameNeedsLoad);
+		let pending = pendingFrames();
+		const frameDeadline = Date.now() + 1500;
+		while (pending.length && Date.now() < frameDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			pending = pendingFrames();
+		}
+	}
 
 	walk(startNode, { rootNode: document, inShadow: false, inIframe: false });
 
@@ -1916,7 +1935,7 @@ def _format_snapshot_row(el: dict, fallback_idx: int) -> str:
 async def snapshot(
 	selector: str = "body",
 	max_elements: int = 80,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	include_shadow: bool = True,
 	include_iframes: bool = True,
 ) -> str:
@@ -1956,7 +1975,7 @@ async def snapshot(
 
 
 @mcp.tool()
-async def batch(actions: list[dict], tab: int = -1) -> str:
+async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 	"""Execute a pipeline of browser actions sequentially in a single turn for maximum speed (10-100x faster than roundtrips).
 
 	Supported action types in the dict:
@@ -1987,7 +2006,17 @@ async def batch(actions: list[dict], tab: int = -1) -> str:
 					continue
 				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref, text=text_target)
 				try:
-					await loc.click(timeout=timeout, force=force)
+					if force:
+						try:
+							el = await asyncio.wait_for(loc.first.element_handle(), timeout=max(1.0, timeout / 1000.0))
+							if el is not None:
+								await el.evaluate("el => el.click()")
+							else:
+								await loc.click(timeout=timeout, force=True)
+						except Exception:
+							await loc.click(timeout=timeout, force=True)
+					else:
+						await loc.click(timeout=timeout)
 				except Exception:
 					if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
 						pass
@@ -2080,7 +2109,7 @@ async def get_content(
 	max_length: int = 4000,
 	interactive_only: bool = False,
 	clean: bool = True,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 ) -> str:
 	"""Extract visible text content or interactive elements from the active tab. Set interactive_only=True for compact semantic elements snapshot, or clean=False for raw text."""
 	try:
@@ -2122,7 +2151,7 @@ async def click(
 	ref: str = "",
 	text: str = "",
 	force: bool = False,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	timeout_ms: int = 5000,
 ) -> str:
 	"""Click an element on the active page or specified tab index by CSS selector, snapshot ref (e.g. 'e12' or '@e12'), or visible text. Set force=True to bypass pointer-interception overlays."""
@@ -2135,7 +2164,17 @@ async def click(
 		page = await session.resolve_page(tab)
 		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean, text=text)
 		try:
-			await locator.click(timeout=timeout_ms, force=force)
+			if force:
+				try:
+					el = await asyncio.wait_for(locator.first.element_handle(), timeout=max(1.0, timeout_ms / 1000.0))
+					if el is not None:
+						await el.evaluate("el => el.click()")
+					else:
+						await locator.click(timeout=timeout_ms, force=True)
+				except Exception:
+					await locator.click(timeout=timeout_ms, force=True)
+			else:
+				await locator.click(timeout=timeout_ms)
 		except Exception:
 			if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
 				pass
@@ -2153,7 +2192,7 @@ async def type(
 	text: str = "",
 	clear_first: bool = True,
 	press_enter: bool = False,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	timeout_ms: int = 5000,
 	ref: str = "",
 ) -> str:
@@ -2187,7 +2226,7 @@ async def type(
 
 
 @mcp.tool()
-async def press_key(key: str, tab: int = -1) -> str:
+async def press_key(key: str, tab: Union[int, str] = -1) -> str:
 	"""Press a keyboard key on the active page or specified tab index (e.g., 'Enter', 'Tab', 'Escape')."""
 	try:
 		page = await session.resolve_page(tab)
@@ -2198,7 +2237,7 @@ async def press_key(key: str, tab: int = -1) -> str:
 
 
 @mcp.tool()
-async def scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> str:
+async def scroll(direction: str = "down", amount: int = 600, tab: Union[int, str] = -1) -> str:
 	"""Scroll the active page or specified tab index up or down (direction: 'up' or 'down', amount in pixels)."""
 	try:
 		page = await session.resolve_page(tab)
@@ -2212,7 +2251,7 @@ async def scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> s
 @mcp.tool()
 async def screenshot(
 	save_path: str = "",
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	full_page: bool = False,
 	selector: str = "",
 	ref: str = "",
@@ -2268,7 +2307,7 @@ async def fetch(
 	headers: Optional[dict] = None,
 	body: Optional[Any] = None,
 	response_type: str = "auto",
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	timeout_ms: int = 15000,
 	save_path: str = "",
 ) -> str:
@@ -2623,6 +2662,7 @@ class TelemetryTracker:
 		self._maxlen = maxlen
 		self._console: dict[Page, collections.deque[dict[str, Any]]] = {}
 		self._network: dict[Page, collections.deque[dict[str, Any]]] = {}
+		self._cdp_sessions: dict[Page, Any] = {}
 
 	def attach(self, page: Page) -> None:
 		if page is None or getattr(page, "_telemetry_tracker_attached", False):
@@ -2637,9 +2677,85 @@ class TelemetryTracker:
 		page.on("requestfailed", lambda req: self._on_requestfailed(page, req))
 		page.on("close", lambda _=None: self._on_close(page))
 
+	async def ensure_console_capture(self, page: Page) -> bool:
+		"""Attach a raw-CDP Runtime console listener to a tab (lazily, on first console_logs call).
+
+		patchright never sends Runtime.enable (stealth), so page.on("console") only sees
+		browser-generated Log entries. Enabling it on-demand trades a small amount of stealth
+		on that single tab for full script console capture.
+		"""
+		if page is None or page.is_closed():
+			return False
+		if page in self._cdp_sessions:
+			return True
+		context = getattr(page, "context", None)
+		if context is None:
+			return False
+		try:
+			cdp = await asyncio.wait_for(context.new_cdp_session(page), timeout=10.0)
+		except Exception:
+			return False
+		self._cdp_sessions[page] = cdp
+
+		def _on_console_api(ev: Any) -> None:
+			try:
+				level = str(ev.get("type", "log") or "log").lower()
+				if level == "warn":
+					level = "warning"
+				parts: list[str] = []
+				for arg in ev.get("args", []) or []:
+					val = arg.get("value")
+					if val is None:
+						val = arg.get("description")
+					parts.append(str(val) if val is not None else "(opaque object)")
+				text = self._truncate_text(" ".join(parts))
+				location = ""
+				stack = ev.get("stackTrace") or []
+				if isinstance(stack, list) and stack and isinstance(stack[0], dict):
+					location = f"{stack[0].get('url', '')}:{stack[0].get('lineNumber', '')}"
+				buf = self._console.setdefault(page, collections.deque(maxlen=self._maxlen))
+				buf.append({
+					"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
+					"level": level,
+					"text": text,
+					"location": location,
+				})
+			except Exception:
+				pass
+
+		def _on_exception_thrown(ev: Any) -> None:
+			try:
+				details = ev.get("exceptionDetails") or {}
+				text = str(details.get("text") or "")
+				exc = details.get("exception") or {}
+				desc = exc.get("description")
+				buf = self._console.setdefault(page, collections.deque(maxlen=self._maxlen))
+				buf.append({
+					"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
+					"level": "pageerror",
+					"text": self._truncate_text(str(desc) if desc else text),
+					"location": "",
+				})
+			except Exception:
+				pass
+
+		cdp.on("Runtime.consoleAPICalled", _on_console_api)
+		cdp.on("Runtime.exceptionThrown", _on_exception_thrown)
+
+		def _on_close(_=None) -> None:
+			self._cdp_sessions.pop(page, None)
+
+		page.on("close", _on_close)
+		try:
+			await cdp.send("Runtime.enable")
+		except Exception:
+			pass
+		return True
+
 	def _on_close(self, page: Page) -> None:
 		self._console.pop(page, None)
 		self._network.pop(page, None)
+		self._cdp_sessions.pop(page, None)
 
 	def _truncate_text(self, text: str) -> str:
 		if len(text) > self.MAX_CONSOLE_TEXT:
@@ -2895,7 +3011,7 @@ async def network_requests(
 	status_min: int = 0,
 	limit: int = 50,
 	clear: bool = False,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 ) -> str:
 	"""List captured network responses and failed requests for a tab from its bounded ring buffer.
 
@@ -2950,9 +3066,13 @@ async def console_logs(
 	level: str = "",
 	limit: int = 50,
 	clear: bool = False,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 ) -> str:
 	"""List captured browser console messages and uncaught page errors for a tab from its bounded ring buffer.
+
+	Note: on the first call for a tab, attaches an on-demand CDP console listener so future
+	script console.log/warn/error calls on that tab are captured (browser-generated messages
+	like network errors are always captured).
 
 	Parameters:
 	- level: Optional level filter (comma-separated, e.g. 'error', 'warning', 'log', 'pageerror').
@@ -2963,6 +3083,7 @@ async def console_logs(
 	try:
 		page = await session.resolve_page(tab)
 		_attach_page_trackers(page)
+		await telemetry_tracker.ensure_console_capture(page)
 		entries, total = telemetry_tracker.get_console(
 			page=page,
 			level=level,
@@ -2987,7 +3108,7 @@ async def console_logs(
 async def state(
 	framework: str = "auto",
 	selector: str = "",
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 ) -> str:
 	"""Inspect and extract in-memory client-side application state (Next.js, Redux, React Fiber, Vue, Apollo, React Query).
 
@@ -3208,7 +3329,7 @@ async def state(
 @mcp.tool()
 async def evaluate_js(
 	expression: str = "",
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	timeout_ms: int = 15000,
 	script: str = "",
 	max_length: int = 40000,
@@ -3241,7 +3362,7 @@ async def wait_for(
 	url_contains: str = "",
 	state: str = "visible",
 	timeout_ms: int = 15000,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 ) -> str:
 	"""Wait for a CSS selector state, visible page text substring, URL substring, or combination."""
 	if not selector and not text and not url_contains:
@@ -3325,13 +3446,19 @@ async def wait_for(
 
 
 @mcp.tool()
-async def switch_tab(tab: Optional[int] = None, index: Optional[int] = None) -> str:
-	"""Switch focus to an open tab by its numeric index (see status). Accepts 'tab' or legacy alias 'index'."""
+async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
+	"""Switch focus to an open tab by numeric index or stable tab id like 't2' (see status). Accepts 'tab' or legacy alias 'index'."""
 	target = tab if tab is not None else index
 	if target is None:
-		return "Error switching tab: provide a numeric 'tab' (or 'index') value."
+		return "Error switching tab: provide a 'tab' (or 'index') value."
 	try:
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		if isinstance(target, str):
+			norm = target.strip()
+			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
+			if resolved < 0:
+				return f"No open tab with id '{norm}'. Use status() to list open tabs."
+			target = resolved
 		if target < 0 or target >= len(pages):
 			return f"Invalid tab index {target}. Total open tabs: {len(pages)}"
 
@@ -3350,8 +3477,8 @@ async def switch_tab(tab: Optional[int] = None, index: Optional[int] = None) -> 
 
 
 @mcp.tool()
-async def close_tab(tab: Optional[int] = None, index: Optional[int] = None) -> str:
-	"""Close a tab by index (-1 closes active tab, -99 or closing last tab terminates the browser window). Accepts 'tab' or legacy alias 'index'."""
+async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
+	"""Close a tab by numeric index or stable tab id like 't2' (-1 closes active tab, -99 or closing last tab terminates the browser window). Accepts 'tab' or legacy alias 'index'."""
 	target = tab if tab is not None else (index if index is not None else -1)
 	try:
 		if target == -99:
@@ -3360,6 +3487,13 @@ async def close_tab(tab: Optional[int] = None, index: Optional[int] = None) -> s
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		if not pages:
 			return await close_browser()
+
+		if isinstance(target, str):
+			norm = target.strip()
+			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
+			if resolved < 0:
+				return f"No open tab with id '{norm}'. Use status() to list open tabs."
+			target = resolved
 
 		if target == -1:
 			if session._active_page is not None and not session._active_page.is_closed():
@@ -3463,7 +3597,7 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 		for p in pages:
 			if not p.is_closed():
 				curr = p.url
-				if curr and curr != "about:blank" and not curr.startswith("chrome://"):
+				if curr and curr != "about:blank" and not curr.startswith("chrome://") and not curr.startswith("chrome-error://"):
 					preserved_urls.append(curr)
 	except Exception:
 		pass
@@ -3473,7 +3607,7 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 			active = session._active_page
 			if active is not None and not active.is_closed():
 				curr = active.url
-				if curr and curr != "about:blank" and not curr.startswith("chrome://"):
+				if curr and curr != "about:blank" and not curr.startswith("chrome://") and not curr.startswith("chrome-error://"):
 					preserved_urls.append(curr)
 		except Exception:
 			pass

@@ -177,7 +177,7 @@ def test_click_by_ref_and_at_ref_and_force(patch_page):
 	assert "(force)" not in res1
 	assert "Clicked element matching ref 'e12' (force)" in res2
 	assert loc.click.await_count == 2
-	assert loc.click.call_args_list[0].kwargs == {"timeout": 5000, "force": False}
+	assert loc.click.call_args_list[0].kwargs == {"timeout": 5000}
 	assert loc.click.call_args_list[1].kwargs == {"timeout": 2500, "force": True}
 
 
@@ -238,7 +238,7 @@ def test_click_by_text_prefers_role_and_visible_match(patch_page):
 
 	res2 = asyncio.run(sb.click(text="Accept"))
 	assert "Clicked element matching text 'Accept'" in res2
-	multi_text.nth(1).click.assert_awaited_once_with(timeout=5000, force=False)
+	multi_text.nth(1).click.assert_awaited_once_with(timeout=5000)
 	multi_text.nth(0).click.assert_not_awaited()
 
 
@@ -256,7 +256,7 @@ def test_click_and_type_validation_and_backwards_compat(patch_page):
 	assert "provide either" in asyncio.run(sb.type(ref="   ", text="abc"))
 
 	assert "Clicked element matching '#submit'" in asyncio.run(sb.click("#submit"))
-	btn.click.assert_awaited_once_with(timeout=5000, force=False)
+	btn.click.assert_awaited_once_with(timeout=5000)
 
 	res_type_sel = asyncio.run(sb.type("#email", "user@test.com", clear_first=True, press_enter=True))
 	assert "Typed text into '#email' and pressed Enter" in res_type_sel
@@ -317,7 +317,7 @@ def test_batch_supports_ref_force_and_backwards_compat(patch_page):
 	loc_e3.press.assert_awaited_once_with("Enter")
 	loc_e4.select_option.assert_awaited_once_with("CA", timeout=4000, force=True)
 	loc_e5.wait_for.assert_awaited_once_with(state="visible", timeout=1500)
-	loc_css.click.assert_awaited_once_with(timeout=4000, force=False)
+	loc_css.click.assert_awaited_once_with(timeout=4000)
 
 
 def test_screenshot_full_page_selector_ref(patch_page):

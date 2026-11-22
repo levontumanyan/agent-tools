@@ -179,6 +179,33 @@ def test_closed_and_missing_tab_id_errors():
 	asyncio.run(_run())
 
 
+def test_switch_and_close_tab_accept_stable_tab_ids(isolated_session):
+	async def _run():
+		p1 = FakePage("https://a.example", "Tab A")
+		p2 = FakePage("https://b.example", "Tab B")
+		mgr, _ = isolated_session([p1, p2])
+		await mgr.get_pages()
+		id1 = mgr.get_tab_id(p1)
+		id2 = mgr.get_tab_id(p2)
+		assert {id1, id2} == {"t1", "t2"}
+
+		res = await sb.switch_tab(tab=id2)
+		assert f"Switched to tab [1]: 'Tab B' (https://b.example)" in res
+		assert p2.brought_to_front == 1
+
+		assert f"No open tab with id 't99'" in await sb.switch_tab(tab="t99")
+		assert f"No open tab with id 't99'" in await sb.close_tab(tab="t99")
+
+		res_close = await sb.close_tab(tab=id1)
+		assert f"Closed tab [0] (https://a.example). Remaining open tabs: 1" in res_close
+		assert p1.is_closed()
+
+		res_after = await sb.switch_tab(tab=id2)
+		assert f"Switched to tab [0]: 'Tab B' (https://b.example)" in res_after
+
+	asyncio.run(_run())
+
+
 def test_resolve_page_numeric_strings_and_backwards_compat():
 	async def _run():
 		p1 = FakePage("https://a.example", "Tab A")

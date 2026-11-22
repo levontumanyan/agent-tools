@@ -703,7 +703,7 @@ def test_switch_tab_aliases_and_validation(sb, monkeypatch):
 		p1 = FakePage(url="https://one.example", title="One")
 		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[p0, p1]))
 
-		assert "provide a numeric 'tab'" in await sb.switch_tab()
+		assert "provide a 'tab' (or 'index') value" in await sb.switch_tab()
 		assert "Switched to tab [1]: 'One'" in await sb.switch_tab(tab=1)
 		assert "Switched to tab [0]: 'Zero'" in await sb.switch_tab(index=0)
 		assert "Switched to tab [1]: 'One'" in await sb.switch_tab(1)
