@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -112,7 +113,10 @@ def tmux_has_session(session_name: str) -> bool:
 	"""Check whether an exact tmux session is currently alive."""
 	if not session_name:
 		return False
-	res = subprocess.run([TMUX_BIN, "has-session", "-t", session_name], capture_output=True)
+	try:
+		res = subprocess.run([TMUX_BIN, "has-session", "-t", session_name], capture_output=True)
+	except OSError:
+		return False
 	return res.returncode == 0
 
 
@@ -223,6 +227,78 @@ def resolve_tmux_for_target(target: str) -> str | None:
 	return None
 
 
+# Statuses meaning a worker should still be alive; reconciled to 'dead' when its session and runner are gone.
+RECONCILABLE_STATUSES = ("starting", "running")
+# Grace period so a freshly dispatched task (runner argv still matching, slow fetch) is never misread.
+RECONCILE_MIN_AGE_SECONDS = 90.0
+
+
+def runner_still_active(task_id: str) -> bool:
+	"""Best-effort check whether the agy-task-runner process for a task is still running."""
+	pattern = f"agy-task-runner.*--task-id {re.escape(task_id)}([[:space:]]|$)"
+	try:
+		res = subprocess.run(["pgrep", "-f", pattern], capture_output=True, timeout=10)
+	except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+		return True  # cannot verify -> treat as alive so active tasks are never wrongly marked dead
+	return res.returncode == 0
+
+
+def _reconcile_stale_tasks(tasks: list[dict[str, Any]]) -> None:
+	"""Reconcile active tasks whose tmux session and runner process are both gone.
+
+	Follows the record_task_finish transition shape: status -> 'dead', completed_at = detection
+	time, duration_seconds = age at detection (true runtime is shorter), error_log gets a note.
+	The guarded UPDATE never clobbers a finish the runner recorded in the meantime.
+	"""
+	candidates = [t for t in tasks if t.get("status") in RECONCILABLE_STATUSES and t.get("tmux_session")]
+	if not candidates:
+		return
+	now_dt = datetime.datetime.now(datetime.timezone.utc)
+	completed = utc_now_iso()
+	updates: list[tuple[str, float, str, str]] = []
+	for task in candidates:
+		try:
+			started = datetime.datetime.fromisoformat(task["started_at"])
+		except (TypeError, ValueError):
+			continue
+		if started.tzinfo is None:
+			started = started.replace(tzinfo=datetime.timezone.utc)
+		age = (now_dt - started).total_seconds()
+		if age < RECONCILE_MIN_AGE_SECONDS:
+			continue
+		session = task["tmux_session"]
+		if tmux_has_session(session):
+			continue
+		if runner_still_active(task["task_id"]):
+			continue
+		duration = round(max(age, 0.0), 2)
+		updates.append((completed, duration, session, task["task_id"]))
+		task["status"] = "dead"
+		if task.get("duration_seconds") is None:
+			task["duration_seconds"] = duration
+	if not updates:
+		return
+	with get_db_conn() as conn:
+		for completed_at, duration, session, task_id in updates:
+			conn.execute(
+				"""
+				UPDATE tasks
+				SET status = 'dead',
+					completed_at = COALESCE(completed_at, ?),
+					duration_seconds = COALESCE(duration_seconds, ?),
+					error_log = COALESCE(error_log, ?)
+				WHERE task_id = ? AND status IN ('starting', 'running');
+				""",
+				(
+					completed_at,
+					duration,
+					f"Reconciled stale task as dead: tmux session '{session}' gone and runner process exited (detected {completed_at})",
+					task_id,
+				),
+			)
+	logger.info("Reconciled %d stale task(s) as dead", len(updates))
+
+
 def _dispatch_task_impl(req: DispatchTaskRequest) -> dict[str, Any]:
 	"""Validate inputs, insert initial task row, and spawn agy-task-runner detached."""
 	resolve_repo_path(req.repo)
@@ -320,21 +396,23 @@ def _get_task_status_impl(task_id: str) -> dict[str, Any] | None:
 
 
 def _list_tasks_impl(limit: int = 10, run_id: str = "") -> list[dict[str, Any]]:
-	"""Query recent tasks with bounded limit."""
+	"""Query recent tasks with bounded limit, reconciling stale active rows first."""
 	safe_limit = max(1, min(limit, 200))
 	with get_db_conn() as conn:
 		if run_id:
 			validate_safe_id(run_id, "run_id")
 			rows = conn.execute(
-				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks WHERE run_id = ? ORDER BY started_at DESC LIMIT ?;",
+				"SELECT task_id, run_id, worker_name, repo, tmux_session, status, mode, duration_seconds, started_at, pr_url FROM tasks WHERE run_id = ? ORDER BY started_at DESC LIMIT ?;",
 				(run_id, safe_limit),
 			).fetchall()
 		else:
 			rows = conn.execute(
-				"SELECT task_id, run_id, worker_name, repo, status, mode, duration_seconds, started_at, pr_url FROM tasks ORDER BY started_at DESC LIMIT ?;",
+				"SELECT task_id, run_id, worker_name, repo, tmux_session, status, mode, duration_seconds, started_at, pr_url FROM tasks ORDER BY started_at DESC LIMIT ?;",
 				(safe_limit,),
 			).fetchall()
-	return [dict(r) for r in rows]
+	tasks = [dict(r) for r in rows]
+	_reconcile_stale_tasks(tasks)
+	return tasks
 
 
 def _send_message_impl(req: SendMessageRequest) -> dict[str, Any]:
@@ -386,7 +464,7 @@ def _read_messages_impl(agent_name: str, since_id: int = 0, limit: int = 50) -> 
 
 
 def _stop_task_impl(task_id: str, graceful: bool = True) -> dict[str, Any]:
-	"""Stop a running worker either by sending /exit or killing its tmux session."""
+	"""Stop a live worker at the user's explicit request: /exit (graceful) or kill its tmux session."""
 	validate_safe_id(task_id, "task_id")
 	session = resolve_tmux_for_target(task_id) or f"agy-{task_id}"
 	if not tmux_has_session(session):
@@ -516,7 +594,7 @@ def submit_report(task_id: str, summary: str, report_md: str, conversation_id: s
 
 @mcp.tool()
 def stop_task(task_id: str, graceful: bool = True) -> dict[str, Any]:
-	"""Stop a running task (sends /exit so git gate & PR run, or kills tmux session if graceful=False)."""
+	"""Stop a live worker — ONLY when the user explicitly asks (workers stay live after reporting). Graceful sends /exit (the runner finishes gate & PR if not already done); graceful=False kills the tmux session."""
 	return _stop_task_impl(task_id=task_id, graceful=graceful)
 
 

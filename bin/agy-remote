@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,10 @@ DEFAULT_REMOTE_URL = "https://fibonacci.tail8b9be7.ts.net:8765"
 DEFAULT_SSH_HOST = "fibonacci"
 REMOTE_TMUX_BIN = os.environ.get("AGY_REMOTE_TMUX", "/home/linuxbrew/.linuxbrew/bin/tmux")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+VIEWPORT_VERIFY_SECONDS = 45
+ATTACH_SESSION_WAIT_SECONDS = 60
+TRUST_DIALOG_MARKERS = ("do you trust", "trust this project", "trust the files", "trust this folder", "trust the authors")
+TMUX_MISS_MARKERS = ("can't find session", "no server running", "error connecting", "failed to connect")
 
 
 def load_env_files() -> None:
@@ -87,11 +92,16 @@ def api_request(base_url: str, path: str, payload: dict | None = None) -> dict:
 		sys.exit(1)
 
 
-def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str) -> None:
-	"""Open a non-focus-stealing cmux terminal tab attached to the remote tmux worker."""
+def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str, wait_for_session: bool = False) -> str:
+	"""Open a non-focus-stealing cmux terminal tab attached to the remote tmux worker; returns the surface ref."""
 	validate_task_id(task_id)
 	session = f"agy-{task_id}"
-	remote_cmd = f"{shlex.quote(REMOTE_TMUX_BIN)} attach -t {shlex.quote(session)}"
+	# Sessions only exist a few seconds after dispatch (fetch + worktree first); wait so the tab lands on the worker.
+	wait_cmd = (
+		f"n=0; until {shlex.quote(REMOTE_TMUX_BIN)} has-session -t {shlex.quote(session)} 2>/dev/null; do "
+		f"n=$((n+1)); [ $n -ge {ATTACH_SESSION_WAIT_SECONDS} ] && break; sleep 1; done; "
+	) if wait_for_session else ""
+	remote_cmd = f"{wait_cmd}{shlex.quote(REMOTE_TMUX_BIN)} attach -t {shlex.quote(session)}"
 	# Keepalive prevents NAT idle drops; trailing printf resets mouse/focus/color-scheme modes on unclean exit.
 	reset_seq = r"\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?1004l\e[?2004l\e[?2031l"
 	cmd_str = (
@@ -109,7 +119,7 @@ def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str) -> None:
 	)
 	if res.returncode != 0:
 		sys.stderr.write(f"Warning: cmux new-surface failed: {res.stderr.strip()}\n")
-		return
+		return ""
 
 	surface_ref = ""
 	for token in res.stdout.split():
@@ -119,15 +129,136 @@ def open_cmux_attach_tab(ssh_host: str, task_id: str, label: str) -> None:
 	if surface_ref:
 		subprocess.run(["cmux", "rename-tab", "--surface", surface_ref, tab_title], capture_output=True)
 		print(f"🪟 Opened cmux tab ({surface_ref}): {tab_title}")
+	return surface_ref
+
+
+def ssh_tmux_run(ssh_host: str, *tmux_args: str, timeout: int = 15) -> subprocess.CompletedProcess | None:
+	"""Run a tmux command on the remote host over ssh; returns None when the transport fails."""
+	cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_host, REMOTE_TMUX_BIN, *tmux_args]
+	try:
+		return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+	except (subprocess.TimeoutExpired, OSError):
+		return None
+
+
+def ssh_tmux_capture(ssh_host: str, session: str, lines: int = 40) -> str | None:
+	"""Capture the visible text of a remote tmux pane (None when the session is missing or ssh fails)."""
+	res = ssh_tmux_run(ssh_host, "capture-pane", "-p", "-t", session, "-S", f"-{lines}")
+	return res.stdout if res is not None and res.returncode == 0 else None
+
+
+def ssh_tmux_session_alive(ssh_host: str, session: str) -> bool:
+	"""Check whether a remote tmux session exists (False on ssh failure)."""
+	res = ssh_tmux_run(ssh_host, "has-session", "-t", session, timeout=10)
+	return res is not None and res.returncode == 0
+
+
+def ssh_tmux_send_enter(ssh_host: str, session: str) -> None:
+	"""Send an Enter keypress into a remote tmux session (e.g. to accept agy's trust dialog)."""
+	ssh_tmux_run(ssh_host, "send-keys", "-t", session, "Enter")
+
+
+def cmux_read_screen(surface_ref: str, lines: int = 40) -> str | None:
+	"""Read the visible screen text of a cmux terminal surface (None when unavailable)."""
+	try:
+		res = subprocess.run(
+			["cmux", "read-screen", "--surface", surface_ref, "--lines", str(lines)],
+			capture_output=True,
+			text=True,
+			timeout=10,
+		)
+	except (subprocess.TimeoutExpired, OSError):
+		return None
+	return res.stdout if res.returncode == 0 else None
+
+
+def classify_worker_screen(screen: str) -> str:
+	"""Classify worker terminal text as 'running', 'trust-dialog', 'stalled', or 'empty'."""
+	text = screen.strip()
+	if not text:
+		return "empty"
+	lower = text.lower()
+	if any(marker in lower for marker in TRUST_DIALOG_MARKERS):
+		return "trust-dialog"
+	if any(marker in lower for marker in TMUX_MISS_MARKERS):
+		return "stalled"
+	return "running"
+
+
+def verify_worker_viewport(ssh_host: str, task_id: str, surface_ref: str) -> None:
+	"""Best-effort verify the dispatched worker actually started in its cmux viewport tab.
+
+	Reads the tab screen (cmux read-screen) and the remote tmux pane over ssh, auto-answers
+	agy's fresh-worktree trust dialog by sending Enter into the tmux session, and prints a
+	one-line verdict: running, trust-dialog, or stalled. Never raises.
+	"""
+	validate_task_id(task_id)
+	session = f"agy-{task_id}"
+	deadline = time.monotonic() + VIEWPORT_VERIFY_SECONDS
+	answered = False
+	enters_sent = 0
+	last_state = "empty"
+	while time.monotonic() < deadline:
+		viewport_text = cmux_read_screen(surface_ref) if surface_ref else None
+		pane_text = ssh_tmux_capture(ssh_host, session)
+		# The tmux pane is authoritative (the viewport may still be attaching); fall back to the tab's screen.
+		text = pane_text if pane_text is not None else (viewport_text or "")
+		state = classify_worker_screen(text)
+		if state != "empty":
+			last_state = state
+			if state == "running" and pane_text is None and not ssh_tmux_session_alive(ssh_host, session):
+				state = "stalled"  # viewport shows a detached shell; the worker session is gone
+				last_state = state
+			if state == "running":
+				note = " (trust dialog auto-answered)" if answered else ""
+				print(f"✅ Viewport verified: worker running{note} in {session}")
+				return
+			if state == "trust-dialog" and enters_sent < 3:
+				ssh_tmux_send_enter(ssh_host, session)
+				answered = True
+				enters_sent += 1
+				time.sleep(3)
+				continue
+		time.sleep(2)
+	if last_state == "trust-dialog":
+		print(f"⚠️ Viewport: trust-dialog persisted after auto-answer — attach manually: agy-remote attach {task_id}")
+		return
+	detail = "worker tmux session gone" if not ssh_tmux_session_alive(ssh_host, session) else "no activity"
+	print(f"❌ Viewport: stalled ({detail}) after {VIEWPORT_VERIFY_SECONDS}s — check agy-remote logs {task_id}")
+
+
+def resolve_dispatch_prompt(args) -> str:
+	"""Resolve the dispatch prompt from --prompt-file or the positional argument (mutually exclusive)."""
+	prompt_file = getattr(args, "prompt_file", "") or ""
+	if prompt_file:
+		if args.prompt:
+			sys.stderr.write("Error: pass either a positional prompt or --prompt-file, not both\n")
+			sys.exit(2)
+		path = os.path.expanduser(prompt_file)
+		try:
+			with open(path, "r", encoding="utf-8") as f:
+				prompt = f.read()
+		except OSError as e:
+			sys.stderr.write(f"Error: cannot read --prompt-file {path}: {e}\n")
+			sys.exit(2)
+		if not prompt.strip():
+			sys.stderr.write(f"Error: --prompt-file {path} is empty\n")
+			sys.exit(2)
+		return prompt
+	if not args.prompt:
+		sys.stderr.write("Error: provide a prompt argument or --prompt-file PATH\n")
+		sys.exit(2)
+	return args.prompt
 
 
 def cmd_dispatch(args) -> None:
 	"""Dispatch a new AGY task to fibonacci."""
 	base_url = get_base_url(args)
 	ssh_host = get_ssh_host(args)
+	prompt = resolve_dispatch_prompt(args)
 	payload = {
 		"repo": args.repo,
-		"prompt": args.prompt,
+		"prompt": prompt,
 		"base_branch": args.base_branch,
 		"gate": args.gate,
 		"interactive": args.interactive,
@@ -147,7 +278,11 @@ def cmd_dispatch(args) -> None:
 	print(f"   Inspect: agy-remote inspect {task_id}")
 
 	if args.cmux:
-		open_cmux_attach_tab(ssh_host, task_id, args.worker_name or args.repo)
+		surface_ref = open_cmux_attach_tab(ssh_host, task_id, args.worker_name or args.repo, wait_for_session=True)
+		try:
+			verify_worker_viewport(ssh_host, task_id, surface_ref)
+		except Exception as e:  # best-effort: verification must never fail the dispatch
+			print(f"Viewport verification skipped: {e}")
 
 
 def cmd_attach(args) -> None:
@@ -183,10 +318,17 @@ def cmd_status(args) -> None:
 		return
 	print(f"{'TASK ID':<29} {'REPO':<15} {'MODE':<11} {'STATUS':<11} {'DURATION':<9} {'PR'}")
 	print("-" * 99)
+	dead_seen = False
 	for t in tasks:
+		status = t.get("status", "-")
 		dur = f"{t['duration_seconds']}s" if t.get("duration_seconds") is not None else "-"
+		if status == "dead" and dur != "-":
+			dur = f"~{dur}"  # duration is age at reconciliation, not true runtime
 		pr = t.get("pr_url") or "-"
-		print(f"{t['task_id']:<29} {t['repo']:<15} {t.get('mode', '-'):<11} {t['status']:<11} {dur:<9} {pr}")
+		print(f"{t.get('task_id', '-'):<29} {t.get('repo', '-'):<15} {t.get('mode', '-'):<11} {status:<11} {dur:<9} {pr}")
+		dead_seen = dead_seen or status == "dead"
+	if dead_seen:
+		print("ℹ️  dead = worker tmux session vanished before finishing; duration is age at detection")
 
 
 def cmd_inspect(args) -> None:
@@ -210,7 +352,7 @@ def cmd_msg(args) -> None:
 
 
 def cmd_stop(args) -> None:
-	"""Stop a running task gracefully (/exit) or force-kill its tmux session."""
+	"""Stop a live worker at the user's request: /exit (graceful, lets the runner finish gate & PR) or force-kill."""
 	task_id = validate_task_id(args.task_id)
 	base_url = get_base_url(args)
 	res = api_request(base_url, f"/api/tasks/{urllib.parse.quote(task_id)}/stop", {"graceful": not args.kill})
@@ -262,7 +404,8 @@ def main() -> None:
 
 	p_dispatch = subparsers.add_parser("dispatch", help="Dispatch a task to remote worker")
 	p_dispatch.add_argument("repo", help="Target repo name in ~/repos/")
-	p_dispatch.add_argument("prompt", help="Prompt / instructions for AGY")
+	p_dispatch.add_argument("prompt", nargs="?", default=None, help="Prompt / instructions for AGY (or pass --prompt-file)")
+	p_dispatch.add_argument("--prompt-file", dest="prompt_file", default="", help="Read the prompt from a file instead of the command line (mutually exclusive with the prompt argument)")
 	p_dispatch.add_argument("--base-branch", default="main", help="Base git branch")
 	p_dispatch.add_argument("--gate", default="", help="Validation gate command (e.g. 'make test')")
 	p_dispatch.add_argument("--interactive", action="store_true", help="Require manual tool approvals in TUI")
@@ -292,7 +435,7 @@ def main() -> None:
 	p_msg.add_argument("--from", dest="sender", default="coordinator", help="Sender identity")
 	p_msg.add_argument("--run-id", default="", help="Coordinator run ID")
 
-	p_stop = subparsers.add_parser("stop", help="Stop a running task")
+	p_stop = subparsers.add_parser("stop", help="Stop a live worker (user-requested only): /exit or force-kill")
 	p_stop.add_argument("task_id", help="Task ID")
 	p_stop.add_argument("--kill", action="store_true", help="Force-kill tmux session instead of sending /exit")
 
