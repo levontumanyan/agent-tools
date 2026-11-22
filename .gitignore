@@ -9,3 +9,4 @@ __pycache__/
 /bin/antigravity-shipper
 /bin/call-recordings
 /bin/wifi-check
+/bin/nl-embed
