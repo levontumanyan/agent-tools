@@ -1,4 +1,5 @@
 import os
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,8 +25,8 @@ LISTING_CACHE = CACHE_DIR / "listings"
 CITY_CACHE = CACHE_DIR / "cities.json"
 CLIMATE_CACHE = CACHE_DIR / "climate.json"
 
-# Logging paths
-LOG_DIR = ROOT_DIR / "logs"
+# Logging paths (use TMPDIR so sandboxed runs never hit repo write denials)
+LOG_DIR = Path(tempfile.gettempdir()) / "airbnb-logs"
 LOG_FILE = LOG_DIR / "app.log"
 
 # Reports path
