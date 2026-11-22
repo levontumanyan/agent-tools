@@ -73,6 +73,13 @@ STEALTH_OPENCODE_RE = re.compile(
 	r"^(?:mcp__)?stealth[-_]browser(?:__|:|_|\.)([a-z0-9_]+)$",
 	re.IGNORECASE,
 )
+NESTED_EXECUTE_RE = re.compile(r'tools\[\s*["\']stealth[-_]browser["\']\s*\]\.\s*([a-zA-Z0-9_]+)\s*\(')
+NESTED_SHELL_RE = re.compile(
+	r"(?:^|[;&|(]\s*|\n\s*|uv\s+run\s+(?:--with\s+\S+\s+)*--script\s+)(?:\S*/)?stealth[-_]browser(?![\w-])(?=$|[\s|&;])",
+	re.MULTILINE,
+)
+JSONRPC_TOOLS_CALL_RE = re.compile(r'"method"\s*:\s*"tools/call"')
+JSONRPC_TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([a-zA-Z0-9_]+)"')
 
 
 def parse_since(spec: Optional[str]) -> Optional[datetime.datetime]:
@@ -446,6 +453,28 @@ def extract_opencode_output(item: dict[str, Any]) -> tuple[str, bool]:
 	return "\n".join(parts).strip(), bool(err or status == "error")
 
 
+def extract_opencode_item_time(item: dict[str, Any]) -> tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+	state = item.get("state") if isinstance(item.get("state"), dict) else {}
+	t = state.get("time") if isinstance(state.get("time"), dict) else item.get("time")
+	t = t if isinstance(t, dict) else {}
+	start = parse_ts(t.get("start") or t.get("ran") or t.get("created"))
+	end = parse_ts(t.get("end") or t.get("completed"))
+	return start, end
+
+
+def extract_nested_shell_calls(code: str) -> list[tuple[str, dict[str, Any], bool]]:
+	rpc_calls: list[tuple[str, dict[str, Any], bool]] = []
+	for m in JSONRPC_TOOLS_CALL_RE.finditer(code):
+		nm = JSONRPC_TOOL_NAME_RE.search(code, m.end(), m.end() + 300)
+		tool = nm.group(1) if nm else "unknown"
+		rpc_calls.append((tool, {}, False))
+	if rpc_calls:
+		return rpc_calls
+	if NESTED_SHELL_RE.search(code):
+		return [("stdio", {}, False)]
+	return []
+
+
 class AuditCollector:
 	def __init__(
 		self,
@@ -496,6 +525,9 @@ class AuditCollector:
 		self.other_browser_mcps = collections.Counter()
 		self.browser_subagents: list[dict[str, Any]] = []
 		self.auth_sessions = 0
+		self._sources_collected: set[str] = set()
+		self._matched_ids_by_source: dict[str, set[str]] = collections.defaultdict(set)
+		self._titles_by_source: dict[str, dict[str, str]] = {}
 
 	def _record_call(
 		self,
@@ -508,6 +540,7 @@ class AuditCollector:
 		explicit_error: bool,
 		duration_s: Optional[float],
 		sess_state: dict[str, Any],
+		nested: bool = False,
 	) -> None:
 		self.by_source[source] += 1
 		self.tool_counts[tool] += 1
@@ -542,8 +575,8 @@ class AuditCollector:
 			if h not in ("127.0.0.1", "localhost", "errors.pydantic.dev"):
 				sess_state["domains"].add(h)
 
-		if tool == "evaluate_js":
-			expr = str(raw_args.get("expression") or raw_args.get("script") or "")
+		if tool == "evaluate_js" and (not nested or raw_args):
+			expr = str(raw_args.get("expression") or raw_args.get("script") or (raw_args.get("code") if nested else "") or "")
 			intent, flags = classify_js_intent(expr)
 			self.js_intents[intent] += 1
 			for fl in flags:
@@ -678,12 +711,18 @@ class AuditCollector:
 	def collect_agy(self) -> None:
 		if not BRAIN_DIR.exists():
 			return
+		self._sources_collected.add("agy")
 		titles = load_agy_titles()
+		self._titles_by_source["agy"] = titles
 		paths = sorted(glob.glob(str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")))
+		matched_ids: set[str] = set()
 
 		for path_str in paths:
 			path = Path(path_str)
 			cid = path.parts[-4]
+			if self.includes and matches_any_prefix(cid, self.includes):
+				matched_ids.add(cid)
+
 			if not should_audit_session(cid, self.includes, self.excludes):
 				continue
 
@@ -809,9 +848,71 @@ class AuditCollector:
 
 			self._finalize_session("agy", cid, title, sess_state, raw.lower())
 
+		self._matched_ids_by_source["agy"] = matched_ids
+
+	def _record_nested_calls(
+		self,
+		sid: str,
+		title: str,
+		kind: str,
+		code: str,
+		item: dict[str, Any],
+		start_dt: Optional[datetime.datetime],
+		end_dt: Optional[datetime.datetime],
+		sess_state: dict[str, Any],
+	) -> None:
+		if not code or "stealth" not in code.lower():
+			return
+		state = item.get("state") if isinstance(item.get("state"), dict) else {}
+		meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+		nested: list[tuple[str, dict[str, Any], bool]] = []
+		tool_calls = meta.get("toolCalls")
+		if isinstance(tool_calls, list) and tool_calls:
+			for tc in tool_calls:
+				if not isinstance(tc, dict):
+					continue
+				t_kind, tool = extract_opencode_tool_name(str(tc.get("tool") or ""))
+				if t_kind == "other" and tool:
+					self.other_browser_mcps[f"opencode:{tool}"] += 1
+					continue
+				if t_kind != "stealth-browser" or not tool:
+					continue
+				nested.append((tool, normalize_args(tc.get("input") or {}), str(tc.get("status") or "").lower() == "error"))
+		elif kind == "execute":
+			nested = [(m.group(1), {}, False) for m in NESTED_EXECUTE_RE.finditer(code)]
+		elif kind == "shell":
+			nested = extract_nested_shell_calls(code)
+		if not nested:
+			return
+
+		body, explicit_err = extract_opencode_output(item)
+		if kind == "shell" and meta.get("exit") not in (None, 0):
+			explicit_err = True
+		duration_s: Optional[float] = None
+		if start_dt and end_dt:
+			duration_s = (end_dt - start_dt).total_seconds()
+
+		if not sess_state["date"] and start_dt:
+			sess_state["date"] = start_dt.astimezone().strftime("%Y-%m-%d")
+
+		for tool, raw_args, call_errored in nested:
+			self._record_call(
+				source="opencode",
+				sid=sid,
+				title=title,
+				tool=tool,
+				raw_args=raw_args,
+				body=body,
+				explicit_error=explicit_err or call_errored,
+				duration_s=duration_s,
+				sess_state=sess_state,
+				nested=True,
+			)
+
 	def collect_opencode(self) -> None:
 		if not OPENCODE_DIR.exists():
 			return
+		self._sources_collected.add("opencode")
 		db_paths = sorted(p for p in OPENCODE_DIR.glob("opencode*.db") if p.is_file())
 		seen_call_ids: set[str] = set()
 
@@ -829,6 +930,12 @@ class AuditCollector:
 				if sess_table:
 					for sid, title in cur.execute(f"SELECT id, title FROM {sess_table}"):
 						titles[str(sid)] = str(title or "")
+				self._titles_by_source["opencode"] = titles
+				if self.includes and sess_table:
+					for (sidv,) in cur.execute(f"SELECT id FROM {sess_table}"):
+						sidv = str(sidv)
+						if matches_any_prefix(sidv, self.includes):
+							self._matched_ids_by_source["opencode"].add(sidv)
 
 				per_session: dict[str, dict[str, Any]] = {}
 				per_session_text: dict[str, list[str]] = collections.defaultdict(list)
@@ -860,9 +967,9 @@ class AuditCollector:
 
 					raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "")
 					state = item.get("state") if isinstance(item.get("state"), dict) else {}
-					time_info = state.get("time") if isinstance(state.get("time"), dict) else {}
-					start_dt = parse_ts(time_info.get("start")) or parse_ts(row_ts)
-					end_dt = parse_ts(time_info.get("end"))
+					start_dt, end_dt = extract_opencode_item_time(item)
+					if start_dt is None:
+						start_dt = parse_ts(row_ts)
 					if self.since is not None and start_dt is not None and start_dt < self.since:
 						return
 
@@ -876,6 +983,19 @@ class AuditCollector:
 						if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
 							self.screenshot_followed_by_read += 1
 							sess_state["prev_was_screenshot"] = False
+						return
+
+					if raw_name in ("shell", "execute", "bash"):
+						self._record_nested_calls(
+							sid=sid,
+							title=titles.get(sid, ""),
+							kind=raw_name,
+							code=str(inp.get("command") or inp.get("code") or ""),
+							item=item,
+							start_dt=start_dt,
+							end_dt=end_dt,
+							sess_state=sess_state,
+						)
 						return
 
 					kind, tool = extract_opencode_tool_name(raw_name)
@@ -957,6 +1077,38 @@ class AuditCollector:
 				pass
 			finally:
 				conn.close()
+
+	def _compute_session_match(self) -> dict[str, Any]:
+		if not self.includes:
+			return {"matched_zero_call": [], "unmatched_prefixes": []}
+		attributed: dict[str, set[str]] = collections.defaultdict(set)
+		for s in self.sessions:
+			attributed[s["source"]].add(s["sid"])
+		zero: list[dict[str, Any]] = []
+		seen_zero: set[str] = set()
+		unmatched: list[str] = []
+		for prefix in self.includes:
+			any_match = False
+			for source in ("agy", "opencode"):
+				if source not in self._sources_collected:
+					continue
+				for msid in self._matched_ids_by_source.get(source, ()):
+					if not (msid == prefix or msid.startswith(prefix)):
+						continue
+					any_match = True
+					if matches_any_prefix(msid, self.excludes):
+						continue
+					if msid in attributed[source] or msid in seen_zero:
+						continue
+					seen_zero.add(msid)
+					zero.append({
+						"source": source,
+						"sid": msid,
+						"title": self._titles_by_source.get(source, {}).get(msid, ""),
+					})
+			if not any_match:
+				unmatched.append(prefix)
+		return {"matched_zero_call": zero, "unmatched_prefixes": unmatched}
 
 	def build_snapshot(self, since_spec: Optional[str], source_filter: str) -> dict[str, Any]:
 		total_calls = sum(self.tool_counts.values())
@@ -1083,6 +1235,7 @@ class AuditCollector:
 			"domains": dict(self.domains.most_common()),
 			"other_browser_mcps": dict(self.other_browser_mcps.most_common()),
 			"browser_subagents": self.browser_subagents,
+			"session_match": self._compute_session_match(),
 			"headless_switches": self.headless_switches,
 			"consecutive_same_tool": dict(self.consecutive_same_tool.most_common()),
 			"sessions": sorted(self.sessions, key=lambda x: x["calls"], reverse=True),
@@ -1217,6 +1370,14 @@ def format_report(snap: dict[str, Any], top_n: int, max_samples: int, diff: Opti
 	window_parts.append(f"excluded={len(f['excluded_ids'])}")
 	window_parts.append(f"slow>={f['slow_threshold_s']}s")
 	lines.append("Window: " + " | ".join(window_parts))
+	match_info = snap.get("session_match") or {}
+	zero = match_info.get("matched_zero_call", [])
+	unmatched = match_info.get("unmatched_prefixes", [])
+	if zero:
+		zs = ", ".join(f"{z['sid']} ({z['source']}, {z['title'] or 'untitled'})" for z in zero)
+		lines.append(f"NOTE: {len(zero)} matched session(s) with 0 attributed stealth-browser calls: {zs}")
+	if unmatched:
+		lines.append(f"NOTE: no matching session ID for prefix(es): {', '.join(unmatched)}")
 	lines.append(
 		f"Sessions: {s['sessions']} {s['sessions_by_source']} | "
 		f"Calls: {s['total_calls']} {s['calls_by_source']} | "
@@ -1375,7 +1536,7 @@ def build_parser() -> argparse.ArgumentParser:
 		"--session",
 		action="append",
 		default=[],
-		help="Conversation/session ID (or prefix) to include (audit only these sessions). Repeatable or comma-separated.",
+		help="Conversation/session ID (or prefix) to include (audit only these sessions). Repeatable or comma-separated. A matched session with 0 attributed calls is reported distinctly from no match.",
 	)
 	parser.add_argument(
 		"--exclude",
