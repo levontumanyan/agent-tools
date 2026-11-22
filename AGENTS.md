@@ -13,6 +13,7 @@
 - **Video Downloader CLI**: Use `download-video "<url>"` (or bare `download-video` to grab URL from clipboard) to download reels, stories, and videos (defaults to `$DOWNLOAD_VIDEO_DIR` or `~/Downloads`) with Apple Vision OCR frame analysis, WhatsApp-compatible H.264/AAC transcoding, and metadata tagging; see `download-video --help`.
 - **Portfolio CLI**: Query holdings, inspect trade history, record fills, and sync YAML snapshots via `portfolio list`, `portfolio history [-s <symbol>] [-a <account>] [-t <type>] [-n <limit>]`, `portfolio add -a <account> -s <symbol> -q <qty> -p <price>`, or `portfolio sync` (see `portfolio --help`). Maintains Adjusted Cost Base (ACB) in a local SQLite ledger (`finances/portfolio.db`) and exports an agent-fast YAML snapshot (`finances/portfolio.yaml`).
 - **Wi-Fi & Network Diagnostic CLI**: Inspect Wi-Fi link health, audit VPN stealth and residential IP match, map hop-by-hop latency, and evaluate network capacity via `wifi-check` (see `wifi-check --help`). For fast, non-blocking agent diagnostic queries, use `wifi-check -q -j` (quick mode, JSON output).
+- **AGY Session Search CLI & MCP**: Search local Antigravity CLI (`agy`) sessions across `conversation_summaries.db`, `tool_calls` in `transcript.jsonl`, and native macOS `NLEmbedding` semantic recall via `agy-search "<query>"` (or `agy-search mcp` for stdio MCP; see `agy-search --help`). Uses `nl-embed` (`src/nl-embed.swift`) for 512-dim on-device embeddings with zero external dependencies.
 
 # Development
 

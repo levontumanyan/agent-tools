@@ -1,0 +1,727 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "mcp>=2.0.0",
+# ]
+# ///
+"""
+agy-search: Hybrid lexical + tool_calls + native macOS semantic search for local AGY sessions.
+Works as both a stdio MCP server (`agy-search mcp`) and a CLI tool (`agy-search "query"`).
+"""
+
+import argparse
+import array
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from mcp.server.mcpserver import MCPServer
+
+AGY_DIR = Path.home() / ".gemini" / "antigravity-cli"
+SUMMARIES_DB = AGY_DIR / "conversation_summaries.db"
+BRAIN_DIR = AGY_DIR / "brain"
+INDEX_DB = AGY_DIR / "agy-search-index.db"
+NL_EMBED_BIN = Path(__file__).resolve().parent / "nl-embed"
+
+SKIP_ARG_KEYS = {"Content", "Replacement", "Target", "Script"}
+MAX_BODY_CHARS = 50000
+MAX_EMBED_CHARS = 500
+RRF_K = 60
+
+mcp = MCPServer("agy-search")
+
+
+def _clean_prose(text: str) -> str:
+	"""Strip XML prompt wrappers, file paths, and markdown noise for clean titles & NLEmbedding."""
+	if not text:
+		return ""
+	text = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", " ", text, flags=re.S)
+	text = re.sub(r"</?(?:USER_REQUEST|SYSTEM_MESSAGE|ADDITIONAL_METADATA)>", " ", text)
+	text = re.sub(r"(?:file://)?/(?:Users|home|var|tmp|etc)/[^\s\"')]+", " ", text)
+	text = re.sub(r"[#*`>|]+", " ", text)
+	return " ".join(text.split())
+
+
+def _parse_since(since: str) -> str:
+	"""Convert relative ('7d', '24h') or ISO date string into an ISO-8601 UTC prefix."""
+	s = since.strip()
+	if not s:
+		return ""
+	m = re.fullmatch(r"(\d+)([hdw])", s.lower())
+	if m:
+		val = int(m.group(1))
+		unit = m.group(2)
+		delta = timedelta(hours=val) if unit == "h" else timedelta(days=val * (7 if unit == "w" else 1))
+		return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%S")
+	return s
+
+
+def _sanitize_fts_query(query: str) -> str:
+	"""Tokenize a free-text query into safe FTS5 double-quoted terms."""
+	tokens = re.findall(r"[A-Za-z0-9_./:-]+", query)
+	if not tokens:
+		return ""
+	return " ".join(f'"{t.replace(chr(34), "")}"' for t in tokens)
+
+
+def _format_workspaces(raw: str) -> list[str]:
+	"""Parse workspace_uris JSON array into clean paths."""
+	try:
+		items = json.loads(raw) if raw else []
+	except json.JSONDecodeError:
+		return [raw] if raw else []
+	return [u.removeprefix("file://") for u in items if isinstance(u, str)]
+
+
+def _extract_tool_call_summary(tc: dict[str, Any]) -> str:
+	"""Format a single tool call into a compact searchable string of tool name + key args."""
+	name = tc.get("name") or tc.get("function", {}).get("name") or ""
+	args = tc.get("args") or tc.get("arguments") or tc.get("function", {}).get("arguments") or {}
+	if isinstance(args, str):
+		try:
+			args = json.loads(args)
+		except json.JSONDecodeError:
+			return f"{name}({args[:200]})" if name else args[:200]
+	if not isinstance(args, dict):
+		return str(name)
+	parts = []
+	for k, v in args.items():
+		if k in SKIP_ARG_KEYS:
+			continue
+		val_str = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+		if len(val_str) > 240:
+			val_str = val_str[:240]
+		parts.append(f"{k}={val_str}")
+	return f"{name}({', '.join(parts)})" if name else ", ".join(parts)
+
+
+def _parse_transcript(cid: str) -> dict[str, str]:
+	"""Extract first_user_input, tool_calls_text, body_text, and last_agent_reply from transcript.jsonl."""
+	t_path = BRAIN_DIR / cid / ".system_generated" / "logs" / "transcript.jsonl"
+	if not t_path.exists():
+		return {"first_user_input": "", "tool_calls_text": "", "body_text": "", "last_agent_reply": ""}
+
+	first_user = ""
+	last_agent = ""
+	tool_lines: list[str] = []
+	body_parts: list[str] = []
+	body_len = 0
+
+	try:
+		with t_path.open("r", encoding="utf-8", errors="replace") as f:
+			for line in f:
+				line = line.strip()
+				if not line:
+					continue
+				try:
+					step = json.loads(line)
+				except json.JSONDecodeError:
+					continue
+				stype = step.get("type", "")
+				content = step.get("content") or ""
+				if stype == "USER_INPUT" and content and not first_user:
+					first_user = _clean_prose(content)[:240]
+				if stype == "PLANNER_RESPONSE" and content:
+					last_agent = _clean_prose(content)[:400]
+				if content and body_len < MAX_BODY_CHARS:
+					chunk = content[:MAX_BODY_CHARS - body_len]
+					body_parts.append(chunk)
+					body_len += len(chunk)
+				for tc in step.get("tool_calls") or []:
+					if isinstance(tc, dict):
+						tool_lines.append(_extract_tool_call_summary(tc))
+	except OSError:
+		pass
+
+	return {
+		"first_user_input": first_user,
+		"tool_calls_text": "\n".join(tool_lines),
+		"body_text": "\n".join(body_parts),
+		"last_agent_reply": last_agent,
+	}
+
+
+def _run_nl_embed_batch(items: list[tuple[str, str]]) -> dict[str, bytes]:
+	"""Call native macOS nl-embed --batch and return {id: packed_float32_bytes}."""
+	if not items or not NL_EMBED_BIN.exists():
+		return {}
+	payload = "\n".join(json.dumps({"id": cid, "text": txt[:MAX_EMBED_CHARS]}, ensure_ascii=False) for cid, txt in items)
+	try:
+		proc = subprocess.run(
+			[str(NL_EMBED_BIN), "--batch"],
+			input=payload,
+			text=True,
+			capture_output=True,
+			timeout=60,
+		)
+	except Exception:
+		return {}
+	if proc.returncode != 0:
+		return {}
+	out: dict[str, bytes] = {}
+	for line in proc.stdout.splitlines():
+		line = line.strip()
+		if not line:
+			continue
+		try:
+			obj = json.loads(line)
+		except json.JSONDecodeError:
+			continue
+		vec = obj.get("vector")
+		cid = obj.get("id")
+		if cid and isinstance(vec, list) and vec:
+			out[cid] = array.array("f", vec).tobytes()
+	return out
+
+
+def _embed_query(query: str) -> array.array | None:
+	"""Embed a single search query via nl-embed."""
+	if not NL_EMBED_BIN.exists():
+		return None
+	try:
+		proc = subprocess.run(
+			[str(NL_EMBED_BIN), query],
+			text=True,
+			capture_output=True,
+			timeout=10,
+		)
+		if proc.returncode != 0:
+			return None
+		obj = json.loads(proc.stdout)
+		vec = obj.get("vector")
+		if isinstance(vec, list) and vec:
+			return array.array("f", vec)
+	except Exception:
+		pass
+	return None
+
+
+def _open_index_db() -> sqlite3.Connection:
+	"""Open (and initialize if needed) agy-search-index.db."""
+	conn = sqlite3.connect(str(INDEX_DB), timeout=30)
+	conn.execute("PRAGMA journal_mode=WAL;")
+	conn.execute("PRAGMA synchronous=NORMAL;")
+	conn.execute(
+		"""
+		CREATE TABLE IF NOT EXISTS sessions (
+			conversation_id TEXT PRIMARY KEY,
+			title TEXT NOT NULL DEFAULT '',
+			effective_title TEXT NOT NULL DEFAULT '',
+			workspace_uris TEXT NOT NULL DEFAULT '',
+			last_modified_time TEXT NOT NULL DEFAULT '',
+			step_count INTEGER NOT NULL DEFAULT 0,
+			first_user_input TEXT NOT NULL DEFAULT '',
+			tool_calls_text TEXT NOT NULL DEFAULT '',
+			summary_text TEXT NOT NULL DEFAULT '',
+			embedding BLOB
+		);
+		"""
+	)
+	conn.execute(
+		"""
+		CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+			conversation_id UNINDEXED,
+			effective_title,
+			workspace_uris,
+			first_user_input,
+			tool_calls_text,
+			body_text,
+			tokenize = 'unicode61 remove_diacritics 2'
+		);
+		"""
+	)
+	conn.commit()
+	return conn
+
+
+def _open_summaries_db() -> sqlite3.Connection:
+	"""Open conversation_summaries.db in read-only mode."""
+	return sqlite3.connect(f"file:{SUMMARIES_DB}?mode=ro", uri=True, timeout=10)
+
+
+def sync_index(semantic: bool = True, rebuild: bool = False) -> dict[str, int]:
+	"""Incrementally sync new/modified sessions from conversation_summaries.db and transcripts."""
+	if not SUMMARIES_DB.exists():
+		return {"total": 0, "updated": 0, "embedded": 0}
+
+	src = _open_summaries_db()
+	dst = _open_index_db()
+	try:
+		if rebuild:
+			dst.execute("DELETE FROM sessions;")
+			dst.execute("DELETE FROM sessions_fts;")
+			dst.commit()
+
+		existing = {
+			row[0]: (row[1], row[2], row[3] is not None)
+			for row in dst.execute("SELECT conversation_id, last_modified_time, step_count, embedding FROM sessions;")
+		}
+
+		src_rows = src.execute(
+			"""
+			SELECT conversation_id, title, workspace_uris, last_modified_time, step_count
+			FROM conversation_summaries
+			ORDER BY last_modified_time DESC;
+			"""
+		).fetchall()
+
+		to_embed: list[tuple[str, str]] = []
+		updated = 0
+
+		for cid, title, ws_raw, lmt, step_count in src_rows:
+			prev = existing.get(cid)
+			if prev and prev[0] == lmt and prev[1] == step_count:
+				if semantic and not prev[2]:
+					row = dst.execute("SELECT summary_text FROM sessions WHERE conversation_id = ?;", (cid,)).fetchone()
+					if row and row[0]:
+						to_embed.append((cid, row[0]))
+				continue
+
+			parsed = _parse_transcript(cid)
+			effective_title = (
+				title.strip()
+				or parsed["first_user_input"]
+				or parsed["last_agent_reply"][:140]
+				or f"(untitled {cid[:8]})"
+			)
+			workspaces = ", ".join(_format_workspaces(ws_raw))
+			repo_names = ", ".join(Path(w).name for w in _format_workspaces(ws_raw) if w)
+			summary_parts = [effective_title]
+			if repo_names:
+				summary_parts.append(repo_names)
+			if parsed["first_user_input"] and parsed["first_user_input"] != effective_title:
+				summary_parts.append(parsed["first_user_input"])
+			if parsed["last_agent_reply"]:
+				summary_parts.append(parsed["last_agent_reply"])
+			summary_text = _clean_prose(". ".join(summary_parts))[:MAX_EMBED_CHARS]
+
+			dst.execute(
+				"""
+				INSERT INTO sessions (
+					conversation_id, title, effective_title, workspace_uris,
+					last_modified_time, step_count, first_user_input, tool_calls_text, summary_text, embedding
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+				ON CONFLICT(conversation_id) DO UPDATE SET
+					title = excluded.title,
+					effective_title = excluded.effective_title,
+					workspace_uris = excluded.workspace_uris,
+					last_modified_time = excluded.last_modified_time,
+					step_count = excluded.step_count,
+					first_user_input = excluded.first_user_input,
+					tool_calls_text = excluded.tool_calls_text,
+					summary_text = excluded.summary_text,
+					embedding = NULL;
+				""",
+				(
+					cid, title, effective_title, ws_raw,
+					lmt, step_count, parsed["first_user_input"], parsed["tool_calls_text"], summary_text,
+				),
+			)
+			dst.execute("DELETE FROM sessions_fts WHERE conversation_id = ?;", (cid,))
+			dst.execute(
+				"""
+				INSERT INTO sessions_fts (
+					conversation_id, effective_title, workspace_uris,
+					first_user_input, tool_calls_text, body_text
+				) VALUES (?, ?, ?, ?, ?, ?);
+				""",
+				(cid, effective_title, workspaces, parsed["first_user_input"], parsed["tool_calls_text"], parsed["body_text"]),
+			)
+			if semantic and summary_text:
+				to_embed.append((cid, summary_text))
+			updated += 1
+
+		embedded = 0
+		if semantic and to_embed:
+			for i in range(0, len(to_embed), 100):
+				batch = to_embed[i:i + 100]
+				vecs = _run_nl_embed_batch(batch)
+				for cid, blob in vecs.items():
+					dst.execute("UPDATE sessions SET embedding = ? WHERE conversation_id = ?;", (blob, cid))
+					embedded += 1
+
+		dst.commit()
+		return {"total": len(src_rows), "updated": updated, "embedded": embedded}
+	finally:
+		src.close()
+		dst.close()
+
+
+def _dot_product(a: array.array, blob: bytes) -> float:
+	"""Compute dot product between normalized query vector and stored float32 BLOB."""
+	b = array.array("f")
+	b.frombytes(blob)
+	if len(a) != len(b):
+		return 0.0
+	return sum(x * y for x, y in zip(a, b))
+
+
+def _matching_tool_calls(tool_calls_text: str, terms: list[str], limit: int = 5) -> list[str]:
+	"""Return up to `limit` tool call lines matching any query term."""
+	if not tool_calls_text or not terms:
+		return []
+	lower_terms = [t.lower() for t in terms]
+	hits: list[str] = []
+	for line in tool_calls_text.splitlines():
+		low = line.lower()
+		if any(t in low for t in lower_terms):
+			hits.append(line[:220])
+			if len(hits) >= limit:
+				break
+	return hits
+
+
+def _search_impl(
+	query: str,
+	limit: int = 10,
+	mode: str = "hybrid",
+	workspace: str = "",
+	since: str = "",
+	exclude_id: str = "",
+	include_tool_calls: bool = True,
+) -> dict[str, Any]:
+	"""Core search implementation shared by MCP and CLI."""
+	use_semantic = mode in ("hybrid", "semantic")
+	sync_info = sync_index(semantic=use_semantic)
+	since_iso = _parse_since(since)
+	fts_query = _sanitize_fts_query(query)
+	terms = re.findall(r"[A-Za-z0-9_./:-]+", query)
+
+	conn = _open_index_db()
+	try:
+		meta_rows = conn.execute(
+			"""
+			SELECT conversation_id, effective_title, workspace_uris, last_modified_time,
+				   step_count, first_user_input, tool_calls_text, embedding
+			FROM sessions;
+			"""
+		).fetchall()
+
+		meta: dict[str, dict[str, Any]] = {}
+		for cid, eff_title, ws_raw, lmt, steps, first_u, tc_text, emb in meta_rows:
+			if exclude_id and cid == exclude_id:
+				continue
+			if since_iso and lmt < since_iso:
+				continue
+			ws_list = _format_workspaces(ws_raw)
+			if workspace and not any(workspace.lower() in w.lower() for w in ws_list):
+				continue
+			meta[cid] = {
+				"conversation_id": cid,
+				"title": eff_title,
+				"workspaces": ws_list,
+				"last_modified_time": lmt,
+				"step_count": steps,
+				"first_user_input": first_u,
+				"tool_calls_text": tc_text,
+				"embedding": emb,
+			}
+
+		lexical_ranks: dict[str, int] = {}
+		snippets: dict[str, str] = {}
+
+		if mode in ("hybrid", "lexical") and fts_query:
+			cols = "{effective_title workspace_uris first_user_input tool_calls_text body_text}" if include_tool_calls else "{effective_title workspace_uris first_user_input body_text}"
+			fts_rows = conn.execute(
+				f"""
+				SELECT conversation_id, snippet(sessions_fts, 5, '[', ']', '...', 18), bm25(sessions_fts, 5.0, 2.0, 4.0, 3.0, 1.0) AS rank_score
+				FROM sessions_fts
+				WHERE sessions_fts MATCH '{cols} : ' || ?
+				ORDER BY rank_score
+				LIMIT 100;
+				""",
+				(fts_query,),
+			).fetchall()
+			rank_idx = 0
+			for cid, snip, _ in fts_rows:
+				if cid in meta:
+					rank_idx += 1
+					lexical_ranks[cid] = rank_idx
+					snippets[cid] = snip or ""
+
+		semantic_ranks: dict[str, int] = {}
+		semantic_scores: dict[str, float] = {}
+		semantic_active = False
+
+		if use_semantic:
+			q_vec = _embed_query(query)
+			if q_vec is not None:
+				semantic_active = True
+				scored: list[tuple[float, str]] = []
+				for cid, info in meta.items():
+					if info["embedding"]:
+						sim = _dot_product(q_vec, info["embedding"])
+						scored.append((sim, cid))
+				scored.sort(reverse=True)
+				for idx, (sim, cid) in enumerate(scored[:100], start=1):
+					if sim > 0.2:
+						semantic_ranks[cid] = idx
+						semantic_scores[cid] = round(sim, 4)
+
+		candidate_ids = set(lexical_ranks.keys()) | set(semantic_ranks.keys())
+		results: list[dict[str, Any]] = []
+
+		for cid in candidate_ids:
+			info = meta[cid]
+			score = 0.0
+			sources: list[str] = []
+			if cid in lexical_ranks:
+				score += 1.0 / (RRF_K + lexical_ranks[cid])
+				sources.append("lexical")
+			if cid in semantic_ranks:
+				score += 1.0 / (RRF_K + semantic_ranks[cid])
+				sources.append("semantic")
+			tc_hits = _matching_tool_calls(info["tool_calls_text"], terms) if include_tool_calls else []
+			if tc_hits:
+				if "tool_calls" not in sources:
+					sources.append("tool_calls")
+				score += 0.005
+
+			results.append({
+				"conversation_id": cid,
+				"title": info["title"],
+				"workspaces": info["workspaces"],
+				"last_modified_time": info["last_modified_time"],
+				"step_count": info["step_count"],
+				"score": round(score, 5),
+				"semantic_similarity": semantic_scores.get(cid),
+				"match_sources": sources,
+				"matched_tool_calls": tc_hits,
+				"snippet": snippets.get(cid) or info["first_user_input"],
+			})
+
+		results.sort(key=lambda r: (r["score"], r["last_modified_time"]), reverse=True)
+		return {
+			"query": query,
+			"mode": mode,
+			"semantic_active": semantic_active,
+			"indexed_sessions": sync_info["total"],
+			"count": len(results[:limit]),
+			"results": results[:limit],
+		}
+	finally:
+		conn.close()
+
+
+@mcp.tool()
+def search_sessions(
+	query: str,
+	limit: int = 10,
+	mode: str = "hybrid",
+	workspace: str = "",
+	since: str = "",
+	exclude_id: str = "",
+	include_tool_calls: bool = True,
+) -> dict[str, Any]:
+	"""Search local AGY sessions using hybrid lexical + tool_calls + native macOS semantic recall.
+
+	Args:
+		query: Search query (keywords, file paths, commands, or natural language concepts).
+		limit: Maximum number of results to return.
+		mode: 'hybrid' (default), 'lexical', or 'semantic'.
+		workspace: Optional workspace substring filter (e.g. 'cloud-lab').
+		since: Optional time filter ('24h', '7d', '30d', or ISO date '2026-11-01').
+		exclude_id: Optional conversation_id to exclude (e.g. current session).
+		include_tool_calls: Whether to match against tool call names, paths, and commands.
+	"""
+	return _search_impl(
+		query=query,
+		limit=max(1, min(limit, 50)),
+		mode=mode,
+		workspace=workspace,
+		since=since,
+		exclude_id=exclude_id,
+		include_tool_calls=include_tool_calls,
+	)
+
+
+@mcp.tool()
+def get_session(
+	conversation_id: str,
+	step_start: int = 0,
+	step_end: int = 50,
+	include_tool_calls: bool = True,
+) -> dict[str, Any]:
+	"""Read transcript steps for a given AGY conversation_id (uses transcript_full.jsonl for truncated steps)."""
+	cid = conversation_id.strip()
+	if not re.fullmatch(r"[0-9a-f-]+", cid):
+		return {"error": f"Invalid conversation_id: {conversation_id}"}
+
+	t_path = BRAIN_DIR / cid / ".system_generated" / "logs" / "transcript.jsonl"
+	full_path = BRAIN_DIR / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+	if not t_path.exists():
+		return {"error": f"Transcript not found for {cid}"}
+
+	full_lines: list[str] | None = None
+	steps: list[dict[str, Any]] = []
+	total_steps = 0
+
+	with t_path.open("r", encoding="utf-8", errors="replace") as f:
+		for idx, line in enumerate(f):
+			total_steps += 1
+			if idx < step_start or idx >= step_end:
+				continue
+			try:
+				obj = json.loads(line)
+			except json.JSONDecodeError:
+				continue
+			if obj.get("truncated_fields") and full_path.exists():
+				if full_lines is None:
+					full_lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+				if idx < len(full_lines):
+					try:
+						obj = json.loads(full_lines[idx])
+					except json.JSONDecodeError:
+						pass
+			entry: dict[str, Any] = {
+				"step_index": obj.get("step_index", idx),
+				"type": obj.get("type", ""),
+				"created_at": obj.get("created_at", ""),
+				"content": obj.get("content", ""),
+			}
+			if include_tool_calls and obj.get("tool_calls"):
+				entry["tool_calls"] = [
+					_extract_tool_call_summary(tc) for tc in obj["tool_calls"] if isinstance(tc, dict)
+				]
+			steps.append(entry)
+
+	return {
+		"conversation_id": cid,
+		"total_steps": total_steps,
+		"step_start": step_start,
+		"step_end": min(step_end, total_steps),
+		"steps": steps,
+	}
+
+
+@mcp.tool()
+def index_stats() -> dict[str, Any]:
+	"""Return index statistics and native macOS NLEmbedding availability."""
+	sync_info = sync_index(semantic=False)
+	conn = _open_index_db()
+	try:
+		total, embedded = conn.execute(
+			"SELECT count(*), sum(case when embedding is not null then 1 else 0 end) FROM sessions;"
+		).fetchone()
+	finally:
+		conn.close()
+
+	nl_available = False
+	if NL_EMBED_BIN.exists():
+		try:
+			out = subprocess.check_output([str(NL_EMBED_BIN), "--check"], text=True, timeout=5)
+			nl_available = bool(json.loads(out).get("available"))
+		except Exception:
+			pass
+
+	return {
+		"summaries_db": str(SUMMARIES_DB),
+		"index_db": str(INDEX_DB),
+		"total_sessions": total or sync_info["total"],
+		"embedded_sessions": embedded or 0,
+		"nl_embed_available": nl_available,
+	}
+
+
+def main() -> None:
+	parser = argparse.ArgumentParser(
+		description="Search local AGY sessions (hybrid lexical + tool_calls + native macOS semantic recall) or run stdio MCP server.",
+	)
+	sub = parser.add_subparsers(dest="cmd")
+
+	sub.add_parser("mcp", help="Run as a stdio MCP server")
+
+	p_search = sub.add_parser("search", help="Search local AGY sessions")
+	p_search.add_argument("query", help="Search query")
+	p_search.add_argument("-n", "--limit", type=int, default=10, help="Max results")
+	p_search.add_argument("-m", "--mode", choices=["hybrid", "lexical", "semantic"], default="hybrid", help="Search mode")
+	p_search.add_argument("-w", "--workspace", default="", help="Workspace filter")
+	p_search.add_argument("-s", "--since", default="", help="Time filter (e.g. 7d, 24h, 2026-11-01)")
+	p_search.add_argument("--no-tools", action="store_true", help="Exclude tool_calls from lexical search")
+	p_search.add_argument("-j", "--json", action="store_true", help="Output JSON")
+
+	p_show = sub.add_parser("show", help="Show transcript steps for a conversation_id")
+	p_show.add_argument("conversation_id", help="Conversation UUID")
+	p_show.add_argument("--start", type=int, default=0, help="Start step index")
+	p_show.add_argument("--end", type=int, default=50, help="End step index")
+	p_show.add_argument("-j", "--json", action="store_true", help="Output JSON")
+
+	p_idx = sub.add_parser("index", help="Build or update the search index")
+	p_idx.add_argument("--rebuild", action="store_true", help="Rebuild index from scratch")
+
+	sub.add_parser("stats", help="Show index and semantic model status")
+
+	# Allow shorthand `agy-search "query"` without typing `search`
+	argv = sys.argv[1:]
+	known_cmds = {"mcp", "search", "show", "index", "stats", "-h", "--help"}
+	if argv and argv[0] not in known_cmds and not argv[0].startswith("-"):
+		argv = ["search"] + argv
+
+	args = parser.parse_args(argv)
+
+	if args.cmd == "mcp":
+		mcp.run()
+		return
+
+	if args.cmd == "index":
+		res = sync_index(semantic=True, rebuild=args.rebuild)
+		print(json.dumps(res, indent=2))
+		return
+
+	if args.cmd == "stats":
+		print(json.dumps(index_stats(), indent=2))
+		return
+
+	if args.cmd == "show":
+		res = get_session(args.conversation_id, step_start=args.start, step_end=args.end)
+		if args.json:
+			print(json.dumps(res, indent=2, ensure_ascii=False))
+		else:
+			if "error" in res:
+				print(res["error"], file=sys.stderr)
+				sys.exit(1)
+			for st in res["steps"]:
+				print(f"[{st['step_index']}] {st['type']} ({st['created_at']})")
+				if st["content"]:
+					print(st["content"][:800])
+				for tc in st.get("tool_calls", []):
+					print(f"  -> {tc}")
+				print()
+		return
+
+	if args.cmd == "search":
+		res = _search_impl(
+			query=args.query,
+			limit=args.limit,
+			mode=args.mode,
+			workspace=args.workspace,
+			since=args.since,
+			include_tool_calls=not args.no_tools,
+		)
+		if args.json:
+			print(json.dumps(res, indent=2, ensure_ascii=False))
+		else:
+			print(f"Found {res['count']} results (mode={res['mode']}, semantic_active={res['semantic_active']}, total={res['indexed_sessions']}):\n")
+			for r in res["results"]:
+				ws = ", ".join(r["workspaces"]) or "(none)"
+				sim = f" sim={r['semantic_similarity']}" if r["semantic_similarity"] is not None else ""
+				print(f"- {r['conversation_id'][:8]}  {r['title']}")
+				print(f"  {r['last_modified_time']} | ws={ws} | via={','.join(r['match_sources'])}{sim}")
+				if r["matched_tool_calls"]:
+					print(f"  tool: {r['matched_tool_calls'][0]}")
+				elif r["snippet"]:
+					print(f"  text: {' '.join(r['snippet'].split())[:180]}")
+		return
+
+	parser.print_help()
+
+
+if __name__ == "__main__":
+	main()
