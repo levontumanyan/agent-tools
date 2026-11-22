@@ -1559,6 +1559,13 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 	if (includeIframes) {
 		const frameNeedsLoad = (f) => {
 			try {
+				const w = f.contentWindow;
+				if (!w) return false;
+				void w.location.href;
+			} catch (_) {
+				return false;
+			}
+			try {
 				const d = f.contentDocument;
 				if (d === null) return true;
 				return d.readyState === 'loading';
@@ -3454,7 +3461,7 @@ async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = N
 	try:
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		if isinstance(target, str):
-			norm = target.strip()
+			norm = target.strip().lower()
 			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
 			if resolved < 0:
 				return f"No open tab with id '{norm}'. Use status() to list open tabs."
@@ -3489,7 +3496,7 @@ async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = No
 			return await close_browser()
 
 		if isinstance(target, str):
-			norm = target.strip()
+			norm = target.strip().lower()
 			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
 			if resolved < 0:
 				return f"No open tab with id '{norm}'. Use status() to list open tabs."
