@@ -68,6 +68,33 @@ const insertPromptSQL = `
 	VALUES ($1, $2, $3, $4, $5, $6)
 `
 
+const upsertHeartbeatOKSQL = `
+	INSERT INTO shipper_heartbeats (
+		shipper_name, host, last_seen_at, last_ok_at,
+		consecutive_errors, last_error, rows_synced_last_pass
+	) VALUES ($1, $2, NOW(), NOW(), 0, '', $3)
+	ON CONFLICT (shipper_name) DO UPDATE SET
+		host = EXCLUDED.host,
+		last_seen_at = NOW(),
+		last_ok_at = NOW(),
+		consecutive_errors = 0,
+		last_error = '',
+		rows_synced_last_pass = EXCLUDED.rows_synced_last_pass;
+`
+
+const upsertHeartbeatErrSQL = `
+	INSERT INTO shipper_heartbeats (
+		shipper_name, host, last_seen_at, last_ok_at,
+		consecutive_errors, last_error, rows_synced_last_pass
+	) VALUES ($1, $2, NOW(), NULL, 1, $3, $4)
+	ON CONFLICT (shipper_name) DO UPDATE SET
+		host = EXCLUDED.host,
+		last_seen_at = NOW(),
+		consecutive_errors = shipper_heartbeats.consecutive_errors + 1,
+		last_error = EXCLUDED.last_error,
+		rows_synced_last_pass = EXCLUDED.rows_synced_last_pass;
+`
+
 func ConnectDB(ctx context.Context, connString string) (*DB, error) {
 	config, err := pgxpool.ParseConfig(connString)
 	if err != nil {
@@ -457,4 +484,15 @@ func (db *DB) SyncPrompts(ctx context.Context, sessionID string, workspace strin
 	}
 
 	return tx.Commit(ctx)
+}
+
+// RecordHeartbeat upserts shipper liveness and error status into shipper_heartbeats.
+func (db *DB) RecordHeartbeat(ctx context.Context, shipperName, host string, rowsSynced int, syncErr error) error {
+	if syncErr != nil {
+		errMsg := Sanitize(syncErr.Error(), 500)
+		_, err := db.pool.Exec(ctx, upsertHeartbeatErrSQL, shipperName, host, errMsg, rowsSynced)
+		return err
+	}
+	_, err := db.pool.Exec(ctx, upsertHeartbeatOKSQL, shipperName, host, rowsSynced)
+	return err
 }

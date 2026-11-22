@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -12,6 +13,40 @@ import (
 	"syscall"
 	"time"
 )
+
+const (
+	shipperName       = "antigravity"
+	heartbeatInterval = 5 * time.Minute
+)
+
+type heartbeatRecorder interface {
+	RecordHeartbeat(ctx context.Context, shipperName, host string, rowsSynced int, syncErr error) error
+}
+
+type heartbeatTracker struct {
+	interval   time.Duration
+	lastSent   time.Time
+	lastHadErr bool
+}
+
+func (h *heartbeatTracker) shouldSend(now time.Time, rowsSynced int, syncErr error) bool {
+	if h.lastSent.IsZero() || syncErr != nil || rowsSynced > 0 || h.lastHadErr {
+		return true
+	}
+	return now.Sub(h.lastSent) >= h.interval
+}
+
+func (h *heartbeatTracker) record(ctx context.Context, rec heartbeatRecorder, name, host string, now time.Time, rowsSynced int, syncErr error) {
+	if !h.shouldSend(now, rowsSynced, syncErr) {
+		return
+	}
+	if err := rec.RecordHeartbeat(ctx, name, host, rowsSynced, syncErr); err != nil {
+		log.Printf("Warning: failed recording shipper heartbeat: %v", err)
+		return
+	}
+	h.lastSent = now
+	h.lastHadErr = syncErr != nil
+}
 
 func main() {
 	var (
@@ -69,6 +104,8 @@ func main() {
 
 	// Track incremental parser state and DB sync watermarks per transcript path
 	sessionStates := make(map[string]*TranscriptState)
+	hostname, _ := os.Hostname()
+	hb := &heartbeatTracker{interval: heartbeatInterval}
 	if state != nil && len(state.Sessions) > 0 {
 		state.PopulateSessionStates(sessionStates)
 		log.Printf("Loaded %d session watermarks from state cache (%s).", len(state.Sessions), resolvedStatePath)
@@ -78,9 +115,12 @@ func main() {
 		transcripts, err := DiscoverRecentTranscripts(*recentLimit)
 		if err != nil {
 			log.Printf("Error discovering transcripts: %v", err)
+			hb.record(ctx, db, shipperName, hostname, time.Now(), 0, fmt.Errorf("discover transcripts: %w", err))
 			return
 		}
 
+		syncedSessions := 0
+		var dbErr, parseErr error
 		dirty := false
 		for _, t := range transcripts {
 			st, seen := sessionStates[t.Path]
@@ -95,6 +135,9 @@ func main() {
 			changed, err := st.UpdateIncremental(t.ModTime, t.Size)
 			if err != nil {
 				log.Printf("Error parsing transcript %s: %v", t.Path, err)
+				if parseErr == nil {
+					parseErr = fmt.Errorf("parse %s: %w", t.Path, err)
+				}
 				continue
 			}
 			if !changed && st.InitialSynced {
@@ -103,9 +146,13 @@ func main() {
 
 			if err := db.SyncSession(ctx, st); err != nil {
 				log.Printf("[%s] Error syncing session: %v", st.ShortID, err)
+				if dbErr == nil {
+					dbErr = fmt.Errorf("sync %s: %w", st.ShortID, err)
+				}
 				continue
 			}
 
+			syncedSessions++
 			dirty = true
 			if state != nil {
 				state.UpdateFromSession(st)
@@ -121,6 +168,12 @@ func main() {
 				log.Printf("Warning: failed saving state cache: %v", err)
 			}
 		}
+
+		passErr := dbErr
+		if passErr == nil && syncedSessions == 0 {
+			passErr = parseErr
+		}
+		hb.record(ctx, db, shipperName, hostname, time.Now(), syncedSessions, passErr)
 	}
 
 	if *recentLimit <= 0 {
