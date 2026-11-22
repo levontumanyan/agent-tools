@@ -114,10 +114,10 @@ def test_extract_tool_formats_rows_and_null_tolerant_fields(monkeypatch):
 		fields={"title": "text:.card-link", "link": "@href .card-link", "price": ".card-price"},
 	))
 	assert "Extracted 2 row(s) from '.result-card'" in out
-	assert '"total_matched": 3' in out
-	assert '"price": "US$10.99"' in out
-	assert '"price": null' in out
-	assert '"title": "Card Beta"' in out
+	assert '"total_matched":3' in out
+	assert '"price":"US$10.99"' in out
+	assert '"price":null' in out
+	assert '"title":"Card Beta"' in out
 
 
 def _make_resolver(page):

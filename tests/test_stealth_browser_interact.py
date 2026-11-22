@@ -107,8 +107,9 @@ def test_normalize_ref_and_selector():
 def test_snapshot_passes_flags_and_formats_refs_and_hrefs(patch_page):
 	long_url = "https://bank.example.com/statements/" + "a" * 140
 	page = FakePage(url="https://bank.example.com/dashboard")
-	page.evaluate = AsyncMock(
-		return_value=[
+	sample_items = {
+		"totalMatched": 3,
+		"items": [
 			{
 				"index": 0,
 				"ref": "e0",
@@ -116,7 +117,7 @@ def test_snapshot_passes_flags_and_formats_refs_and_hrefs(patch_page):
 				"selector": "#login-btn",
 				"text": "Sign In",
 				"href": "",
-				"attrs": '#login-btn [type="submit"]',
+				"attrs": "#login-btn type=submit",
 			},
 			{
 				"index": 1,
@@ -136,8 +137,9 @@ def test_snapshot_passes_flags_and_formats_refs_and_hrefs(patch_page):
 				"href": "",
 				"attrs": "[shadow]",
 			},
-		]
-	)
+		],
+	}
+	page.evaluate = AsyncMock(return_value=sample_items)
 	patch_page(page)
 
 	out = asyncio.run(
@@ -155,14 +157,22 @@ def test_snapshot_passes_flags_and_formats_refs_and_hrefs(patch_page):
 		"maxElements": 50,
 		"includeShadow": False,
 		"includeIframes": True,
+		"includeHrefs": False,
+		"filter": "",
+		"viewportOnly": False,
 	}
 
-	assert "| Ref | Tag | Selector | Text / Details |" in out
-	assert "| e0 | `<button>` | `#login-btn` | Sign In (#login-btn [type=\"submit\"]) |" in out
-	assert "| e1 | `<a>` | `[data-sb-ref=\"e1\"]` | Download \\| Statement ([iframe] href=" in out
-	assert "..." in out
-	assert long_url not in out
-	assert "| e2 | `<button>` | `[data-sb-ref=\"e2\"]` | Shadow Save ([shadow]) |" in out
+	assert "[e0] <button> #login-btn \"Sign In\" (type=submit)" in out
+	assert "#login-btn (type=submit)" not in out or "#login-btn #login-btn" not in out
+	assert '[data-sb-ref="e1"]' not in out
+	assert "href=" not in out
+	assert '[e1] <a> "Download | Statement" ([iframe])' in out
+	assert '[e2] <button> "Shadow Save" ([shadow])' in out
+
+	out_hrefs = asyncio.run(sb.snapshot(include_hrefs=True))
+	assert "href=https://bank.example.com/statements/" in out_hrefs
+	assert "..." in out_hrefs
+	assert long_url not in out_hrefs
 
 
 def test_click_by_ref_and_at_ref_and_force(patch_page):

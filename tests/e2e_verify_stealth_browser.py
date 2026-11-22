@@ -212,7 +212,7 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 
 					# script alias + JSON serialization in evaluate_js
 					ev_alias = await call("evaluate_js", {"script": "({ok: true, nums: [1, 2, 3]})"})
-					check("evaluate_js script alias + JSON", '"ok": true' in ev_alias, ev_alias)
+					check("evaluate_js script alias + JSON", '"ok":true' in ev_alias, ev_alias)
 
 					# Truncation guard on huge string
 					ev_big = await call("evaluate_js", {"expression": "'x'.repeat(50000)", "max_length": 500})
@@ -222,9 +222,9 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 					check(
 						"state() reads page-world __NEXT_DATA__ and window.store",
 						"Next.js (__NEXT_DATA__)" in st_res
-						and '"user": "levon"' in st_res
+						and '"user":"levon"' in st_res
 						and "Redux (window.store)" in st_res
-						and '"cash": 12345' in st_res,
+						and '"cash":12345' in st_res,
 						st_res[:500],
 					)
 					ev_iso = await call("evaluate_js", {"expression": "window.__CUSTOM_PAGE_GLOBAL__?.secretToken ?? 'isolated'"})
@@ -267,10 +267,19 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 
 				if suite in ("interact", "all"):
 					snap = await call("snapshot", {})
-					check("snapshot includes href", "/account/details" in snap and "/statement.pdf" in snap, snap[:600])
+					check("snapshot compact omits href by default", "href=" not in snap, snap[:600])
 					check("snapshot includes shadow DOM btn", "Shadow Confirm" in snap, snap)
 					check("snapshot includes iframe btn", "Iframe Submit" in snap, snap)
 					check("snapshot assigns eN refs", bool(re.search(r"\be\d+\b", snap)), snap[:600])
+
+					snap_hrefs = await call("snapshot", {"include_hrefs": True})
+					check("snapshot(include_hrefs=True) includes relative href", "/account/details" in snap_hrefs and "/statement.pdf" in snap_hrefs, snap_hrefs[:600])
+
+					snap_filtered = await call("snapshot", {"filter": "Statement", "include_hrefs": True})
+					check("snapshot(filter=...) narrows elements", "Download Statement PDF" in snap_filtered and "Second Action" not in snap_filtered, snap_filtered)
+
+					# Re-snapshot unfiltered so refs below stay active on page
+					snap = await call("snapshot", {})
 
 					# extract: structured repeated-card rows with null-tolerant fields
 					extr = await call("extract", {
@@ -283,10 +292,10 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 						},
 					})
 					check("extract returns structured rows",
-						'"title": "Card Alpha"' in extr and '"price": "US$10.99"' in extr and '"total_matched": 3' in extr,
+						'"title":"Card Alpha"' in extr and '"price":"US$10.99"' in extr and '"total_matched":3' in extr,
 						extr[:500])
 					check("extract null-tolerant missing fields",
-						'"price": null' in extr and '"link": "/account/details"' in extr and '"id": "C3"' in extr,
+						'"price":null' in extr and '"link":"/account/details"' in extr and '"id":"C3"' in extr,
 						extr)
 
 					# Find ref for "Second Action", "Shadow Confirm", "Iframe Submit", and input
