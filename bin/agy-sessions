@@ -1117,7 +1117,7 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		idle_hr = idle_sec / 3600.0
 		stats.append((pid, cid, title, conv_idle_sec / 3600.0, proc_elapsed_sec / 3600.0, tty_idle_sec / 3600.0, idle_hr))
 
-		if idle_sec >= threshold_sec:
+		if args.all or idle_sec >= threshold_sec:
 			cwd = pid_to_cwd.get(pid_str, "")
 			candidates.append((pid, cid, title, idle_hr, tty, cwd))
 
@@ -1136,14 +1136,21 @@ def cmd_cull(args: argparse.Namespace) -> int:
 
 	if not candidates:
 		if not args.quiet:
-			print(f"No idle agy sessions exceeding {args.hours} hours (scanned {len(pid_to_cid)} live sessions).")
+			if args.all:
+				print(f"No cullable agy sessions found (scanned {len(pid_to_cid)} live sessions).")
+			else:
+				print(f"No idle agy sessions exceeding {args.hours} hours (scanned {len(pid_to_cid)} live sessions).")
 		return 0
 
 	# First, save current state so every culled session's tab and CID is recorded in iterm-sessions.json
 	cmd_save(argparse.Namespace(quiet=True))
 
 	culled_sessions = []
-	print(f"Found {len(candidates)} session(s) idle for > {args.hours:g}h {'[DRY-RUN]' if args.dry_run else ''}:")
+	dry_tag = " [DRY-RUN]" if args.dry_run else ""
+	if args.all:
+		print(f"Found {len(candidates)} session(s) to cull (--all){dry_tag}:")
+	else:
+		print(f"Found {len(candidates)} session(s) idle for > {args.hours:g}h{dry_tag}:")
 	for pid, cid, title, idle_hr, tty, cwd in candidates:
 		title_disp = f"'{title}'" if title else cid
 		if args.dry_run:
@@ -1220,6 +1227,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 	p_cull = sub.add_parser("cull", help="Gracefully close agy sessions that have been idle for more than --hours (default: 6)")
 	p_cull.add_argument("--hours", type=float, default=6.0, help="Idle hour threshold to trigger culling (default: 6.0)")
+	p_cull.add_argument("-a", "--all", action="store_true", help="Cull all live sessions regardless of idle time (excludes current and active sessions)")
 	p_cull.add_argument("-n", "--dry-run", action="store_true", help="Preview which sessions would be culled without terminating")
 	p_cull.add_argument("-v", "--verbose", action="store_true", help="Show detailed breakdown of idle timers across all live sessions")
 	p_cull.add_argument("-q", "--quiet", action="store_true", help="Suppress output")

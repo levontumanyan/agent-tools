@@ -546,10 +546,10 @@ def cmd_cull(args: argparse.Namespace) -> int:
 		idle_hr = idle_sec / 3600
 		in_use = tty_sec < grace_sec
 		stats.append((proc, conv_sec / 3600, proc_sec / 3600, tty_sec / 3600, idle_hr, in_use))
-		# Never cull two TUIs attributed to the same session.
-		if ses.get("id") and ses["id"] in seen_sessions:
+		# Never cull two TUIs attributed to the same session unless --all is set.
+		if not args.all and ses.get("id") and ses["id"] in seen_sessions:
 			continue
-		if idle_sec >= threshold_sec and not in_use:
+		if args.all or (idle_sec >= threshold_sec and not in_use):
 			if ses.get("id"):
 				seen_sessions.add(ses["id"])
 			candidates.append((proc, idle_hr))
@@ -572,10 +572,17 @@ def cmd_cull(args: argparse.Namespace) -> int:
 	if not candidates:
 		cur.close()
 		if not args.quiet:
-			print(f"No idle opencode sessions exceeding {args.hours:g}h (scanned {len(procs)} live TUIs).")
+			if args.all:
+				print(f"No cullable opencode sessions found (scanned {len(procs)} live TUIs).")
+			else:
+				print(f"No idle opencode sessions exceeding {args.hours:g}h (scanned {len(procs)} live TUIs).")
 		return 0
 
-	print(f"Found {len(candidates)} session(s) idle for > {args.hours:g}h {'[DRY-RUN]' if args.dry_run else ''}:")
+	dry_tag = " [DRY-RUN]" if args.dry_run else ""
+	if args.all:
+		print(f"Found {len(candidates)} session(s) to cull (--all){dry_tag}:")
+	else:
+		print(f"Found {len(candidates)} session(s) idle for > {args.hours:g}h{dry_tag}:")
 	culled = []
 	for proc, idle_hr in candidates:
 		ses = proc.get("session") or {}
@@ -633,6 +640,7 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Protect tabs with tty activity within this many minutes (default: 15)",
 	)
 	p_cull.add_argument("--pid", type=int, help="Only consider this TUI process (for targeted culls)")
+	p_cull.add_argument("-a", "--all", action="store_true", help="Cull all live sessions regardless of idle time or tty grace")
 	p_cull.add_argument("-n", "--dry-run", action="store_true", help="Preview which sessions would be culled")
 	p_cull.add_argument("-v", "--verbose", action="store_true", help="Show the idle breakdown for every live session")
 	p_cull.add_argument("-q", "--quiet", action="store_true", help="Suppress output")
