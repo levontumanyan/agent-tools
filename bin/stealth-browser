@@ -11,6 +11,7 @@
 import argparse
 import asyncio
 import base64
+import collections
 import datetime
 import fcntl
 import hashlib
@@ -28,6 +29,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from collections import deque
 from typing import Any, Optional, Union
 from adblock import Engine, FilterSet
 from mcp.server.fastmcp import FastMCP
@@ -35,7 +37,22 @@ from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 
 mcp = FastMCP(
 	"stealth-browser",
-	instructions="Stay headless by default. Only call set_headless(headless=False) for interactive login/2FA/CAPTCHA or when asked.",
+	instructions=(
+		"Stay headless by default. Only call set_headless(headless=False) for interactive login/2FA/CAPTCHA or when asked.\n"
+		"Tool cheat-sheet (tab=-1 targets active tab):\n"
+		"- status() | new_tab(url='about:blank', block_media=None) | switch_tab(tab=0) | close_tab(tab=-1)\n"
+		"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
+		"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
+		"- snapshot(selector='body', max_elements=80, tab=-1) | get_content(selector='body', max_length=4000, interactive_only=False, clean=True, tab=-1)\n"
+		"- click(selector, tab=-1, timeout_ms=5000) | type(selector, text, clear_first=True, press_enter=False, tab=-1, timeout_ms=5000)\n"
+		"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1)\n"
+		"- batch(actions=[{action, selector, text, key, value, state, ms, expression, timeout_ms}], tab=-1)\n"
+		"- evaluate_js(expression='', tab=-1, timeout_ms=15000, max_length=40000) (alias: script=...)\n"
+		"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000)\n"
+		"- state(framework='auto', selector='', tab=-1) | set_media(enable_media=True, tab=-1)\n"
+		"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None)\n"
+		"- set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
+	),
 )
 
 CDP_PORT = int(os.environ.get("STEALTH_BROWSER_CDP_PORT", os.environ.get("CDP_PORT", "9222")))
@@ -43,6 +60,19 @@ CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 PROFILE_DIR = os.path.expanduser(os.environ.get("STEALTH_BROWSER_PROFILE_DIR", "~/.agent-chromium-profile"))
 DOWNLOADS_DIR = os.path.expanduser(os.environ.get("STEALTH_BROWSER_DOWNLOADS_DIR", "~/Downloads"))
 IDLE_TIMEOUT_SECONDS = int(os.environ.get("STEALTH_BROWSER_IDLE_TIMEOUT", "300"))
+CDP_CONNECT_TIMEOUT_S = 5.0
+CDP_OP_TIMEOUT_S = 5.0
+GET_CONTEXT_TIMEOUT_S = 30.0
+PAGE_TITLE_TIMEOUT_S = 5.0
+PAGE_CLOSE_TIMEOUT_S = 5.0
+BROWSER_CLOSE_TIMEOUT_S = 5.0
+PLAYWRIGHT_START_TIMEOUT_S = 15.0
+PLAYWRIGHT_STOP_TIMEOUT_S = 5.0
+NEW_PAGE_TIMEOUT_S = 10.0
+RESTART_BROWSER_TIMEOUT_S = 30.0
+GOTO_OUTER_BUFFER_S = 5.0
+DIALOG_ACTION_TIMEOUT_S = 3.0
+MAX_DIALOG_HISTORY = 50
 HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
 CHROMIUM_APP_BIN = "/Applications/Chromium.app/Contents/MacOS/Chromium"
 DEFAULT_BROWSER_EXECUTABLE = CHROMIUM_APP_BIN if os.path.exists(CHROMIUM_APP_BIN) else None
@@ -290,13 +320,35 @@ def _save_persisted_headless(headless: Optional[bool]) -> None:
 
 _adblock_engine: Optional[Engine] = None
 _adblock_initialized: bool = False
+_adblock_load_task: Optional[asyncio.Task] = None
+
+
+def _acquire_file_lock(lock_file, timeout_s: float = 15.0) -> None:
+	deadline = time.monotonic() + timeout_s
+	while True:
+		try:
+			fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+			return
+		except BlockingIOError:
+			if time.monotonic() >= deadline:
+				raise TimeoutError(f"Timed out acquiring file lock after {timeout_s}s")
+			time.sleep(0.05)
+
+
+def _resolve_apple_passwords_ext_locked() -> Optional[str]:
+	os.makedirs(CACHE_DIR, exist_ok=True)
+	with open(os.path.join(CACHE_DIR, "apple-passwords-ext.lock"), "w", encoding="utf-8") as lock_file:
+		_acquire_file_lock(lock_file, timeout_s=15.0)
+		try:
+			return _install_apple_passwords_ext()
+		finally:
+			fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def _load_or_build_engine() -> Optional[Engine]:
 	"""Load cached binary engine or compile EasyPrivacy into Brave's adblock-rust engine."""
 	os.makedirs(CACHE_DIR, exist_ok=True)
 
-	# 1. Fast path: load compiled binary cache (< 20ms)
 	if os.path.exists(CACHE_BIN_FILE):
 		try:
 			if (time.time() - os.path.getmtime(CACHE_BIN_FILE)) < (7 * 86400):
@@ -306,7 +358,6 @@ def _load_or_build_engine() -> Optional[Engine]:
 		except Exception:
 			pass
 
-	# 2. Text rule file: load from cache or download fresh
 	content = None
 	if os.path.exists(CACHE_FILE):
 		try:
@@ -336,7 +387,6 @@ def _load_or_build_engine() -> Optional[Engine]:
 			filters = FilterSet()
 			filters.add_filter_list(content)
 			engine = Engine(filter_set=filters)
-			# Serialize compiled binary to disk for instant subsequent startups
 			try:
 				engine.serialize_to_file(CACHE_BIN_FILE)
 			except Exception:
@@ -347,11 +397,46 @@ def _load_or_build_engine() -> Optional[Engine]:
 	return None
 
 
+async def _warm_adblock_engine() -> Optional[Engine]:
+	global _adblock_engine, _adblock_initialized, _adblock_load_task
+	if _adblock_initialized:
+		return _adblock_engine
+	try:
+		_adblock_engine = await asyncio.to_thread(_load_or_build_engine)
+	except asyncio.CancelledError:
+		raise
+	except Exception:
+		_adblock_engine = None
+		_adblock_initialized = True
+	else:
+		_adblock_initialized = True
+	finally:
+		_adblock_load_task = None
+	return _adblock_engine
+
+
+def _schedule_adblock_warmup() -> Optional[asyncio.Task]:
+	global _adblock_load_task
+	if _adblock_initialized:
+		return None
+	if _adblock_load_task is not None and not _adblock_load_task.done():
+		return _adblock_load_task
+	try:
+		loop = asyncio.get_running_loop()
+	except RuntimeError:
+		return None
+	_adblock_load_task = loop.create_task(_warm_adblock_engine())
+	return _adblock_load_task
+
+
 def get_adblock_engine() -> Optional[Engine]:
 	global _adblock_engine, _adblock_initialized
-	if not _adblock_initialized:
-		_adblock_initialized = True
-		_adblock_engine = _load_or_build_engine()
+	if _adblock_initialized:
+		return _adblock_engine
+	if _schedule_adblock_warmup() is not None:
+		return _adblock_engine
+	_adblock_initialized = True
+	_adblock_engine = _load_or_build_engine()
 	return _adblock_engine
 
 
@@ -359,18 +444,29 @@ async def _network_route_handler(route, request):
 	"""Intercepts network requests: evaluates trackers against EasyPrivacy and blocks media when enabled."""
 	handled = False
 	try:
-		# Service worker requests do not have an associated frame and should not be blocked
 		frame = None
 		try:
 			frame = request.frame
 		except Exception:
 			frame = None
 
+		if frame is None:
+			handled = True
+			await route.continue_()
+			return
+
 		url = request.url
-		frame_url = frame.url if frame else ""
+		try:
+			frame_url = frame.url or ""
+		except Exception:
+			frame_url = ""
 		res_type = request.resource_type or "other"
 
-		# Adblock tracker check
+		if res_type == "document":
+			handled = True
+			await route.continue_()
+			return
+
 		engine = get_adblock_engine()
 		if engine is not None:
 			try:
@@ -381,8 +477,10 @@ async def _network_route_handler(route, request):
 			except Exception:
 				pass
 
-		# Media blocking check (fast path)
-		page = frame.page if frame else None
+		try:
+			page = frame.page
+		except Exception:
+			page = None
 		if page and getattr(page, "_media_blocked", False):
 			if res_type in MEDIA_RESOURCE_TYPES:
 				handled = True
@@ -415,6 +513,9 @@ class BrowserSessionManager:
 		self._context: Optional[BrowserContext] = None
 		self._active_page: Optional[Page] = None
 		self._idle_task: Optional[asyncio.Task] = None
+		self._page_to_id: dict[Page, str] = {}
+		self._id_to_page: dict[str, Page] = {}
+		self._next_tab_seq: int = 1
 
 	def _touch_activity(self):
 		if self._idle_task is not None and not self._idle_task.done():
@@ -441,7 +542,10 @@ class BrowserSessionManager:
 	async def close(self):
 		"""Cleanly stop the patchright node driver and release browser handles."""
 		if "keep_alive_mgr" in globals():
-			await keep_alive_mgr.stop_all()
+			try:
+				await asyncio.wait_for(keep_alive_mgr.stop_all(), timeout=CDP_OP_TIMEOUT_S)
+			except Exception:
+				pass
 		if (
 			self._idle_task is not None
 			and not self._idle_task.done()
@@ -452,9 +556,11 @@ class BrowserSessionManager:
 		self._context = None
 		self._browser = None
 		self._active_page = None
+		self._page_to_id.clear()
+		self._id_to_page.clear()
 		if self._playwright is not None:
 			try:
-				await self._playwright.stop()
+				await asyncio.wait_for(self._playwright.stop(), timeout=PLAYWRIGHT_STOP_TIMEOUT_S)
 			except Exception:
 				pass
 			finally:
@@ -508,11 +614,20 @@ class BrowserSessionManager:
 	async def _connect_cdp(self) -> Optional[BrowserContext]:
 		"""Attach to an already-running Chromium CDP endpoint and sync headless state."""
 		try:
-			self._browser = await self._playwright.chromium.connect_over_cdp(
-				self.cdp_url,
-				timeout=1500,
+			self._browser = await asyncio.wait_for(
+				self._playwright.chromium.connect_over_cdp(
+					self.cdp_url,
+					timeout=1500,
+				),
+				timeout=CDP_CONNECT_TIMEOUT_S,
 			)
-			detected_headless = self._detect_cdp_headless()
+			try:
+				detected_headless = await asyncio.wait_for(
+					asyncio.to_thread(self._detect_cdp_headless),
+					timeout=CDP_OP_TIMEOUT_S,
+				)
+			except Exception:
+				detected_headless = None
 			if detected_headless is not None:
 				self.headless = detected_headless
 			if self._browser.contexts:
@@ -523,11 +638,17 @@ class BrowserSessionManager:
 			self._browser = None
 		return None
 
+	def _probe_cdp_ready(self) -> bool:
+		try:
+			with urllib.request.urlopen(f"{self.cdp_url}/json/version", timeout=0.3) as resp:
+				return resp.status == 200
+		except Exception:
+			return False
+
 	async def _launch_detached_chromium(self) -> None:
 		"""Launch standalone Chromium detached from the MCP server process so it survives restarts."""
 		os.makedirs(PROFILE_DIR, exist_ok=True)
 
-		# Ensure Apple Passwords native messaging manifest exists in agent profile
 		nm_hosts_dir = os.path.join(PROFILE_DIR, "NativeMessagingHosts")
 		os.makedirs(nm_hosts_dir, exist_ok=True)
 		nm_manifest = os.path.join(nm_hosts_dir, "com.apple.passwordmanager.json")
@@ -554,16 +675,16 @@ class BrowserSessionManager:
 		]
 		if self.headless:
 			browser_args.append("--headless=new")
-		# Resolve at launch so extension refreshes apply without restarting the MCP server
 		apple_passwords_ext = _apple_passwords_ext_cache
 		if not apple_passwords_ext:
-			os.makedirs(CACHE_DIR, exist_ok=True)
-			with open(os.path.join(CACHE_DIR, "apple-passwords-ext.lock"), "w", encoding="utf-8") as lock_file:
-				fcntl.flock(lock_file, fcntl.LOCK_EX)
-				try:
-					apple_passwords_ext = _install_apple_passwords_ext()
-				finally:
-					fcntl.flock(lock_file, fcntl.LOCK_UN)
+			try:
+				apple_passwords_ext = await asyncio.wait_for(
+					asyncio.to_thread(_resolve_apple_passwords_ext_locked),
+					timeout=20.0,
+				)
+			except Exception as exc:
+				print(f"stealth-browser: Apple Passwords setup skipped: {exc}", file=sys.stderr)
+				apple_passwords_ext = None
 		if apple_passwords_ext:
 			browser_args.extend([
 				f"--disable-extensions-except={apple_passwords_ext}",
@@ -582,21 +703,19 @@ class BrowserSessionManager:
 		while time.monotonic() < deadline:
 			if proc.poll() is not None:
 				raise RuntimeError(f"Detached Chromium exited early with code {proc.returncode}")
-			try:
-				with urllib.request.urlopen(f"{self.cdp_url}/json/version", timeout=0.3) as resp:
-					if resp.status == 200:
-						return
-			except Exception:
-				pass
+			if await asyncio.to_thread(self._probe_cdp_ready):
+				return
 			await asyncio.sleep(0.05)
 		raise TimeoutError(f"Timed out waiting for Chromium CDP endpoint at {self.cdp_url}")
 
 	async def get_context(self) -> BrowserContext:
 		self._touch_activity()
 		if self._playwright is None:
-			self._playwright = await async_playwright().start()
+			self._playwright = await asyncio.wait_for(
+				async_playwright().start(),
+				timeout=PLAYWRIGHT_START_TIMEOUT_S,
+			)
 
-		# Check if an existing context is still alive
 		if self._context is not None:
 			try:
 				if self._browser is not None and not self._browser.is_connected():
@@ -611,16 +730,14 @@ class BrowserSessionManager:
 				self._context = None
 				self._browser = None
 
-		# 1. Try attaching to existing CDP session (e.g., detached Chromium on CDP_PORT)
 		ctx = await self._connect_cdp()
 		if ctx is not None:
 			return ctx
 
-		# 2. Launch detached standalone stealth Chromium under a file lock to prevent startup races
 		os.makedirs(CACHE_DIR, exist_ok=True)
 		lock_path = os.path.join(CACHE_DIR, f"launch-{CDP_PORT}.lock")
 		with open(lock_path, "w", encoding="utf-8") as lock_file:
-			fcntl.flock(lock_file, fcntl.LOCK_EX)
+			await asyncio.to_thread(_acquire_file_lock, lock_file, 15.0)
 			try:
 				ctx = await self._connect_cdp()
 				if ctx is not None:
@@ -642,18 +759,27 @@ class BrowserSessionManager:
 		cdp = None
 		try:
 			if self._browser is not None:
-				cdp = await self._browser.new_browser_cdp_session()
+				cdp = await asyncio.wait_for(
+					self._browser.new_browser_cdp_session(),
+					timeout=CDP_OP_TIMEOUT_S,
+				)
 			else:
 				target_page = page or (context.pages[0] if context.pages else None)
 				if target_page is None or target_page.is_closed():
 					return
-				cdp = await context.new_cdp_session(target_page)
-			await cdp.send(
-				"Browser.setDownloadBehavior",
-				{
-					"behavior": "allow",
-					"downloadPath": DOWNLOADS_DIR,
-				},
+				cdp = await asyncio.wait_for(
+					context.new_cdp_session(target_page),
+					timeout=CDP_OP_TIMEOUT_S,
+				)
+			await asyncio.wait_for(
+				cdp.send(
+					"Browser.setDownloadBehavior",
+					{
+						"behavior": "allow",
+						"downloadPath": DOWNLOADS_DIR,
+					},
+				),
+				timeout=CDP_OP_TIMEOUT_S,
 			)
 			setattr(context, "_downloads_configured", True)
 		except Exception:
@@ -661,41 +787,109 @@ class BrowserSessionManager:
 		finally:
 			if cdp is not None:
 				try:
-					await cdp.detach()
+					await asyncio.wait_for(cdp.detach(), timeout=CDP_OP_TIMEOUT_S)
 				except Exception:
 					pass
 
 	async def _ensure_interceptor(self, context: BrowserContext):
+		_schedule_adblock_warmup()
 		await self._configure_native_downloads(context)
 		if getattr(context, "_interceptor_attached", False):
 			return
 		setattr(context, "_interceptor_attached", True)
 		try:
-			await context.route("**/*", _network_route_handler)
+			await asyncio.wait_for(context.route("**/*", _network_route_handler), timeout=CDP_OP_TIMEOUT_S)
 		except Exception:
 			pass
 
 	def _register_page_listeners(self, page: Page):
-		"""Attach lifecycle event listeners to auto-invalidate cached pointer on tab close or renderer crash."""
+		"""Attach lifecycle and dialog event listeners to keep cached state clean and prevent modal hangs."""
 		if getattr(page, "_agent_listeners_attached", False):
 			return
 		setattr(page, "_agent_listeners_attached", True)
+		dialogs = getattr(page, "_dialog_history", None)
+		if dialogs is None:
+			dialogs = deque(maxlen=MAX_DIALOG_HISTORY)
+			setattr(page, "_dialog_history", dialogs)
 
 		def _on_closed_or_crashed(_=None):
 			if self._active_page is page:
 				self._active_page = None
 
+		async def _on_dialog(dialog):
+			dialog_type = str(getattr(dialog, "type", "unknown") or "unknown").lower()
+			message = str(getattr(dialog, "message", "") or "")
+			try:
+				dialog_url = page.url or ""
+			except Exception:
+				dialog_url = ""
+			dialogs.append({
+				"type": dialog_type,
+				"message": message,
+				"url": dialog_url,
+				"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+			})
+			try:
+				if dialog_type == "beforeunload":
+					await asyncio.wait_for(dialog.accept(), timeout=DIALOG_ACTION_TIMEOUT_S)
+				else:
+					await asyncio.wait_for(dialog.dismiss(), timeout=DIALOG_ACTION_TIMEOUT_S)
+			except Exception:
+				pass
+
 		page.on("close", _on_closed_or_crashed)
 		page.on("crash", _on_closed_or_crashed)
+		page.on("dialog", _on_dialog)
+		download_tracker.attach(page)
+		telemetry_tracker.attach(page)
+
+	def _unregister_page(self, page: Page) -> None:
+		tab_id = self._page_to_id.pop(page, None)
+		if tab_id is not None and self._id_to_page.get(tab_id) is page:
+			self._id_to_page.pop(tab_id, None)
+
+	def _prune_closed_tabs(self) -> None:
+		for page in list(self._page_to_id):
+			try:
+				closed = page.is_closed()
+			except Exception:
+				closed = True
+			if closed:
+				self._unregister_page(page)
+
+	def get_tab_id(self, page: Page) -> str:
+		existing = self._page_to_id.get(page)
+		if existing is not None:
+			return existing
+		tab_id = f"t{self._next_tab_seq}"
+		self._next_tab_seq += 1
+		self._page_to_id[page] = tab_id
+		self._id_to_page[tab_id] = page
+		if not getattr(page, "_tab_id_close_attached", False):
+			setattr(page, "_tab_id_close_attached", True)
+			page.on("close", lambda _=None, p=page: self._unregister_page(p))
+		return tab_id
 
 	def set_active_page(self, page: Page):
 		self._active_page = page
 		if page is not None and not page.is_closed():
 			self._register_page_listeners(page)
+			self.get_tab_id(page)
 
 	async def get_pages(self) -> list[Page]:
-		context = await self.get_context()
-		return [p for p in context.pages if not p.is_closed()]
+		context = await asyncio.wait_for(self.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
+		self._prune_closed_tabs()
+		open_pages = []
+		for p in context.pages:
+			try:
+				if not p.is_closed():
+					self._register_page_listeners(p)
+					_attach_page_trackers(p)
+					self.get_tab_id(p)
+					open_pages.append(p)
+			except Exception:
+				continue
+		return open_pages
 
 	async def get_active_page(self) -> Page:
 		self._touch_activity()
@@ -707,24 +901,22 @@ class BrowserSessionManager:
 			return self._active_page
 
 		try:
-			context = await self.get_context()
+			context = await asyncio.wait_for(self.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 			pages = await self.get_pages()
-			# Check for an existing empty/blank tab to avoid tab proliferation
 			blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
 			if blank_pages:
 				page = blank_pages[0]
 			elif pages:
 				page = pages[-1]
 			else:
-				page = await context.new_page()
+				page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 
 			self.set_active_page(page)
 			return page
 		except Exception as exc:
 			if "closed" in str(exc).lower():
-				# Browser window was killed externally; reset and relaunch
 				await self.close()
-				context = await self.get_context()
+				context = await asyncio.wait_for(self.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 				pages = await self.get_pages()
 				blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
 				if blank_pages:
@@ -732,24 +924,54 @@ class BrowserSessionManager:
 				elif pages:
 					page = pages[-1]
 				else:
-					page = await context.new_page()
+					page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 				self.set_active_page(page)
 				return page
 			raise
 
-	async def resolve_page(self, tab: int = -1) -> Page:
+	async def resolve_page(self, tab: Union[int, str] = -1) -> Page:
 		self._touch_activity()
+		if isinstance(tab, str):
+			tab_str = tab.strip()
+			if tab_str.lower().startswith("t"):
+				tab_key = tab_str.lower()
+				self._prune_closed_tabs()
+				page = self._id_to_page.get(tab_key)
+				if page is not None:
+					try:
+						is_closed = page.is_closed()
+					except Exception:
+						is_closed = True
+					if is_closed:
+						self._unregister_page(page)
+						page = None
+				if page is not None and self._browser is not None and not self._browser.is_connected():
+					self._unregister_page(page)
+					page = None
+				if page is not None and self._context is not None:
+					ctx_pages = getattr(self._context, "pages", None)
+					if isinstance(ctx_pages, (list, tuple)) and page not in ctx_pages:
+						self._unregister_page(page)
+						page = None
+				if page is None:
+					raise ValueError(f"Tab '{tab}' not found or was closed")
+				return page
+			try:
+				tab = int(tab_str)
+			except ValueError as exc:
+				raise ValueError(f"Invalid tab identifier '{tab}'. Expected an integer index or tab ID like 't1'.") from exc
+
 		if tab < 0:
-			# Fast path: instant in-memory pointer resolution (< 0.01ms)
 			if (
 				self._active_page is not None
 				and not self._active_page.is_closed()
 				and (self._browser is None or self._browser.is_connected())
 			):
+				_attach_page_trackers(self._active_page)
+				self.get_tab_id(self._active_page)
 				return self._active_page
 			return await self.get_active_page()
 
-		# Explicit tab index requested
 		pages = await self.get_pages()
 		if tab >= len(pages):
 			raise ValueError(f"Invalid tab index {tab}. Total open tabs: {len(pages)}")
@@ -892,6 +1114,7 @@ async def status() -> str:
 		lines = [f"Connected to browser session at {CDP_URL} (Mode: {mode_str})"]
 		lines.append(f"Total open tabs: {len(pages)}")
 		for idx, page in enumerate(pages):
+			tab_id = session.get_tab_id(page)
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
 			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
 			keep_alive_status = " [KEEP-ALIVE ACTIVE]" if keep_alive_mgr.is_active(page) else ""
@@ -899,7 +1122,7 @@ async def status() -> str:
 				title = await asyncio.wait_for(page.title(), timeout=2.0)
 			except Exception:
 				title = "(Unresponsive / Busy)"
-			lines.append(f"\t[{idx}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
+			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Disconnected: {exc}"
@@ -908,7 +1131,7 @@ async def status() -> str:
 @mcp.tool()
 async def keep_alive(
 	enable: bool = True,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	min_seconds: int = 45,
 	max_seconds: int = 90,
 	ping_url: Optional[str] = None,
@@ -957,7 +1180,7 @@ async def navigate(
 	url: str,
 	block_media: Optional[bool] = None,
 	new_tab: bool = False,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	timeout_ms: int = 30000,
 	wait_until: str = "domcontentloaded",
 ) -> str:
@@ -973,50 +1196,243 @@ async def navigate(
 	"""
 	t0 = time.perf_counter()
 	try:
-		context = await session.get_context()
+		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 		if new_tab:
-			pages = await session.get_pages()
-			blank_pages = [p for p in pages if p.url in ("about:blank", "chrome://newtab/", "")]
-			if blank_pages:
-				page = blank_pages[0]
-			else:
-				page = await context.new_page()
+			page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 			session.set_active_page(page)
 		else:
 			page = await session.resolve_page(tab)
 
-		# Apply media blocking state if explicitly specified
 		if block_media is not None:
 			await set_page_media_state(page, block_media=block_media)
 
-		# Ensure URL has protocol
 		if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("about:"):
 			url = "https://" + url
 
 		valid_waits = {"commit", "domcontentloaded", "load", "networkidle"}
 		wait_mode = wait_until if wait_until in valid_waits else "domcontentloaded"
 
-		response = await page.goto(url, timeout=timeout_ms, wait_until=wait_mode)
-		status = response.status if response else "loaded"
-		title = await page.title()
-		pages = await session.get_pages()
-		target_idx = pages.index(page) if page in pages else -1
+		goto_outer_timeout = max(1.0, (timeout_ms / 1000.0)) + GOTO_OUTER_BUFFER_S
+		response = None
+		sw_fallback = False
+		try:
+			response = await asyncio.wait_for(
+				page.goto(url, timeout=timeout_ms, wait_until=wait_mode),
+				timeout=goto_outer_timeout,
+			)
+		except Exception as exc:
+			if "service worker requests do not have an associated frame" in str(exc).lower():
+				sw_fallback = True
+				try:
+					await asyncio.wait_for(
+						page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 5000)),
+						timeout=min(timeout_ms / 1000.0, 5.0) + 1.0,
+					)
+				except Exception:
+					pass
+			else:
+				raise
+
+		if sw_fallback:
+			status = "loaded (service worker)"
+		else:
+			status = response.status if response else "loaded"
+		try:
+			title = await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_S)
+		except Exception:
+			title = "(Unavailable)"
+		try:
+			pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+			target_idx = pages.index(page) if page in pages else -1
+		except Exception:
+			target_idx = -1
 		elapsed = int((time.perf_counter() - t0) * 1000)
 		is_media_blocked = getattr(page, "_media_blocked", False)
 		media_tag = " (media blocked)" if is_media_blocked else ""
 		return f"Navigated tab [{target_idx}] to '{url}' [HTTP {status}]{media_tag} ({elapsed}ms, wait_until={wait_mode}) - Title: '{title}'"
+	except (asyncio.TimeoutError, TimeoutError):
+		return f"Navigation error: Timed out after {timeout_ms}ms navigating to '{url}'"
 	except Exception as exc:
+		if "timeout" in exc.__class__.__name__.lower():
+			return f"Navigation error: Timed out after {timeout_ms}ms navigating to '{url}'"
 		return f"Navigation error: {exc}"
 
 
 @mcp.tool()
 async def new_tab(url: str = "about:blank", block_media: Optional[bool] = None) -> str:
 	"""Open a new browser tab and navigate to url (default 'about:blank'). Set block_media=True for high-speed text-only browsing."""
-	return await navigate(url=url, block_media=block_media, new_tab=True)
+	result = await navigate(url=url, block_media=block_media, new_tab=True)
+	if result.startswith("Navigation error:"):
+		return result
+	page = None
+	match = re.match(r"Navigated tab \[(\d+)\]", result)
+	if match:
+		try:
+			pages = await session.get_pages()
+			idx = int(match.group(1))
+			if 0 <= idx < len(pages):
+				page = pages[idx]
+		except Exception:
+			page = None
+	if page is None:
+		page = session._active_page
+	if page is not None and not page.is_closed():
+		tab_id = session.get_tab_id(page)
+		if f"tab_id={tab_id}" not in result:
+			return f"{result} (tab_id={tab_id})"
+	return result
+
+
+def _escape_applescript(text: str) -> str:
+	return text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", " ").replace("\n", " ")
+
+
+def _notify_human(reason: str) -> Optional[subprocess.Popen]:
+	try:
+		safe_msg = _escape_applescript(reason)
+		script = f'display notification "{safe_msg}" with title "stealth-browser"'
+		return subprocess.Popen(
+			["osascript", "-e", script],
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception:
+		return None
+
+
+def _url_origin(url: str) -> str:
+	match = re.match(r"^(https?://[^/]+)", url or "")
+	return match.group(1) if match else ""
 
 
 @mcp.tool()
-async def set_media(enable_media: bool = True, tab: int = -1) -> str:
+async def wait_for_human(
+	reason: str = "Complete login / 2FA / CAPTCHA",
+	url_contains: str = "",
+	url_not_contains: str = "",
+	selector: str = "",
+	timeout_s: int = 180,
+	poll_interval_s: float = 1.5,
+	notify: bool = True,
+	tab: Union[int, str] = -1,
+) -> str:
+	"""Hand off a tab to the human for interactive login/2FA/CAPTCHA, switching to headed mode if needed, and poll until complete.
+
+	Parameters:
+	- reason: Human-readable prompt shown in the macOS notification and timeout message.
+	- url_contains: Complete when the tab URL contains this substring.
+	- url_not_contains: Complete when the tab URL no longer contains this substring.
+	- selector: Complete when this CSS/Playwright selector becomes visible on the tab.
+	- timeout_s: Maximum seconds to wait before timing out (default 180).
+	- poll_interval_s: Seconds between completion checks (default 1.5).
+	- notify: Send a best-effort non-blocking macOS notification via osascript (default True).
+	- tab: Target tab index or stable tab ID like 't1' (-1 for active tab).
+	"""
+	t0 = time.monotonic()
+	notify_proc: Optional[subprocess.Popen] = None
+	try:
+		page = await session.resolve_page(tab)
+		initial_url = page.url or ""
+		tab_id = session.get_tab_id(page)
+		switched_to_headed = False
+
+		if session.headless:
+			restart_res = await restart_browser(headless=False)
+			if isinstance(restart_res, str) and restart_res.startswith("Error"):
+				return f"Error switching to headed mode for human handoff: {restart_res}"
+			switched_to_headed = True
+			pages = await session.get_pages()
+			resolved_page = None
+			if initial_url and initial_url != "about:blank" and not initial_url.startswith("chrome://"):
+				for candidate in pages:
+					if candidate.url == initial_url:
+						resolved_page = candidate
+						break
+				if resolved_page is None:
+					origin = _url_origin(initial_url)
+					if origin:
+						for candidate in pages:
+							if (candidate.url or "").startswith(origin):
+								resolved_page = candidate
+								break
+			page = resolved_page if resolved_page is not None else await session.get_active_page()
+			session.set_active_page(page)
+			tab_id = session.get_tab_id(page)
+		else:
+			session.set_active_page(page)
+
+		try:
+			await page.bring_to_front()
+		except Exception:
+			pass
+
+		if notify:
+			notify_proc = _notify_human(reason)
+
+		has_explicit_condition = bool(url_contains or url_not_contains or selector)
+		interval = max(0.005, float(poll_interval_s))
+		deadline = t0 + max(0.0, float(timeout_s))
+		mode_note = " (switched to headed mode)" if switched_to_headed else ""
+
+		while True:
+			session._touch_activity()
+			if page.is_closed():
+				elapsed = time.monotonic() - t0
+				return f"Human handoff ended: tab {tab_id} was closed after {elapsed:.1f}s{mode_note} (reason: {reason})"
+
+			current_url = page.url or ""
+			matched_condition = ""
+			if url_contains and url_contains in current_url:
+				matched_condition = f"url_contains='{url_contains}'"
+			elif url_not_contains and url_not_contains not in current_url:
+				matched_condition = f"url_not_contains='{url_not_contains}'"
+			elif selector:
+				try:
+					visible = await asyncio.wait_for(page.locator(selector).first.is_visible(), timeout=2.0)
+				except Exception:
+					visible = False
+				if visible:
+					matched_condition = f"selector='{selector}' visible"
+			elif not has_explicit_condition and current_url != initial_url:
+				matched_condition = f"URL changed from '{initial_url}'"
+
+			if matched_condition:
+				elapsed = time.monotonic() - t0
+				try:
+					title = await asyncio.wait_for(page.title(), timeout=2.0)
+				except Exception:
+					title = "(Unavailable)"
+				return (
+					f"Human handoff completed ({matched_condition}) in {elapsed:.1f}s{mode_note} "
+					f"[tab_id={tab_id}] - Title: '{title}' - URL: {current_url}"
+				)
+
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				elapsed = time.monotonic() - t0
+				try:
+					title = await asyncio.wait_for(page.title(), timeout=2.0)
+				except Exception:
+					title = "(Unavailable)"
+				return (
+					f"Timed out after {elapsed:.1f}s waiting for human ({reason}){mode_note} "
+					f"[tab_id={tab_id}] - Title: '{title}' - URL: {current_url}"
+				)
+
+			await asyncio.sleep(min(interval, remaining))
+	except Exception as exc:
+		return f"Error during human handoff: {exc}"
+	finally:
+		if notify_proc is not None:
+			try:
+				notify_proc.poll()
+			except Exception:
+				pass
+
+
+@mcp.tool()
+async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str:
 	"""Toggle media loading (images, videos, web fonts) on the current or specified tab.
 
 	Parameters:
@@ -1034,52 +1450,521 @@ async def set_media(enable_media: bool = True, tab: int = -1) -> str:
 		return f"Error updating media state: {exc}"
 
 
+_SB_REF_SELECTOR_RE = re.compile(r'^\[data-sb-ref=["\']([^"\']+)["\']\]$')
+
+_SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeIframes }) => {
+	const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'HEAD', 'TITLE', 'TEMPLATE']);
+	const INTERACTIVE_SEL = 'button, input, select, textarea, a[href], summary, [role="button"], [role="link"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"]';
+	const limit = Math.max(1, Number(maxElements) || 80);
+
+	const escIdent = (s) => (typeof CSS !== 'undefined' && CSS.escape)
+		? CSS.escape(String(s))
+		: String(s).replace(/([^\w-])/g, '\\$1');
+	const escAttr = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+	const isVisible = (el) => {
+		try {
+			const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+			const style = win.getComputedStyle(el);
+			if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+			const rect = el.getBoundingClientRect();
+			return rect.width > 0 && rect.height > 0;
+		} catch (_) {
+			return false;
+		}
+	};
+
+	const clearRefs = (root, visited) => {
+		if (!root || visited.has(root)) return;
+		visited.add(root);
+		try {
+			root.querySelectorAll('[data-sb-ref]').forEach((el) => el.removeAttribute('data-sb-ref'));
+		} catch (_) {}
+		let all = [];
+		try {
+			all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+		} catch (_) {}
+		for (const el of all) {
+			if (el.shadowRoot) clearRefs(el.shadowRoot, visited);
+			const tn = (el.tagName || '').toUpperCase();
+			if (tn === 'IFRAME' || tn === 'FRAME') {
+				try {
+					if (el.contentDocument) clearRefs(el.contentDocument, visited);
+				} catch (_) {}
+			}
+		}
+	};
+
+	clearRefs(document, new Set());
+
+	let startNode = document;
+	if (targetSelector && targetSelector !== 'body') {
+		try {
+			startNode = document.querySelector(targetSelector) || document;
+		} catch (_) {
+			startNode = document;
+		}
+	} else if (document.body) {
+		startNode = document.body;
+	}
+
+	const collected = [];
+	const seen = new Set();
+
+	const walk = (node, ctx) => {
+		if (!node || collected.length >= limit) return;
+		if (node.nodeType === 1) {
+			const tn = (node.tagName || '').toUpperCase();
+			if (SKIP_TAGS.has(tn) || seen.has(node)) return;
+			seen.add(node);
+
+			try {
+				if (node.matches && node.matches(INTERACTIVE_SEL) && isVisible(node)) {
+					collected.push({ el: node, ctx });
+					if (collected.length >= limit) return;
+				}
+			} catch (_) {}
+
+			if (includeShadow && node.shadowRoot) {
+				const shadowCtx = { rootNode: node.shadowRoot, inShadow: true, inIframe: ctx.inIframe };
+				for (const child of node.shadowRoot.children) {
+					walk(child, shadowCtx);
+					if (collected.length >= limit) return;
+				}
+			}
+
+			if (includeIframes && (tn === 'IFRAME' || tn === 'FRAME') && isVisible(node)) {
+				try {
+					const doc = node.contentDocument;
+					if (doc && doc.documentElement) {
+						const iframeCtx = { rootNode: doc, inShadow: ctx.inShadow, inIframe: true };
+						walk(doc.documentElement, iframeCtx);
+						if (collected.length >= limit) return;
+					}
+				} catch (_) {}
+			}
+
+			for (const child of node.children) {
+				walk(child, ctx);
+				if (collected.length >= limit) return;
+			}
+		} else if (node.children) {
+			for (const child of node.children) {
+				walk(child, ctx);
+				if (collected.length >= limit) return;
+			}
+		}
+	};
+
+	if (includeIframes) {
+		const frameNeedsLoad = (f) => {
+			try {
+				const w = f.contentWindow;
+				if (!w) return false;
+				void w.location.href;
+			} catch (_) {
+				return false;
+			}
+			try {
+				const d = f.contentDocument;
+				if (d === null) return true;
+				return d.readyState === 'loading';
+			} catch (_) {
+				return false;
+			}
+		};
+		const pendingFrames = () => [...document.querySelectorAll('iframe, frame')].filter(frameNeedsLoad);
+		let pending = pendingFrames();
+		const frameDeadline = Date.now() + 1500;
+		while (pending.length && Date.now() < frameDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			pending = pendingFrames();
+		}
+	}
+
+	walk(startNode, { rootNode: document, inShadow: false, inIframe: false });
+
+	const isUnique = (root, sel, target) => {
+		if (!sel || !root || !root.querySelectorAll) return false;
+		try {
+			const matches = root.querySelectorAll(sel);
+			return matches.length === 1 && matches[0] === target;
+		} catch (_) {
+			return false;
+		}
+	};
+
+	const buildSelector = (el, tag, ref, ctx) => {
+		const refSel = `[data-sb-ref="${ref}"]`;
+		if (ctx.inShadow || ctx.inIframe) return refSel;
+
+		const candidates = [];
+		if (el.id) candidates.push(`#${escIdent(el.id)}`);
+		const testid = el.getAttribute('data-testid');
+		if (testid) candidates.push(`[data-testid="${escAttr(testid)}"]`);
+		if (el.name) candidates.push(`${tag}[name="${escAttr(el.name)}"]`);
+		const ariaLabel = el.getAttribute('aria-label');
+		if (ariaLabel && ariaLabel.length <= 60) {
+			candidates.push(`${tag}[aria-label="${escAttr(ariaLabel)}"]`);
+		}
+		if (typeof el.className === 'string' && el.className.trim()) {
+			const classes = el.className.trim().split(/\s+/).filter((c) => c && !c.includes(':'));
+			for (const cls of classes.slice(0, 3)) {
+				candidates.push(`${tag}.${escIdent(cls)}`);
+			}
+		}
+		if (el.type) candidates.push(`${tag}[type="${escAttr(el.type)}"]`);
+		candidates.push(tag);
+
+		for (const cand of candidates) {
+			if (isUnique(document, cand, el)) return cand;
+		}
+		return refSel;
+	};
+
+	return collected.map(({ el, ctx }, i) => {
+		const ref = `e${i}`;
+		el.setAttribute('data-sb-ref', ref);
+		const tag = (el.tagName || '').toLowerCase();
+		const id = el.id ? `#${el.id}` : '';
+		const name = el.name ? `[name="${el.name}"]` : '';
+		const type = el.type ? `[type="${el.type}"]` : '';
+		const role = el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]` : '';
+		const aria = el.getAttribute('aria-label') ? `aria-label="${el.getAttribute('aria-label')}"` : '';
+		const val = (el.value !== undefined && el.value !== '' && tag !== 'button') ? `val="${String(el.value).slice(0, 60)}"` : '';
+		const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+
+		let href = '';
+		if (tag === 'a') {
+			const rawHref = (el.getAttribute('href') || '').trim();
+			if (rawHref.startsWith('#') || rawHref.toLowerCase().startsWith('javascript:')) {
+				href = rawHref;
+			} else {
+				href = el.href || rawHref;
+			}
+			if (href.length > 120) href = href.slice(0, 117) + '...';
+		}
+
+		const scopeTags = [];
+		if (ctx.inIframe) scopeTags.push('[iframe]');
+		if (ctx.inShadow) scopeTags.push('[shadow]');
+
+		return {
+			index: i,
+			ref,
+			tag,
+			selector: buildSelector(el, tag, ref, ctx),
+			text,
+			href,
+			attrs: [id, name, type, role, aria, val, ...scopeTags].filter(Boolean).join(' ')
+		};
+	});
+}"""
+
+_JS_FIND_REF_HELPER = r"""const findByRef = (root, refId, visited) => {
+	if (!root || visited.has(root)) return null;
+	visited.add(root);
+	const safe = String(refId).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+	try {
+		const direct = root.querySelector('[data-sb-ref="' + safe + '"]');
+		if (direct) return direct;
+	} catch (_) {}
+	let all = [];
+	try {
+		all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+	} catch (_) {}
+	for (const el of all) {
+		if (el.shadowRoot) {
+			const hit = findByRef(el.shadowRoot, refId, visited);
+			if (hit) return hit;
+		}
+		const tn = (el.tagName || '').toUpperCase();
+		if (tn === 'IFRAME' || tn === 'FRAME') {
+			try {
+				if (el.contentDocument) {
+					const hit = findByRef(el.contentDocument, refId, visited);
+					if (hit) return hit;
+				}
+			} catch (_) {}
+		}
+	}
+	return null;
+};"""
+
+_JS_CLICK_REF = "({ refId }) => {\n" + _JS_FIND_REF_HELPER + r"""
+	const target = findByRef(document, refId, new Set());
+	if (!target) return false;
+	if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'center' });
+	target.click();
+	return true;
+}"""
+
+_JS_TYPE_REF = "({ refId, text, clearFirst, pressEnter }) => {\n" + _JS_FIND_REF_HELPER + r"""
+	const target = findByRef(document, refId, new Set());
+	if (!target) return false;
+	if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'center' });
+	if (target.focus) target.focus();
+	const nextVal = clearFirst ? String(text) : (String(target.value || '') + String(text));
+	const win = (target.ownerDocument && target.ownerDocument.defaultView) || window;
+	const proto = target.tagName === 'TEXTAREA'
+		? win.HTMLTextAreaElement && win.HTMLTextAreaElement.prototype
+		: win.HTMLInputElement && win.HTMLInputElement.prototype;
+	const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+	if (desc && desc.set) {
+		desc.set.call(target, nextVal);
+	} else {
+		target.value = nextVal;
+	}
+	target.dispatchEvent(new Event('input', { bubbles: true }));
+	target.dispatchEvent(new Event('change', { bubbles: true }));
+	if (pressEnter) {
+		target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+		target.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+	}
+	return true;
+}"""
+
+_JS_ANNOTATE_OVERLAY = r"""() => {
+	const existing = document.getElementById('__sb_annotation_overlay__');
+	if (existing) existing.remove();
+
+	const entries = [];
+	const collect = (root, ox, oy, visited) => {
+		if (!root || visited.has(root)) return;
+		visited.add(root);
+		let refs = [];
+		try {
+			refs = root.querySelectorAll ? root.querySelectorAll('[data-sb-ref]') : [];
+		} catch (_) {}
+		for (const el of refs) {
+			try {
+				const rect = el.getBoundingClientRect();
+				if (rect.width > 0 && rect.height > 0) {
+					entries.push({
+						ref: el.getAttribute('data-sb-ref') || '',
+						left: rect.left + ox,
+						top: rect.top + oy,
+						width: rect.width,
+						height: rect.height
+					});
+				}
+			} catch (_) {}
+		}
+		let all = [];
+		try {
+			all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+		} catch (_) {}
+		for (const el of all) {
+			if (el.shadowRoot) collect(el.shadowRoot, ox, oy, visited);
+			const tn = (el.tagName || '').toUpperCase();
+			if (tn === 'IFRAME' || tn === 'FRAME') {
+				try {
+					if (el.contentDocument) {
+						const ir = el.getBoundingClientRect();
+						collect(el.contentDocument, ox + ir.left, oy + ir.top, visited);
+					}
+				} catch (_) {}
+			}
+		}
+	};
+
+	collect(document, window.scrollX || 0, window.scrollY || 0, new Set());
+	if (entries.length === 0) return 0;
+
+	const container = document.createElement('div');
+	container.id = '__sb_annotation_overlay__';
+	container.style.cssText = 'position:absolute;top:0;left:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
+
+	for (const item of entries) {
+		const box = document.createElement('div');
+		box.style.cssText = `position:absolute;left:${item.left}px;top:${item.top}px;width:${item.width}px;height:${item.height}px;border:2px solid #e11d48;box-sizing:border-box;pointer-events:none;`;
+		const label = document.createElement('span');
+		label.textContent = item.ref;
+		const labelTop = item.top < 16 ? '0px' : '-16px';
+		label.style.cssText = `position:absolute;left:-2px;top:${labelTop};background:#e11d48;color:#ffffff;font:bold 11px/14px monospace;padding:0 4px;border-radius:2px;white-space:nowrap;pointer-events:none;`;
+		box.appendChild(label);
+		container.appendChild(box);
+	}
+
+	(document.body || document.documentElement).appendChild(container);
+	return entries.length;
+}"""
+
+_JS_REMOVE_OVERLAY = "() => { const el = document.getElementById('__sb_annotation_overlay__'); if (el) el.remove(); }"
+
+
+def _normalize_ref(ref: str) -> str:
+	r = (ref or "").strip()
+	if r.startswith("@"):
+		r = r[1:].strip()
+	return r
+
+
+def _ref_to_selector(ref_id: str) -> str:
+	escaped = ref_id.replace("\\", "\\\\").replace('"', '\\"')
+	return f'[data-sb-ref="{escaped}"]'
+
+
+def _secondary_frames(page: Page) -> list:
+	frames = getattr(page, "frames", None) or []
+	main_frame = getattr(page, "main_frame", None)
+	return [f for f in frames if f is not main_frame]
+
+
+async def _locator_has_match(loc) -> bool:
+	try:
+		cnt = await loc.count()
+		return isinstance(cnt, int) and cnt > 0
+	except Exception:
+		return False
+
+
+async def _first_visible_locator(loc):
+	try:
+		cnt = await loc.count()
+	except Exception:
+		return None
+	if not isinstance(cnt, int) or cnt <= 0:
+		return None
+	if cnt == 1:
+		first = loc.first
+		try:
+			vis = await first.is_visible()
+			if isinstance(vis, bool) and not vis:
+				return None
+		except Exception:
+			pass
+		return first
+	for idx in range(min(cnt, 10)):
+		item = loc.nth(idx)
+		try:
+			vis = await item.is_visible()
+			if not isinstance(vis, bool) or vis:
+				return item
+		except Exception:
+			return item
+	return None
+
+
+async def _resolve_locator(page: Page, selector: str = "", ref: str = "", text: str = "") -> tuple:
+	ref_id = _normalize_ref(ref)
+	if not ref_id and selector:
+		m = _SB_REF_SELECTOR_RE.match(selector.strip())
+		if m:
+			ref_id = m.group(1)
+
+	if ref_id:
+		ref_sel = _ref_to_selector(ref_id)
+		label = f"ref '{ref_id}'" if ref else f"'{selector}'"
+		main_loc = page.locator(ref_sel)
+		if await _locator_has_match(main_loc):
+			return main_loc.first, label, ref_id, True
+		for frame in _secondary_frames(page):
+			try:
+				floc = frame.locator(ref_sel)
+				if await _locator_has_match(floc):
+					return floc.first, label, ref_id, True
+			except Exception:
+				continue
+		return main_loc.first, label, ref_id, False
+
+	if selector:
+		return page.locator(selector).first, f"'{selector}'", "", True
+
+	if text:
+		label = f"text '{text}'"
+		scopes = [page] + _secondary_frames(page)
+		for scope in scopes:
+			if hasattr(scope, "get_by_role"):
+				for role in ("button", "link", "tab", "menuitem", "option"):
+					try:
+						cand = await _first_visible_locator(scope.get_by_role(role, name=text))
+						if cand is not None:
+							return cand, label, "", True
+					except Exception:
+						continue
+			if hasattr(scope, "get_by_text"):
+				try:
+					cand = await _first_visible_locator(scope.get_by_text(text))
+					if cand is not None:
+						return cand, label, "", True
+				except Exception:
+					continue
+		return page.get_by_text(text).first, label, "", False
+
+	return None, "", "", False
+
+
+async def _js_click_ref(page: Page, ref_id: str) -> bool:
+	try:
+		return bool(await asyncio.wait_for(page.evaluate(_JS_CLICK_REF, {"refId": ref_id}), timeout=5.0))
+	except Exception:
+		return False
+
+
+async def _js_type_ref(page: Page, ref_id: str, text: str, clear_first: bool = True, press_enter: bool = False) -> bool:
+	try:
+		return bool(
+			await asyncio.wait_for(
+				page.evaluate(
+					_JS_TYPE_REF,
+					{"refId": ref_id, "text": text, "clearFirst": clear_first, "pressEnter": press_enter},
+				),
+				timeout=5.0,
+			)
+		)
+	except Exception:
+		return False
+
+
+def _format_snapshot_row(el: dict, fallback_idx: int) -> str:
+	ref = el.get("ref") or f"e{el.get('index', fallback_idx)}"
+	tag = el.get("tag", "")
+	sel = str(el.get("selector", "")).replace("|", "\\|")
+	text = str(el.get("text", "")).replace("\n", " ").replace("|", "\\|").strip()
+	attrs = str(el.get("attrs", "")).replace("\n", " ").replace("|", "\\|").strip()
+	href = str(el.get("href", "") or "").replace("\n", " ").replace("|", "\\|").strip()
+	if href:
+		if len(href) > 120:
+			href = href[:117] + "..."
+		href_part = f"href={href}"
+		attrs = f"{attrs} {href_part}".strip() if attrs else href_part
+	if text and attrs:
+		desc = f"{text} ({attrs})"
+	elif attrs:
+		desc = f"({attrs})"
+	else:
+		desc = text
+	return f"| {ref} | `<{tag}>` | `{sel}` | {desc} |"
+
+
 @mcp.tool()
-async def snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1) -> str:
-	"""Extract interactive elements (buttons, inputs, links, selects, dropdowns) with exact selectors and values in a single high-speed call."""
+async def snapshot(
+	selector: str = "body",
+	max_elements: int = 80,
+	tab: Union[int, str] = -1,
+	include_shadow: bool = True,
+	include_iframes: bool = True,
+) -> str:
+	"""Extract interactive elements (buttons, inputs, links, selects, dropdowns) with ephemeral refs (e0, e1, ...), unique selectors, and link hrefs across DOM, open Shadow DOM, and same-origin iframes."""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
-		js_code = """({ targetSelector }) => {
-			const isVisible = (el) => {
-				const style = window.getComputedStyle(el);
-				return style && style.visibility !== 'hidden' && style.display !== 'none' && el.offsetWidth > 0 && el.offsetHeight > 0;
-			};
-			const root = (targetSelector && targetSelector !== 'body') ? (document.querySelector(targetSelector) || document) : document;
-			const nodes = Array.from(root.querySelectorAll(
-				'button, input, select, textarea, a[href], [role="button"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"]'
-			)).filter(isVisible);
-
-			return nodes.slice(0, 100).map((el, i) => {
-				const tag = el.tagName.toLowerCase();
-				const id = el.id ? `#${el.id}` : '';
-				const name = el.name ? `[name="${el.name}"]` : '';
-				const type = el.type ? `[type="${el.type}"]` : '';
-				const role = el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]` : '';
-				const aria = el.getAttribute('aria-label') ? `aria-label="${el.getAttribute('aria-label')}"` : '';
-				const val = el.value !== undefined && el.value !== '' ? `val="${el.value}"` : '';
-				const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
-
-				let selector = el.id ? `#${el.id}` : (el.name ? `${tag}[name="${el.name}"]` : (el.getAttribute('data-testid') ? `[data-testid="${el.getAttribute('data-testid')}"]` : ''));
-				if (!selector && el.className && typeof el.className === 'string') {
-					const firstClass = el.className.split(' ').filter(c => c && !c.includes(':'))[0];
-					if (firstClass) selector = `${tag}.${firstClass}`;
-				}
-				if (!selector) selector = tag;
-
-				return {
-					index: i,
-					tag,
-					selector,
-					text,
-					attrs: [id, name, type, role, aria, val].filter(Boolean).join(' ')
-				};
-			});
-		}"""
 		try:
-			elements = await asyncio.wait_for(page.evaluate(js_code, {"targetSelector": selector}), timeout=10.0)
+			elements = await asyncio.wait_for(
+				page.evaluate(
+					_SNAPSHOT_JS,
+					{
+						"targetSelector": selector,
+						"maxElements": max_elements,
+						"includeShadow": include_shadow,
+						"includeIframes": include_iframes,
+					},
+				),
+				timeout=10.0,
+			)
 		except asyncio.TimeoutError:
-			return f"Error capturing snapshot: Timed out after 10000ms"
+			return "Error capturing snapshot: Timed out after 10000ms"
 		elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
 		if not elements:
@@ -1087,27 +1972,26 @@ async def snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1
 
 		elements = elements[:max_elements]
 		lines = [f"Interactive elements snapshot for {page.url} ({elapsed_ms}ms, {len(elements)} items):", ""]
-		lines.append("| # | Tag | Selector | Text / Details |")
+		lines.append("| Ref | Tag | Selector | Text / Details |")
 		lines.append("|---|---|---|---|")
-		for el in elements:
-			desc = f"{el['text']} ({el['attrs']})" if el['attrs'] else el['text']
-			lines.append(f"| {el['index']} | `<{el['tag']}>` | `{el['selector']}` | {desc} |")
+		for idx, el in enumerate(elements):
+			lines.append(_format_snapshot_row(el, idx))
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Error capturing snapshot: {exc}"
 
 
 @mcp.tool()
-async def batch(actions: list[dict], tab: int = -1) -> str:
+async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 	"""Execute a pipeline of browser actions sequentially in a single turn for maximum speed (10-100x faster than roundtrips).
 
 	Supported action types in the dict:
-	- {"action": "click", "selector": "#btn", "timeout_ms": 3000}
-	- {"action": "fill", "selector": "#input", "text": "hello", "timeout_ms": 3000}
-	- {"action": "type", "selector": "#input", "text": "hello", "press_enter": True, "timeout_ms": 3000}
-	- {"action": "select", "selector": "select#country", "value": "CA", "timeout_ms": 3000}
+	- {"action": "click", "selector": "#btn", "ref": "e5", "text": "Sign In", "force": False, "timeout_ms": 3000}
+	- {"action": "fill", "selector": "#input", "ref": "e2", "text": "hello", "force": False, "timeout_ms": 3000}
+	- {"action": "type", "selector": "#input", "ref": "e2", "text": "hello", "press_enter": True, "timeout_ms": 3000}
+	- {"action": "select", "selector": "select#country", "ref": "e4", "value": "CA", "force": False, "timeout_ms": 3000}
 	- {"action": "press", "key": "Enter"}
-	- {"action": "wait_for", "selector": ".modal", "timeout_ms": 3000, "state": "visible"}
+	- {"action": "wait_for", "selector": ".modal", "ref": "e7", "timeout_ms": 3000, "state": "visible"}
 	- {"action": "sleep", "ms": 500}
 	- {"action": "evaluate", "expression": "window.scrollTo(0, 500)"}
 	"""
@@ -1118,45 +2002,79 @@ async def batch(actions: list[dict], tab: int = -1) -> str:
 		for idx, item in enumerate(actions):
 			act = item.get("action", "").lower()
 			timeout = item.get("timeout_ms", 4000)
+			sel = (item.get("selector") or "").strip()
+			ref = _normalize_ref(item.get("ref") or "")
+			force = bool(item.get("force", False))
 
 			if act == "click":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] click: SKIPPED (missing 'selector')")
+				text_target = item.get("text") or ""
+				if not (sel or ref or text_target):
+					results.append(f"[{idx}] click: SKIPPED (missing 'selector', 'ref', or 'text')")
 					continue
-				await page.locator(sel).first.click(timeout=timeout)
-				results.append(f"[{idx}] click '{sel}': OK")
+				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref, text=text_target)
+				try:
+					if force:
+						try:
+							el = await asyncio.wait_for(loc.first.element_handle(), timeout=max(1.0, timeout / 1000.0))
+							if el is not None:
+								await el.evaluate("el => el.click()")
+							else:
+								await loc.click(timeout=timeout, force=True)
+						except Exception:
+							await loc.click(timeout=timeout, force=True)
+					else:
+						await loc.click(timeout=timeout)
+				except Exception:
+					if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
+						pass
+					else:
+						raise
+				force_tag = " (force)" if force else ""
+				results.append(f"[{idx}] click {label}{force_tag}: OK")
 
 			elif act == "fill":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] fill: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] fill: SKIPPED (missing 'selector' or 'ref')")
 					continue
-				text = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
-				await page.locator(sel).first.fill(text, timeout=timeout)
-				results.append(f"[{idx}] fill '{sel}': OK")
+				text_val = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
+				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref)
+				try:
+					await loc.fill(text_val, timeout=timeout, force=force)
+				except Exception:
+					if ref_id and (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=True, press_enter=False):
+						pass
+					else:
+						raise
+				results.append(f"[{idx}] fill {label}: OK")
 
 			elif act == "type":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] type: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] type: SKIPPED (missing 'selector' or 'ref')")
 					continue
-				text = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
-				press_enter = item.get("press_enter", False)
-				loc = page.locator(sel).first
-				await loc.type(text, timeout=timeout)
-				if press_enter:
-					await loc.press("Enter")
-				results.append(f"[{idx}] type '{sel}' ({'with Enter' if press_enter else ''}): OK")
+				text_val = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
+				press_enter = bool(item.get("press_enter", False))
+				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref)
+				try:
+					if force:
+						await loc.click(timeout=timeout, force=True)
+					await loc.type(text_val, timeout=timeout)
+					if press_enter:
+						await loc.press("Enter")
+				except Exception:
+					if ref_id and (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=False, press_enter=press_enter):
+						pass
+					else:
+						raise
+				results.append(f"[{idx}] type {label} ({'with Enter' if press_enter else ''}): OK")
 
 			elif act == "select":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] select: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] select: SKIPPED (missing 'selector' or 'ref')")
 					continue
 				val = str(item.get("value") if item.get("value") is not None else item.get("text", ""))
-				await page.locator(sel).first.select_option(val, timeout=timeout)
-				results.append(f"[{idx}] select '{sel}' option '{val}': OK")
+				loc, label, _, _ = await _resolve_locator(page, selector=sel, ref=ref)
+				await loc.select_option(val, timeout=timeout, force=force)
+				results.append(f"[{idx}] select {label} option '{val}': OK")
 
 			elif act == "press":
 				key = item.get("key") or item.get("button", "Enter")
@@ -1164,13 +2082,13 @@ async def batch(actions: list[dict], tab: int = -1) -> str:
 				results.append(f"[{idx}] press '{key}': OK")
 
 			elif act == "wait_for":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] wait_for: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] wait_for: SKIPPED (missing 'selector' or 'ref')")
 					continue
 				state = item.get("state", "visible")
-				await page.locator(sel).first.wait_for(state=state, timeout=timeout)
-				results.append(f"[{idx}] wait_for '{sel}' ({state}): OK")
+				loc, label, _, _ = await _resolve_locator(page, selector=sel, ref=ref)
+				await loc.wait_for(state=state, timeout=timeout)
+				results.append(f"[{idx}] wait_for {label} ({state}): OK")
 
 			elif act == "sleep":
 				ms = item.get("ms") or item.get("duration_ms", 200)
@@ -1198,7 +2116,7 @@ async def get_content(
 	max_length: int = 4000,
 	interactive_only: bool = False,
 	clean: bool = True,
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 ) -> str:
 	"""Extract visible text content or interactive elements from the active tab. Set interactive_only=True for compact semantic elements snapshot, or clean=False for raw text."""
 	try:
@@ -1235,38 +2153,87 @@ async def get_content(
 
 
 @mcp.tool()
-async def click(selector: str, tab: int = -1, timeout_ms: int = 5000) -> str:
-	"""Click an element on the active page or specified tab index by CSS selector, text, or XPath."""
+async def click(
+	selector: str = "",
+	ref: str = "",
+	text: str = "",
+	force: bool = False,
+	tab: Union[int, str] = -1,
+	timeout_ms: int = 5000,
+) -> str:
+	"""Click an element on the active page or specified tab index by CSS selector, snapshot ref (e.g. 'e12' or '@e12'), or visible text. Set force=True to bypass pointer-interception overlays."""
+	sel_clean = (selector or "").strip()
+	ref_clean = _normalize_ref(ref)
+	if not (sel_clean or ref_clean or text):
+		return "Error clicking element: provide at least one of 'selector', 'ref', or 'text'"
+	label = f"ref '{ref_clean}'" if ref_clean else (f"'{sel_clean}'" if sel_clean else f"text '{text}'")
 	try:
 		page = await session.resolve_page(tab)
-		locator = page.locator(selector).first
-		await locator.click(timeout=timeout_ms)
-		return f"Clicked element matching '{selector}' on {page.url}"
+		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean, text=text)
+		try:
+			if force:
+				try:
+					el = await asyncio.wait_for(locator.first.element_handle(), timeout=max(1.0, timeout_ms / 1000.0))
+					if el is not None:
+						await el.evaluate("el => el.click()")
+					else:
+						await locator.click(timeout=timeout_ms, force=True)
+				except Exception:
+					await locator.click(timeout=timeout_ms, force=True)
+			else:
+				await locator.click(timeout=timeout_ms)
+		except Exception:
+			if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
+				pass
+			else:
+				raise
+		force_tag = " (force)" if force else ""
+		return f"Clicked element matching {label}{force_tag} on {page.url}"
 	except Exception as exc:
-		return f"Error clicking element '{selector}': {exc}"
+		return f"Error clicking element {label}: {exc}"
 
 
 @mcp.tool()
-async def type(selector: str, text: str, clear_first: bool = True, press_enter: bool = False, tab: int = -1, timeout_ms: int = 5000) -> str:
-	"""Type text into an input field or textarea on the active page or specified tab index."""
+async def type(
+	selector: str = "",
+	text: str = "",
+	clear_first: bool = True,
+	press_enter: bool = False,
+	tab: Union[int, str] = -1,
+	timeout_ms: int = 5000,
+	ref: str = "",
+) -> str:
+	"""Type text into an input field or textarea on the active page or specified tab index by CSS selector or snapshot ref (e.g. 'e3' or '@e3')."""
+	sel_clean = (selector or "").strip()
+	ref_clean = _normalize_ref(ref)
+	if not (sel_clean or ref_clean):
+		return "Error typing: provide either 'selector' or 'ref'"
+	label = f"ref '{ref_clean}'" if ref_clean else f"'{sel_clean}'"
 	try:
 		page = await session.resolve_page(tab)
-		locator = page.locator(selector).first
-		if clear_first:
-			await locator.fill(text, timeout=timeout_ms)
-		else:
-			await locator.type(text, timeout=timeout_ms)
+		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean)
+		try:
+			if clear_first:
+				await locator.fill(text, timeout=timeout_ms)
+			else:
+				await locator.type(text, timeout=timeout_ms)
+			if press_enter:
+				await locator.press("Enter")
+		except Exception:
+			if ref_id and not matched and await _js_type_ref(page, ref_id, text, clear_first=clear_first, press_enter=press_enter):
+				pass
+			else:
+				raise
 
 		if press_enter:
-			await locator.press("Enter")
-			return f"Typed text into '{selector}' and pressed Enter"
-		return f"Typed text into '{selector}'"
+			return f"Typed text into {label} and pressed Enter"
+		return f"Typed text into {label}"
 	except Exception as exc:
-		return f"Error typing into '{selector}': {exc}"
+		return f"Error typing into {label}: {exc}"
 
 
 @mcp.tool()
-async def press_key(key: str, tab: int = -1) -> str:
+async def press_key(key: str, tab: Union[int, str] = -1) -> str:
 	"""Press a keyboard key on the active page or specified tab index (e.g., 'Enter', 'Tab', 'Escape')."""
 	try:
 		page = await session.resolve_page(tab)
@@ -1277,7 +2244,7 @@ async def press_key(key: str, tab: int = -1) -> str:
 
 
 @mcp.tool()
-async def scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> str:
+async def scroll(direction: str = "down", amount: int = 600, tab: Union[int, str] = -1) -> str:
 	"""Scroll the active page or specified tab index up or down (direction: 'up' or 'down', amount in pixels)."""
 	try:
 		page = await session.resolve_page(tab)
@@ -1289,17 +2256,53 @@ async def scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> s
 
 
 @mcp.tool()
-async def screenshot(save_path: str = "", tab: int = -1) -> str:
-	"""Capture a screenshot of the active page view or specified tab index and return the file path."""
+async def screenshot(
+	save_path: str = "",
+	tab: Union[int, str] = -1,
+	full_page: bool = False,
+	selector: str = "",
+	ref: str = "",
+	annotate: bool = False,
+) -> str:
+	"""Capture a screenshot of the active page, full page, or a specific element (by selector or snapshot ref). Set annotate=True to temporarily overlay snapshot ref labels (e0, e1, ...)."""
 	try:
 		page = await session.resolve_page(tab)
 		if not save_path:
 			timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 			save_path = f"/tmp/screenshot_{timestamp}.png"
 
-		await page.screenshot(path=save_path, full_page=False)
+		sel_clean = (selector or "").strip()
+		ref_clean = _normalize_ref(ref)
+		annotated_count = 0
+		try:
+			if annotate:
+				annotated_count = int(await asyncio.wait_for(page.evaluate(_JS_ANNOTATE_OVERLAY), timeout=10.0) or 0)
+				if annotated_count == 0:
+					await snapshot(tab=tab)
+					annotated_count = int(await asyncio.wait_for(page.evaluate(_JS_ANNOTATE_OVERLAY), timeout=10.0) or 0)
+
+			if sel_clean or ref_clean:
+				locator, _, _, _ = await _resolve_locator(page, selector=sel_clean, ref=ref_clean)
+				await locator.screenshot(path=save_path)
+			else:
+				await page.screenshot(path=save_path, full_page=full_page)
+		finally:
+			if annotate:
+				try:
+					await asyncio.wait_for(page.evaluate(_JS_REMOVE_OVERLAY), timeout=5.0)
+				except Exception:
+					pass
+
 		title = await page.title()
-		return f"Screenshot saved to: {save_path}\nPage Title: {title}\nURL: {page.url}"
+		extras = []
+		if sel_clean or ref_clean:
+			extras.append(f"Element: {f'ref {ref_clean}' if ref_clean else sel_clean}")
+		elif full_page:
+			extras.append("Mode: full_page")
+		if annotate:
+			extras.append(f"Annotated: {annotated_count} ref(s)")
+		extra_line = ("\n" + " | ".join(extras)) if extras else ""
+		return f"Screenshot saved to: {save_path}\nPage Title: {title}\nURL: {page.url}{extra_line}"
 	except Exception as exc:
 		return f"Error taking screenshot: {exc}"
 
@@ -1311,30 +2314,33 @@ async def fetch(
 	headers: Optional[dict] = None,
 	body: Optional[Any] = None,
 	response_type: str = "auto",
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 	timeout_ms: int = 15000,
+	save_path: str = "",
 ) -> str:
 	"""Execute an in-browser HTTP request in the active tab origin using authenticated cookies and session state.
 
 	Parameters:
-	- url: Target URL or endpoint path (can be relative e.g. '/api/accounts' or absolute).
+	- url: Target URL or endpoint path (can be relative e.g. '/api/accounts', absolute, or a 'blob:' URL).
 	- method: HTTP method ('GET', 'POST', 'PUT', 'DELETE', etc. Default 'GET').
 	- headers: Optional dictionary of HTTP request headers.
 	- body: Optional request payload (string, dict, or list; dict/list will be serialized as JSON with Content-Type header).
-	- response_type: Expected format: 'auto' (parses JSON if possible, else text), 'json', or 'text'.
+	- response_type: Expected format: 'auto' (parses JSON if possible, else text), 'json', or 'text'. Ignored when save_path is set.
 	- tab: Target tab index (-1 for active tab).
+	- timeout_ms: Maximum request timeout in milliseconds (default 15000).
+	- save_path: Optional local file path (supports '~') to save binary/PDF/blob responses directly to disk without dumping contents into context.
 	"""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
 
-		# Auto-serialize dict/list body to JSON
 		if isinstance(body, (dict, list)):
 			body = json.dumps(body)
 			if headers is None:
 				headers = {}
 			headers.setdefault("Content-Type", "application/json")
-		js_script = """async ({ url, method, headers, body, responseType }) => {
+		save_binary = bool(save_path and save_path.strip())
+		js_script = """async ({ url, method, headers, body, responseType, saveBinary }) => {
 			const options = {
 				method: (method || 'GET').toUpperCase(),
 				credentials: 'include',
@@ -1349,6 +2355,43 @@ async def fetch(
 				const duration = Math.round(performance.now() - tStart);
 				const resHeaders = {};
 				res.headers.forEach((v, k) => { resHeaders[k] = v; });
+
+				if (saveBinary) {
+					if (!res.ok) {
+						let errorPreview = '';
+						try {
+							errorPreview = (await res.text()).slice(0, 1000);
+						} catch (_) {}
+						return {
+							ok: false,
+							status: res.status,
+							statusText: res.statusText,
+							url: res.url,
+							duration,
+							headers: resHeaders,
+							errorPreview
+						};
+					}
+					const buf = await res.arrayBuffer();
+					const bytes = new Uint8Array(buf);
+					// Multiple of 3 so each btoa chunk avoids intermediate padding and call-stack overflow
+					const chunkSize = 12288;
+					const b64Parts = [];
+					for (let i = 0; i < bytes.length; i += chunkSize) {
+						const slice = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+						b64Parts.push(btoa(String.fromCharCode.apply(null, slice)));
+					}
+					return {
+						ok: true,
+						status: res.status,
+						statusText: res.statusText,
+						url: res.url,
+						duration,
+						headers: resHeaders,
+						base64: b64Parts.join(''),
+						sizeBytes: bytes.byteLength
+					};
+				}
 
 				const text = await res.text();
 				let parsed = null;
@@ -1384,6 +2427,7 @@ async def fetch(
 					"headers": headers or {},
 					"body": body,
 					"responseType": response_type,
+					"saveBinary": save_binary,
 				}),
 				timeout=timeout_ms / 1000.0,
 			)
@@ -1395,6 +2439,33 @@ async def fetch(
 			return f"Fetch error ({result.get('duration', elapsed_total)}ms): {result['error']}"
 
 		status_str = f"HTTP {result['status']} {result['statusText']} ({result['duration']}ms)"
+		if save_binary:
+			dest_path = os.path.abspath(os.path.expanduser(save_path.strip()))
+			res_headers = result.get("headers") or {}
+			content_type = next(
+				(v for k, v in res_headers.items() if k.lower() == "content-type"),
+				"application/octet-stream",
+			)
+			if not result.get("ok"):
+				preview = (result.get("errorPreview") or "").strip()
+				msg = (
+					f"Fetch failed — {status_str} from {result['url']} "
+					f"(Content-Type: {content_type}); file not saved to {dest_path}"
+				)
+				if preview:
+					msg += f"\nResponse preview: {preview}"
+				return msg
+			raw_bytes = base64.b64decode(result.get("base64") or "")
+			parent_dir = os.path.dirname(dest_path)
+			if parent_dir:
+				os.makedirs(parent_dir, exist_ok=True)
+			with open(dest_path, "wb") as f:
+				f.write(raw_bytes)
+			return (
+				f"{status_str} [SAVED] from {result['url']} -> {dest_path} "
+				f"(Content-Type: {content_type}, {len(raw_bytes)} bytes / {_format_byte_size(len(raw_bytes))})"
+			)
+
 		data = result.get("data")
 		if result.get("isJson") and data is not None:
 			dumped = json.dumps(data, indent=2)
@@ -1410,11 +2481,641 @@ async def fetch(
 		return f"Error executing fetch: {exc}"
 
 
+def _format_byte_size(size_bytes: Optional[int]) -> str:
+	if size_bytes is None:
+		return "unknown size"
+	if size_bytes < 1024:
+		return f"{size_bytes} B"
+	if size_bytes < 1024 * 1024:
+		return f"{size_bytes / 1024:.1f} KB"
+	return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+
+class DownloadTracker:
+	"""Tracks Playwright download events in a bounded ring buffer without blocking the event loop."""
+
+	def __init__(self, maxlen: int = 100, downloads_dir: Optional[str] = None):
+		self._entries: collections.deque[dict[str, Any]] = collections.deque(maxlen=maxlen)
+		self._next_id: int = 1
+		self._pending_tasks: set[asyncio.Task] = set()
+		self._downloads_dir_override: Optional[str] = downloads_dir
+
+	@property
+	def downloads_dir(self) -> str:
+		return self._downloads_dir_override if self._downloads_dir_override is not None else DOWNLOADS_DIR
+
+	def attach(self, page: Page) -> None:
+		if page is None or getattr(page, "_download_tracker_attached", False):
+			return
+		setattr(page, "_download_tracker_attached", True)
+		page.on("download", self._on_download)
+
+	def _resolve_native_path(self, suggested_filename: str, started_ts: float) -> Optional[str]:
+		target_dir = self.downloads_dir
+		if not suggested_filename or not os.path.isdir(target_dir):
+			return None
+		stem, ext = os.path.splitext(suggested_filename)
+		recent_candidates: list[tuple[float, str]] = []
+		try:
+			with os.scandir(target_dir) as it:
+				for de in it:
+					if not de.is_file():
+						continue
+					name = de.name
+					if name == suggested_filename or (name.startswith(f"{stem} (") and name.endswith(f"){ext}")):
+						try:
+							mtime = de.stat().st_mtime
+						except OSError:
+							continue
+						if mtime >= started_ts - 2.0:
+							recent_candidates.append((mtime, de.path))
+		except OSError:
+			return None
+		if recent_candidates:
+			recent_candidates.sort(key=lambda item: item[0], reverse=True)
+			return os.path.abspath(recent_candidates[0][1])
+		direct = os.path.join(target_dir, suggested_filename)
+		if os.path.isfile(direct):
+			return os.path.abspath(direct)
+		return None
+
+	def _on_download(self, download: Any) -> None:
+		started_ts = time.time()
+		try:
+			url = str(getattr(download, "url", "") or "")
+		except Exception:
+			url = ""
+		try:
+			suggested_filename = str(getattr(download, "suggested_filename", "") or "")
+		except Exception:
+			suggested_filename = ""
+
+		entry: dict[str, Any] = {
+			"id": self._next_id,
+			"url": url,
+			"suggested_filename": suggested_filename,
+			"save_path": None,
+			"status": "in_progress",
+			"size_bytes": None,
+			"started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+			"completed_at": None,
+			"error": None,
+		}
+		self._next_id += 1
+		self._entries.append(entry)
+
+		try:
+			loop = asyncio.get_running_loop()
+		except RuntimeError:
+			return
+		task = loop.create_task(self._await_completion(entry, download, started_ts))
+		self._pending_tasks.add(task)
+		task.add_done_callback(self._pending_tasks.discard)
+
+	async def _await_completion(self, entry: dict[str, Any], download: Any, started_ts: float) -> None:
+		try:
+			failure = await download.failure()
+		except Exception as exc:
+			native_path = self._resolve_native_path(entry["suggested_filename"], started_ts)
+			if native_path is not None:
+				self._mark_completed(entry, native_path)
+			else:
+				self._mark_failed(entry, str(exc))
+			return
+
+		if failure:
+			self._mark_failed(entry, str(failure))
+			return
+
+		path_err: Optional[str] = None
+		save_path: Optional[str] = None
+		try:
+			raw_path = await download.path()
+			if raw_path is not None:
+				save_path = str(raw_path)
+		except Exception as exc:
+			path_err = str(exc)
+
+		if not save_path or not os.path.isfile(save_path):
+			native_path = self._resolve_native_path(entry["suggested_filename"], started_ts)
+			if native_path is not None:
+				save_path = native_path
+
+		if save_path:
+			self._mark_completed(entry, save_path)
+		elif path_err:
+			self._mark_failed(entry, path_err)
+		else:
+			self._mark_completed(entry, None)
+
+	def _mark_completed(self, entry: dict[str, Any], save_path: Optional[str]) -> None:
+		entry["status"] = "completed"
+		entry["save_path"] = save_path
+		if save_path and os.path.isfile(save_path):
+			try:
+				entry["size_bytes"] = os.path.getsize(save_path)
+			except OSError:
+				entry["size_bytes"] = None
+		entry["completed_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+	def _mark_failed(self, entry: dict[str, Any], error: str) -> None:
+		entry["status"] = "failed"
+		entry["error"] = error
+		entry["completed_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+	async def flush(self) -> None:
+		if self._pending_tasks:
+			await asyncio.gather(*list(self._pending_tasks), return_exceptions=True)
+
+	def list_entries(self, limit: int = 20) -> list[dict[str, Any]]:
+		if limit <= 0:
+			return []
+		return list(self._entries)[-limit:][::-1]
+
+	def list_dir_files(self, limit: int = 20) -> list[dict[str, Any]]:
+		if limit <= 0 or not os.path.isdir(self.downloads_dir):
+			return []
+		files: list[tuple[float, dict[str, Any]]] = []
+		try:
+			with os.scandir(self.downloads_dir) as it:
+				for de in it:
+					if de.name.startswith(".") or not de.is_file():
+						continue
+					try:
+						st = de.stat()
+					except OSError:
+						continue
+					files.append((
+						st.st_mtime,
+						{
+							"name": de.name,
+							"path": os.path.abspath(de.path),
+							"size_bytes": st.st_size,
+							"modified_at": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+						},
+					))
+		except OSError:
+			return []
+		files.sort(key=lambda item: item[0], reverse=True)
+		return [item[1] for item in files[:limit]]
+
+
+class TelemetryTracker:
+	"""Maintains per-page bounded ring buffers for console messages and network responses/failures."""
+
+	MAX_CONSOLE_TEXT = 500
+
+	def __init__(self, maxlen: int = 200):
+		self._maxlen = maxlen
+		self._console: dict[Page, collections.deque[dict[str, Any]]] = {}
+		self._network: dict[Page, collections.deque[dict[str, Any]]] = {}
+		self._cdp_sessions: dict[Page, Any] = {}
+
+	def attach(self, page: Page) -> None:
+		if page is None or getattr(page, "_telemetry_tracker_attached", False):
+			return
+		setattr(page, "_telemetry_tracker_attached", True)
+		self._console.setdefault(page, collections.deque(maxlen=self._maxlen))
+		self._network.setdefault(page, collections.deque(maxlen=self._maxlen))
+
+		page.on("console", lambda msg: self._on_console(page, msg))
+		page.on("pageerror", lambda err: self._on_pageerror(page, err))
+		page.on("response", lambda resp: self._on_response(page, resp))
+		page.on("requestfailed", lambda req: self._on_requestfailed(page, req))
+		page.on("close", lambda _=None: self._on_close(page))
+
+	async def ensure_console_capture(self, page: Page) -> bool:
+		"""Attach a raw-CDP Runtime console listener to a tab (lazily, on first console_logs call).
+
+		patchright never sends Runtime.enable (stealth), so page.on("console") only sees
+		browser-generated Log entries. Enabling it on-demand trades a small amount of stealth
+		on that single tab for full script console capture.
+		"""
+		if page is None or page.is_closed():
+			return False
+		if page in self._cdp_sessions:
+			return True
+		context = getattr(page, "context", None)
+		if context is None:
+			return False
+		try:
+			cdp = await asyncio.wait_for(context.new_cdp_session(page), timeout=10.0)
+		except Exception:
+			return False
+		self._cdp_sessions[page] = cdp
+
+		def _on_console_api(ev: Any) -> None:
+			try:
+				level = str(ev.get("type", "log") or "log").lower()
+				if level == "warn":
+					level = "warning"
+				parts: list[str] = []
+				for arg in ev.get("args", []) or []:
+					val = arg.get("value")
+					if val is None:
+						val = arg.get("description")
+					parts.append(str(val) if val is not None else "(opaque object)")
+				text = self._truncate_text(" ".join(parts))
+				location = ""
+				stack = ev.get("stackTrace") or []
+				if isinstance(stack, list) and stack and isinstance(stack[0], dict):
+					location = f"{stack[0].get('url', '')}:{stack[0].get('lineNumber', '')}"
+				buf = self._console.setdefault(page, collections.deque(maxlen=self._maxlen))
+				buf.append({
+					"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
+					"level": level,
+					"text": text,
+					"location": location,
+				})
+			except Exception:
+				pass
+
+		def _on_exception_thrown(ev: Any) -> None:
+			try:
+				details = ev.get("exceptionDetails") or {}
+				text = str(details.get("text") or "")
+				exc = details.get("exception") or {}
+				desc = exc.get("description")
+				buf = self._console.setdefault(page, collections.deque(maxlen=self._maxlen))
+				buf.append({
+					"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"),
+					"level": "pageerror",
+					"text": self._truncate_text(str(desc) if desc else text),
+					"location": "",
+				})
+			except Exception:
+				pass
+
+		cdp.on("Runtime.consoleAPICalled", _on_console_api)
+		cdp.on("Runtime.exceptionThrown", _on_exception_thrown)
+
+		def _on_close(_=None) -> None:
+			self._cdp_sessions.pop(page, None)
+
+		page.on("close", _on_close)
+		try:
+			await cdp.send("Runtime.enable")
+		except Exception:
+			pass
+		return True
+
+	def _on_close(self, page: Page) -> None:
+		self._console.pop(page, None)
+		self._network.pop(page, None)
+		self._cdp_sessions.pop(page, None)
+
+	def _truncate_text(self, text: str) -> str:
+		if len(text) > self.MAX_CONSOLE_TEXT:
+			return text[:self.MAX_CONSOLE_TEXT] + "... [truncated]"
+		return text
+
+	def _on_console(self, page: Page, msg: Any) -> None:
+		buf = self._console.setdefault(page, collections.deque(maxlen=self._maxlen))
+		try:
+			level = str(getattr(msg, "type", "log") or "log").lower()
+		except Exception:
+			level = "log"
+		if level == "warn":
+			level = "warning"
+		try:
+			raw_text = str(getattr(msg, "text", "") or "")
+		except Exception:
+			raw_text = ""
+		location = ""
+		try:
+			loc = getattr(msg, "location", None)
+			if isinstance(loc, dict) and loc.get("url"):
+				line_no = loc.get("lineNumber")
+				location = f"{loc['url']}:{line_no}" if line_no is not None else str(loc["url"])
+		except Exception:
+			location = ""
+		buf.append({
+			"timestamp": datetime.datetime.now().isoformat(timespec="milliseconds"),
+			"level": level,
+			"text": self._truncate_text(raw_text),
+			"location": location,
+		})
+
+	def _on_pageerror(self, page: Page, err: Any) -> None:
+		buf = self._console.setdefault(page, collections.deque(maxlen=self._maxlen))
+		try:
+			raw_text = str(getattr(err, "message", None) or err)
+		except Exception:
+			raw_text = str(err)
+		buf.append({
+			"timestamp": datetime.datetime.now().isoformat(timespec="milliseconds"),
+			"level": "pageerror",
+			"text": self._truncate_text(raw_text),
+			"location": "",
+		})
+
+	def _on_response(self, page: Page, resp: Any) -> None:
+		buf = self._network.setdefault(page, collections.deque(maxlen=self._maxlen))
+		req = getattr(resp, "request", None)
+		method = str(getattr(req, "method", "GET") or "GET").upper()
+		resource_type = str(getattr(req, "resource_type", "other") or "other").lower()
+		try:
+			status = int(getattr(resp, "status", 0))
+		except Exception:
+			status = None
+		url = str(getattr(resp, "url", "") or getattr(req, "url", "") or "")
+
+		content_type = ""
+		size_bytes: Optional[int] = None
+		try:
+			raw_headers = getattr(resp, "headers", None) or {}
+			if isinstance(raw_headers, dict):
+				for k, v in raw_headers.items():
+					kl = k.lower()
+					if kl == "content-type":
+						content_type = str(v)
+					elif kl == "content-length":
+						try:
+							size_bytes = int(str(v).strip())
+						except ValueError:
+							pass
+		except Exception:
+			pass
+
+		duration_ms: Optional[int] = None
+		try:
+			timing = getattr(req, "timing", None)
+			if isinstance(timing, dict):
+				resp_end = timing.get("responseEnd")
+				resp_start = timing.get("responseStart")
+				if isinstance(resp_end, (int, float)) and resp_end > 0:
+					duration_ms = int(round(resp_end))
+				elif isinstance(resp_start, (int, float)) and resp_start >= 0:
+					duration_ms = int(round(resp_start))
+		except Exception:
+			pass
+
+		buf.append({
+			"timestamp": datetime.datetime.now().isoformat(timespec="milliseconds"),
+			"method": method,
+			"status": status,
+			"failure": None,
+			"resource_type": resource_type,
+			"content_type": content_type,
+			"url": url,
+			"size_bytes": size_bytes,
+			"duration_ms": duration_ms,
+		})
+
+	def _on_requestfailed(self, page: Page, req: Any) -> None:
+		buf = self._network.setdefault(page, collections.deque(maxlen=self._maxlen))
+		method = str(getattr(req, "method", "GET") or "GET").upper()
+		resource_type = str(getattr(req, "resource_type", "other") or "other").lower()
+		url = str(getattr(req, "url", "") or "")
+		raw_failure = getattr(req, "failure", None)
+		if isinstance(raw_failure, dict):
+			failure = str(raw_failure.get("errorText") or raw_failure)
+		elif raw_failure:
+			failure = str(raw_failure)
+		else:
+			failure = "failed"
+		buf.append({
+			"timestamp": datetime.datetime.now().isoformat(timespec="milliseconds"),
+			"method": method,
+			"status": None,
+			"failure": failure,
+			"resource_type": resource_type,
+			"content_type": "",
+			"url": url,
+			"size_bytes": None,
+			"duration_ms": None,
+		})
+
+	def get_network(
+		self,
+		page: Page,
+		url_filter: str = "",
+		resource_type: str = "",
+		content_type: str = "",
+		status_min: int = 0,
+		limit: int = 50,
+		clear: bool = False,
+	) -> tuple[list[dict[str, Any]], int]:
+		buf = self._network.get(page)
+		if not buf:
+			return [], 0
+		total = len(buf)
+		entries = list(buf)
+		if clear:
+			buf.clear()
+
+		url_sub = url_filter.strip().lower()
+		allowed_types = {t.strip().lower() for t in resource_type.split(",") if t.strip()} if resource_type else set()
+		ct_sub = content_type.strip().lower()
+
+		matched = []
+		for item in entries:
+			if url_sub and url_sub not in item["url"].lower():
+				continue
+			if allowed_types and item["resource_type"].lower() not in allowed_types:
+				continue
+			if ct_sub and ct_sub not in item["content_type"].lower():
+				continue
+			if status_min > 0 and (item["status"] is None or item["status"] < status_min):
+				continue
+			matched.append(item)
+
+		if limit <= 0:
+			return [], total
+		return matched[-limit:], total
+
+	def get_console(
+		self,
+		page: Page,
+		level: str = "",
+		limit: int = 50,
+		clear: bool = False,
+	) -> tuple[list[dict[str, Any]], int]:
+		buf = self._console.get(page)
+		if not buf:
+			return [], 0
+		total = len(buf)
+		entries = list(buf)
+		if clear:
+			buf.clear()
+
+		allowed_levels: set[str] = set()
+		if level:
+			for part in level.split(","):
+				norm = part.strip().lower()
+				if norm == "warn":
+					norm = "warning"
+				if norm:
+					allowed_levels.add(norm)
+
+		matched = [item for item in entries if not allowed_levels or item["level"].lower() in allowed_levels]
+		if limit <= 0:
+			return [], total
+		return matched[-limit:], total
+
+
+download_tracker = DownloadTracker()
+telemetry_tracker = TelemetryTracker()
+
+
+def _attach_page_trackers(page: Page) -> None:
+	download_tracker.attach(page)
+	telemetry_tracker.attach(page)
+
+
+@mcp.tool()
+async def downloads(limit: int = 20, include_dir: bool = False) -> str:
+	"""List tracked browser downloads (and optionally recent files in the Downloads directory).
+
+	Parameters:
+	- limit: Maximum number of downloads (and directory files, if include_dir=True) to show (default 20).
+	- include_dir: If True, also list the most recent files in DOWNLOADS_DIR with modified time and size.
+	"""
+	try:
+		entries = download_tracker.list_entries(limit=limit)
+		sections: list[str] = []
+		if entries:
+			lines = [f"Tracked browser downloads (showing {len(entries)} of {len(download_tracker._entries)}):"]
+			for item in entries:
+				size_str = _format_byte_size(item["size_bytes"])
+				dest = item["save_path"] or "(pending)"
+				line = (
+					f"- [#{item['id']}] [{item['status']}] {item['suggested_filename'] or '(unnamed)'} "
+					f"({size_str}) -> {dest} | url: {item['url']} | started: {item['started_at']}"
+				)
+				if item["completed_at"]:
+					line += f" | completed: {item['completed_at']}"
+				if item["error"]:
+					line += f" | error: {item['error']}"
+				lines.append(line)
+			sections.append("\n".join(lines))
+		else:
+			hint = "" if include_dir else f" Pass include_dir=True to list files in {download_tracker.downloads_dir}."
+			sections.append(f"No tracked browser downloads yet.{hint}")
+
+		if include_dir:
+			dir_files = download_tracker.list_dir_files(limit=limit)
+			if dir_files:
+				dir_lines = [f"Recent files in {download_tracker.downloads_dir} (showing {len(dir_files)}):"]
+				for f in dir_files:
+					dir_lines.append(
+						f"- {f['name']} ({_format_byte_size(f['size_bytes'])}, modified {f['modified_at']}) -> {f['path']}"
+					)
+				sections.append("\n".join(dir_lines))
+			else:
+				sections.append(f"No files found in {download_tracker.downloads_dir}.")
+
+		return "\n\n".join(sections)
+	except Exception as exc:
+		return f"Error listing downloads: {exc}"
+
+
+@mcp.tool()
+async def network_requests(
+	url_filter: str = "",
+	resource_type: str = "",
+	content_type: str = "",
+	status_min: int = 0,
+	limit: int = 50,
+	clear: bool = False,
+	tab: Union[int, str] = -1,
+) -> str:
+	"""List captured network responses and failed requests for a tab from its bounded ring buffer.
+
+	Parameters:
+	- url_filter: Optional case-insensitive substring filter on request URL.
+	- resource_type: Optional resource type filter (comma-separated, e.g. 'fetch', 'xhr,fetch', 'document').
+	- content_type: Optional case-insensitive substring filter on response Content-Type (e.g. 'json', 'pdf').
+	- status_min: Optional minimum HTTP status code (e.g. 400 for errors). Default 0 returns all responses and failures.
+	- limit: Maximum number of matching entries to return (default 50, most recent).
+	- clear: If True, clear this tab's network buffer after reading.
+	- tab: Target tab index (-1 for active tab).
+	"""
+	try:
+		page = await session.resolve_page(tab)
+		_attach_page_trackers(page)
+		entries, total = telemetry_tracker.get_network(
+			page=page,
+			url_filter=url_filter,
+			resource_type=resource_type,
+			content_type=content_type,
+			status_min=status_min,
+			limit=limit,
+			clear=clear,
+		)
+		cleared_tag = " [buffer cleared]" if clear else ""
+		if not entries:
+			return f"No matching network requests for {page.url} ({total} total captured){cleared_tag}."
+
+		lines = [f"Network requests for {page.url} (showing {len(entries)} of {total} captured){cleared_tag}:"]
+		for item in entries:
+			ts = item["timestamp"].split("T")[-1]
+			if item["failure"]:
+				status_part = f"FAILED({item['failure']})"
+			else:
+				status_part = str(item["status"])
+			meta = []
+			if item["content_type"]:
+				meta.append(item["content_type"])
+			if item["size_bytes"] is not None:
+				meta.append(_format_byte_size(item["size_bytes"]))
+			if item["duration_ms"] is not None:
+				meta.append(f"{item['duration_ms']}ms")
+			meta_str = f" ({', '.join(meta)})" if meta else ""
+			lines.append(f"- [{ts}] {status_part} {item['method']} [{item['resource_type']}]{meta_str} {item['url']}")
+		return "\n".join(lines)
+	except Exception as exc:
+		return f"Error listing network requests: {exc}"
+
+
+@mcp.tool()
+async def console_logs(
+	level: str = "",
+	limit: int = 50,
+	clear: bool = False,
+	tab: Union[int, str] = -1,
+) -> str:
+	"""List captured browser console messages and uncaught page errors for a tab from its bounded ring buffer.
+
+	Note: on the first call for a tab, attaches an on-demand CDP console listener so future
+	script console.log/warn/error calls on that tab are captured (browser-generated messages
+	like network errors are always captured).
+
+	Parameters:
+	- level: Optional level filter (comma-separated, e.g. 'error', 'warning', 'log', 'pageerror').
+	- limit: Maximum number of matching entries to return (default 50, most recent).
+	- clear: If True, clear this tab's console buffer after reading.
+	- tab: Target tab index (-1 for active tab).
+	"""
+	try:
+		page = await session.resolve_page(tab)
+		_attach_page_trackers(page)
+		await telemetry_tracker.ensure_console_capture(page)
+		entries, total = telemetry_tracker.get_console(
+			page=page,
+			level=level,
+			limit=limit,
+			clear=clear,
+		)
+		cleared_tag = " [buffer cleared]" if clear else ""
+		if not entries:
+			return f"No matching console logs for {page.url} ({total} total captured){cleared_tag}."
+
+		lines = [f"Console logs for {page.url} (showing {len(entries)} of {total} captured){cleared_tag}:"]
+		for item in entries:
+			ts = item["timestamp"].split("T")[-1]
+			loc_str = f" ({item['location']})" if item["location"] else ""
+			lines.append(f"- [{ts}] [{item['level']}]{loc_str} {item['text']}")
+		return "\n".join(lines)
+	except Exception as exc:
+		return f"Error listing console logs: {exc}"
+
+
 @mcp.tool()
 async def state(
 	framework: str = "auto",
 	selector: str = "",
-	tab: int = -1,
+	tab: Union[int, str] = -1,
 ) -> str:
 	"""Inspect and extract in-memory client-side application state (Next.js, Redux, React Fiber, Vue, Apollo, React Query).
 
@@ -1633,12 +3334,28 @@ async def state(
 
 
 @mcp.tool()
-async def evaluate_js(expression: str, tab: int = -1, timeout_ms: int = 15000) -> str:
+async def evaluate_js(
+	expression: str = "",
+	tab: Union[int, str] = -1,
+	timeout_ms: int = 15000,
+	script: str = "",
+	max_length: int = 40000,
+) -> str:
 	"""Evaluate a JavaScript expression in the active page or specified tab index and return the result."""
+	code = expression if expression and expression.strip() else script
+	if not code or not code.strip():
+		return "JavaScript execution error: 'expression' (or alias 'script') must be non-empty."
 	try:
 		page = await session.resolve_page(tab)
-		result = await asyncio.wait_for(page.evaluate(expression), timeout=timeout_ms / 1000.0)
-		return f"Result: {result}"
+		result = await asyncio.wait_for(page.evaluate(code), timeout=timeout_ms / 1000.0)
+		if isinstance(result, (dict, list)):
+			formatted = json.dumps(result, indent=2, default=str)
+		else:
+			formatted = str(result)
+		if max_length > 0 and len(formatted) > max_length:
+			total_len = len(formatted)
+			formatted = formatted[:max_length] + f"\n... [Truncated: {total_len} total characters]"
+		return f"Result: {formatted}"
 	except asyncio.TimeoutError:
 		return f"JavaScript execution error: Timed out after {timeout_ms}ms"
 	except Exception as exc:
@@ -1646,56 +3363,176 @@ async def evaluate_js(expression: str, tab: int = -1, timeout_ms: int = 15000) -
 
 
 @mcp.tool()
-async def switch_tab(index: int) -> str:
-	"""Switch focus to an open tab by its numeric index (see status)."""
-	try:
-		pages = await session.get_pages()
-		if index < 0 or index >= len(pages):
-			return f"Invalid tab index {index}. Total open tabs: {len(pages)}"
+async def wait_for(
+	selector: str = "",
+	text: str = "",
+	url_contains: str = "",
+	state: str = "visible",
+	timeout_ms: int = 15000,
+	tab: Union[int, str] = -1,
+) -> str:
+	"""Wait for a CSS selector state, visible page text substring, URL substring, or combination."""
+	if not selector and not text and not url_contains:
+		return "Error in wait_for: specify at least one of 'selector', 'text', or 'url_contains'."
+	valid_states = {"attached", "detached", "hidden", "visible"}
+	if state not in valid_states:
+		return f"Error in wait_for: invalid state '{state}'. Expected one of: {', '.join(sorted(valid_states))}."
+	if timeout_ms <= 0:
+		return f"Error in wait_for: timeout_ms must be > 0 (got {timeout_ms})."
 
-		page = pages[index]
+	t0 = time.perf_counter()
+	deadline = time.monotonic() + (timeout_ms / 1000.0)
+	pending_desc = ""
+	page: Optional[Page] = None
+
+	try:
+		page = await session.resolve_page(tab)
+		matched: list[str] = []
+
+		if url_contains:
+			pending_desc = f"url containing '{url_contains}'"
+			while url_contains not in (page.url or ""):
+				if page.is_closed():
+					return f"Error in wait_for: tab closed while waiting for {pending_desc}"
+				if time.monotonic() >= deadline:
+					raise asyncio.TimeoutError()
+				await asyncio.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
+			matched.append(f"url_contains='{url_contains}'")
+
+		if selector:
+			pending_desc = f"selector '{selector}' ({state})"
+			rem_s = deadline - time.monotonic()
+			if rem_s <= 0:
+				raise asyncio.TimeoutError()
+			await asyncio.wait_for(
+				page.locator(selector).first.wait_for(state=state, timeout=max(1, int(rem_s * 1000))),
+				timeout=rem_s + 2.0,
+			)
+			matched.append(f"selector='{selector}' ({state})")
+
+		if text:
+			pending_desc = f"visible text '{text}'"
+			js_has_text = """(needle) => {
+				const root = document.body || document.documentElement;
+				return Boolean(root && (root.innerText || '').includes(needle));
+			}"""
+			while True:
+				if page.is_closed():
+					return f"Error in wait_for: tab closed while waiting for {pending_desc}"
+				rem_s = deadline - time.monotonic()
+				if rem_s <= 0:
+					raise asyncio.TimeoutError()
+				try:
+					found = await asyncio.wait_for(
+						page.evaluate(js_has_text, text),
+						timeout=min(rem_s, 3.0),
+					)
+				except asyncio.TimeoutError:
+					if time.monotonic() >= deadline:
+						raise
+					found = False
+				except Exception:
+					found = False
+				if found:
+					break
+				if time.monotonic() >= deadline:
+					raise asyncio.TimeoutError()
+				await asyncio.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
+			matched.append(f"text='{text}'")
+
+		elapsed_ms = int((time.perf_counter() - t0) * 1000)
+		return f"Wait condition met ({', '.join(matched)}) on {page.url} ({elapsed_ms}ms)"
+	except (asyncio.TimeoutError, TimeoutError):
+		curr_url = page.url if page is not None else "unknown"
+		return f"Wait timed out after {timeout_ms}ms waiting for {pending_desc or 'condition'} on {curr_url}"
+	except Exception as exc:
+		if "timeout" in exc.__class__.__name__.lower():
+			curr_url = page.url if page is not None else "unknown"
+			return f"Wait timed out after {timeout_ms}ms waiting for {pending_desc or 'condition'} on {curr_url}"
+		return f"Error in wait_for: {exc}"
+
+
+@mcp.tool()
+async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
+	"""Switch focus to an open tab by numeric index or stable tab id like 't2' (see status). Accepts 'tab' or legacy alias 'index'."""
+	target = tab if tab is not None else index
+	if target is None:
+		return "Error switching tab: provide a 'tab' (or 'index') value."
+	try:
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		if isinstance(target, str):
+			norm = target.strip().lower()
+			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
+			if resolved < 0:
+				return f"No open tab with id '{norm}'. Use status() to list open tabs."
+			target = resolved
+		if target < 0 or target >= len(pages):
+			return f"Invalid tab index {target}. Total open tabs: {len(pages)}"
+
+		page = pages[target]
 		session.set_active_page(page)
-		await page.bring_to_front()
-		title = await page.title()
-		return f"Switched to tab [{index}]: '{title}' ({page.url})"
+		await asyncio.wait_for(page.bring_to_front(), timeout=CDP_OP_TIMEOUT_S)
+		try:
+			title = await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_S)
+		except Exception:
+			title = "(Unavailable)"
+		return f"Switched to tab [{target}]: '{title}' ({page.url})"
+	except asyncio.TimeoutError:
+		return f"Error switching tab [{target}]: Timed out"
 	except Exception as exc:
 		return f"Error switching tab: {exc}"
 
 
 @mcp.tool()
-async def close_tab(index: int = -1) -> str:
-	"""Close a tab by index (-1 closes active tab, -99 or closing last tab terminates the browser window)."""
+async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
+	"""Close a tab by numeric index or stable tab id like 't2' (-1 closes active tab, -99 or closing last tab terminates the browser window). Accepts 'tab' or legacy alias 'index'."""
+	target = tab if tab is not None else (index if index is not None else -1)
 	try:
-		if index == -99:
+		if target == -99:
 			return await close_browser()
 
-		pages = await session.get_pages()
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		if not pages:
 			return await close_browser()
 
-		if index == -1:
+		if isinstance(target, str):
+			norm = target.strip().lower()
+			resolved = next((i for i, p in enumerate(pages) if session.get_tab_id(p) == norm), -1)
+			if resolved < 0:
+				return f"No open tab with id '{norm}'. Use status() to list open tabs."
+			target = resolved
+
+		if target == -1:
 			if session._active_page is not None and not session._active_page.is_closed():
 				page = session._active_page
 			else:
 				page = pages[-1]
 			target_index = pages.index(page) if page in pages else -1
 		else:
-			if index < 0 or index >= len(pages):
-				return f"Invalid tab index {index}. Total open tabs: {len(pages)}"
-			page = pages[index]
-			target_index = index
+			if target < 0 or target >= len(pages):
+				return f"Invalid tab index {target}. Total open tabs: {len(pages)}"
+			page = pages[target]
+			target_index = target
 
 		url = page.url
-		await keep_alive_mgr.stop(page)
-		await page.close()
+		try:
+			await asyncio.wait_for(keep_alive_mgr.stop(page), timeout=CDP_OP_TIMEOUT_S)
+		except Exception:
+			pass
+		try:
+			await asyncio.wait_for(page.close(), timeout=PAGE_CLOSE_TIMEOUT_S)
+		except asyncio.TimeoutError:
+			return f"Error closing tab [{target_index}]: Timed out after {int(PAGE_CLOSE_TIMEOUT_S * 1000)}ms (renderer unresponsive)"
 
-		remaining = await session.get_pages()
+		remaining = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		if page == session._active_page:
 			session._active_page = remaining[-1] if remaining else None
 		if not remaining:
 			await close_browser()
 			return f"Closed last tab [{target_index}] ({url}). Browser window completely closed."
 		return f"Closed tab [{target_index}] ({url}). Remaining open tabs: {len(remaining)}"
+	except asyncio.TimeoutError:
+		return f"Error closing tab [{target}]: Timed out"
 	except Exception as exc:
 		return f"Error closing tab: {exc}"
 
@@ -1708,7 +3545,6 @@ def _force_kill_browser_processes():
 		time.sleep(0.3)
 		subprocess.run(["pkill", "-9", "-f", "--", f"--user-data-dir={PROFILE_DIR}"], capture_output=True)
 		subprocess.run(["pkill", "-9", "-f", "--", f"--remote-debugging-port={CDP_PORT}"], capture_output=True)
-		# Clean up any orphaned Chromium singleton locks left behind
 		for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
 			lock_path = os.path.join(PROFILE_DIR, lock_name)
 			if os.path.islink(lock_path) or os.path.exists(lock_path):
@@ -1724,29 +3560,102 @@ def _force_kill_browser_processes():
 async def close_browser(force_kill: bool = True) -> str:
 	"""Completely close the browser window, terminate all browser and renderer processes, and release all resources."""
 	try:
+		cdp_timed_out = False
 		if session._browser is not None and session._browser.is_connected():
 			try:
-				cdp = await session._browser.new_browser_cdp_session()
-				await cdp.send("Browser.close")
+				cdp = await asyncio.wait_for(
+					session._browser.new_browser_cdp_session(),
+					timeout=BROWSER_CLOSE_TIMEOUT_S,
+				)
+				await asyncio.wait_for(cdp.send("Browser.close"), timeout=BROWSER_CLOSE_TIMEOUT_S)
+			except asyncio.TimeoutError:
+				cdp_timed_out = True
 			except Exception:
 				pass
-		if session._context is not None:
+		if not cdp_timed_out and session._context is not None:
 			try:
-				await session._context.close()
+				await asyncio.wait_for(session._context.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
 			except Exception:
 				pass
-		if session._browser is not None:
+		if not cdp_timed_out and session._browser is not None:
 			try:
-				await session._browser.close()
+				await asyncio.wait_for(session._browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
 			except Exception:
 				pass
-		await session.close()
+		try:
+			await asyncio.wait_for(session.close(), timeout=BROWSER_CLOSE_TIMEOUT_S)
+		except Exception:
+			session.close_sync()
 		_save_persisted_headless(None)
 		if force_kill:
-			_force_kill_browser_processes()
+			try:
+				await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
+			except Exception:
+				pass
 		return "Browser completely closed and all resources released."
 	except Exception as exc:
 		return f"Error closing browser: {exc}"
+
+
+async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[str] = None) -> str:
+	preserved_urls: list[str] = []
+	try:
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		for p in pages:
+			if not p.is_closed():
+				curr = p.url
+				if curr and curr != "about:blank" and not curr.startswith("chrome://") and not curr.startswith("chrome-error://"):
+					preserved_urls.append(curr)
+	except Exception:
+		pass
+
+	if not preserved_urls:
+		try:
+			active = session._active_page
+			if active is not None and not active.is_closed():
+				curr = active.url
+				if curr and curr != "about:blank" and not curr.startswith("chrome://") and not curr.startswith("chrome-error://"):
+					preserved_urls.append(curr)
+		except Exception:
+			pass
+
+	target_url = url if url is not None else (preserved_urls[0] if preserved_urls else None)
+	extra_urls = preserved_urls if url is not None else preserved_urls[1:]
+
+	if headless is not None:
+		session.headless = bool(headless)
+
+	await close_browser(force_kill=True)
+	_save_persisted_headless(session.headless)
+	await asyncio.sleep(0.3)
+	page = await session.get_active_page()
+	if target_url:
+		try:
+			await asyncio.wait_for(
+				page.goto(target_url, timeout=15000, wait_until="domcontentloaded"),
+				timeout=18.0,
+			)
+		except Exception:
+			pass
+	ctx = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
+	for extra_url in extra_urls:
+		if url is not None and extra_url == url:
+			continue
+		try:
+			new_page = await asyncio.wait_for(ctx.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+			await asyncio.wait_for(
+				new_page.goto(extra_url, timeout=10000, wait_until="domcontentloaded"),
+				timeout=12.0,
+			)
+		except Exception:
+			pass
+	try:
+		title = await asyncio.wait_for(page.title(), timeout=PAGE_TITLE_TIMEOUT_S)
+	except Exception:
+		title = "(Unavailable)"
+	mode_str = "Headless" if session.headless else "Headed"
+	reopened = f" (reopened {len(preserved_urls)} tab(s))" if preserved_urls and url is None else ""
+	return f"Browser restarted successfully in {mode_str} mode on tab [0]: '{title}' ({page.url}){reopened}"
 
 
 @mcp.tool()
@@ -1760,56 +3669,12 @@ async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = 
 		url: Optional URL to navigate to in tab [0] after restarting. If omitted, retains existing open tabs if active, otherwise opens about:blank.
 	"""
 	try:
-		preserved_urls: list[str] = []
-		try:
-			pages = await session.get_pages()
-			for p in pages:
-				if not p.is_closed():
-					curr = p.url
-					if curr and curr != "about:blank" and not curr.startswith("chrome://"):
-						preserved_urls.append(curr)
-		except Exception:
-			pass
-
-		if not preserved_urls:
-			try:
-				active = session._active_page
-				if active is not None and not active.is_closed():
-					curr = active.url
-					if curr and curr != "about:blank" and not curr.startswith("chrome://"):
-						preserved_urls.append(curr)
-			except Exception:
-				pass
-
-		target_url = url if url is not None else (preserved_urls[0] if preserved_urls else None)
-		extra_urls = preserved_urls if url is not None else preserved_urls[1:]
-
-		if headless is not None:
-			session.headless = bool(headless)
-
-		await close_browser(force_kill=True)
-		_save_persisted_headless(session.headless)
-		# Allow OS kernel and filesystem locks on PROFILE_DIR to settle cleanly
-		await asyncio.sleep(0.3)
-		page = await session.get_active_page()
-		if target_url:
-			try:
-				await page.goto(target_url, wait_until="domcontentloaded")
-			except Exception:
-				pass
-		ctx = await session.get_context()
-		for extra_url in extra_urls:
-			if url is not None and extra_url == url:
-				continue
-			try:
-				new_page = await ctx.new_page()
-				await new_page.goto(extra_url, wait_until="domcontentloaded")
-			except Exception:
-				pass
-		title = await page.title()
-		mode_str = "Headless" if session.headless else "Headed"
-		reopened = f" (reopened {len(preserved_urls)} tab(s))" if preserved_urls and url is None else ""
-		return f"Browser restarted successfully in {mode_str} mode on tab [0]: '{title}' ({page.url}){reopened}"
+		return await asyncio.wait_for(
+			_restart_browser_inner(headless=headless, url=url),
+			timeout=RESTART_BROWSER_TIMEOUT_S,
+		)
+	except asyncio.TimeoutError:
+		return f"Error restarting browser: Timed out after {int(RESTART_BROWSER_TIMEOUT_S)}s"
 	except Exception as exc:
 		return f"Error restarting browser: {exc}"
 
@@ -1822,10 +3687,9 @@ async def set_headless(headless: bool = True, force: bool = False) -> str:
 		headless: True for background headless (default); False only for interactive login/2FA/CAPTCHA or when asked.
 		force: Set True to restart Chromium even when non-blank tabs are open.
 	"""
-	# Attach to any already-running CDP browser first so session.headless reflects its true mode
 	pages: list[Page] = []
 	try:
-		pages = await session.get_pages()
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 	except Exception:
 		pages = []
 
