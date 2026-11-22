@@ -415,6 +415,9 @@ class BrowserSessionManager:
 		self._context: Optional[BrowserContext] = None
 		self._active_page: Optional[Page] = None
 		self._idle_task: Optional[asyncio.Task] = None
+		self._page_to_id: dict[Page, str] = {}
+		self._id_to_page: dict[str, Page] = {}
+		self._next_tab_seq: int = 1
 
 	def _touch_activity(self):
 		if self._idle_task is not None and not self._idle_task.done():
@@ -452,6 +455,8 @@ class BrowserSessionManager:
 		self._context = None
 		self._browser = None
 		self._active_page = None
+		self._page_to_id.clear()
+		self._id_to_page.clear()
 		if self._playwright is not None:
 			try:
 				await self._playwright.stop()
@@ -688,14 +693,46 @@ class BrowserSessionManager:
 		page.on("close", _on_closed_or_crashed)
 		page.on("crash", _on_closed_or_crashed)
 
+	def _unregister_page(self, page: Page) -> None:
+		tab_id = self._page_to_id.pop(page, None)
+		if tab_id is not None and self._id_to_page.get(tab_id) is page:
+			self._id_to_page.pop(tab_id, None)
+
+	def _prune_closed_tabs(self) -> None:
+		for page in list(self._page_to_id):
+			try:
+				closed = page.is_closed()
+			except Exception:
+				closed = True
+			if closed:
+				self._unregister_page(page)
+
+	def get_tab_id(self, page: Page) -> str:
+		existing = self._page_to_id.get(page)
+		if existing is not None:
+			return existing
+		tab_id = f"t{self._next_tab_seq}"
+		self._next_tab_seq += 1
+		self._page_to_id[page] = tab_id
+		self._id_to_page[tab_id] = page
+		if not getattr(page, "_tab_id_close_attached", False):
+			setattr(page, "_tab_id_close_attached", True)
+			page.on("close", lambda _=None, p=page: self._unregister_page(p))
+		return tab_id
+
 	def set_active_page(self, page: Page):
 		self._active_page = page
 		if page is not None and not page.is_closed():
 			self._register_page_listeners(page)
+			self.get_tab_id(page)
 
 	async def get_pages(self) -> list[Page]:
 		context = await self.get_context()
-		return [p for p in context.pages if not p.is_closed()]
+		self._prune_closed_tabs()
+		pages = [p for p in context.pages if not p.is_closed()]
+		for p in pages:
+			self.get_tab_id(p)
+		return pages
 
 	async def get_active_page(self) -> Page:
 		self._touch_activity()
@@ -737,19 +774,48 @@ class BrowserSessionManager:
 				return page
 			raise
 
-	async def resolve_page(self, tab: int = -1) -> Page:
+	async def resolve_page(self, tab: Union[int, str] = -1) -> Page:
 		self._touch_activity()
+		if isinstance(tab, str):
+			tab_str = tab.strip()
+			if tab_str.lower().startswith("t"):
+				tab_key = tab_str.lower()
+				self._prune_closed_tabs()
+				page = self._id_to_page.get(tab_key)
+				if page is not None:
+					try:
+						is_closed = page.is_closed()
+					except Exception:
+						is_closed = True
+					if is_closed:
+						self._unregister_page(page)
+						page = None
+				if page is not None and self._browser is not None and not self._browser.is_connected():
+					self._unregister_page(page)
+					page = None
+				if page is not None and self._context is not None:
+					ctx_pages = getattr(self._context, "pages", None)
+					if isinstance(ctx_pages, (list, tuple)) and page not in ctx_pages:
+						self._unregister_page(page)
+						page = None
+				if page is None:
+					raise ValueError(f"Tab '{tab}' not found or was closed")
+				return page
+			try:
+				tab = int(tab_str)
+			except ValueError as exc:
+				raise ValueError(f"Invalid tab identifier '{tab}'. Expected an integer index or tab ID like 't1'.") from exc
+
 		if tab < 0:
-			# Fast path: instant in-memory pointer resolution (< 0.01ms)
 			if (
 				self._active_page is not None
 				and not self._active_page.is_closed()
 				and (self._browser is None or self._browser.is_connected())
 			):
+				self.get_tab_id(self._active_page)
 				return self._active_page
 			return await self.get_active_page()
 
-		# Explicit tab index requested
 		pages = await self.get_pages()
 		if tab >= len(pages):
 			raise ValueError(f"Invalid tab index {tab}. Total open tabs: {len(pages)}")
@@ -892,6 +958,7 @@ async def status() -> str:
 		lines = [f"Connected to browser session at {CDP_URL} (Mode: {mode_str})"]
 		lines.append(f"Total open tabs: {len(pages)}")
 		for idx, page in enumerate(pages):
+			tab_id = session.get_tab_id(page)
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
 			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
 			keep_alive_status = " [KEEP-ALIVE ACTIVE]" if keep_alive_mgr.is_active(page) else ""
@@ -899,7 +966,7 @@ async def status() -> str:
 				title = await asyncio.wait_for(page.title(), timeout=2.0)
 			except Exception:
 				title = "(Unresponsive / Busy)"
-			lines.append(f"\t[{idx}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
+			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Disconnected: {exc}"
@@ -1012,7 +1079,174 @@ async def navigate(
 @mcp.tool()
 async def new_tab(url: str = "about:blank", block_media: Optional[bool] = None) -> str:
 	"""Open a new browser tab and navigate to url (default 'about:blank'). Set block_media=True for high-speed text-only browsing."""
-	return await navigate(url=url, block_media=block_media, new_tab=True)
+	result = await navigate(url=url, block_media=block_media, new_tab=True)
+	if result.startswith("Navigation error:"):
+		return result
+	page = None
+	match = re.match(r"Navigated tab \[(\d+)\]", result)
+	if match:
+		try:
+			pages = await session.get_pages()
+			idx = int(match.group(1))
+			if 0 <= idx < len(pages):
+				page = pages[idx]
+		except Exception:
+			page = None
+	if page is None:
+		page = session._active_page
+	if page is not None and not page.is_closed():
+		tab_id = session.get_tab_id(page)
+		if f"tab_id={tab_id}" not in result:
+			return f"{result} (tab_id={tab_id})"
+	return result
+
+
+def _escape_applescript(text: str) -> str:
+	return text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", " ").replace("\n", " ")
+
+
+def _notify_human(reason: str) -> Optional[subprocess.Popen]:
+	try:
+		safe_msg = _escape_applescript(reason)
+		script = f'display notification "{safe_msg}" with title "stealth-browser"'
+		return subprocess.Popen(
+			["osascript", "-e", script],
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception:
+		return None
+
+
+def _url_origin(url: str) -> str:
+	match = re.match(r"^(https?://[^/]+)", url or "")
+	return match.group(1) if match else ""
+
+
+@mcp.tool()
+async def wait_for_human(
+	reason: str = "Complete login / 2FA / CAPTCHA",
+	url_contains: str = "",
+	url_not_contains: str = "",
+	selector: str = "",
+	timeout_s: int = 180,
+	poll_interval_s: float = 1.5,
+	notify: bool = True,
+	tab: Union[int, str] = -1,
+) -> str:
+	"""Hand off a tab to the human for interactive login/2FA/CAPTCHA, switching to headed mode if needed, and poll until complete.
+
+	Parameters:
+	- reason: Human-readable prompt shown in the macOS notification and timeout message.
+	- url_contains: Complete when the tab URL contains this substring.
+	- url_not_contains: Complete when the tab URL no longer contains this substring.
+	- selector: Complete when this CSS/Playwright selector becomes visible on the tab.
+	- timeout_s: Maximum seconds to wait before timing out (default 180).
+	- poll_interval_s: Seconds between completion checks (default 1.5).
+	- notify: Send a best-effort non-blocking macOS notification via osascript (default True).
+	- tab: Target tab index or stable tab ID like 't1' (-1 for active tab).
+	"""
+	t0 = time.monotonic()
+	notify_proc: Optional[subprocess.Popen] = None
+	try:
+		page = await session.resolve_page(tab)
+		initial_url = page.url or ""
+		tab_id = session.get_tab_id(page)
+		switched_to_headed = False
+
+		if session.headless:
+			restart_res = await restart_browser(headless=False)
+			if isinstance(restart_res, str) and restart_res.startswith("Error"):
+				return f"Error switching to headed mode for human handoff: {restart_res}"
+			switched_to_headed = True
+			pages = await session.get_pages()
+			resolved_page = None
+			if initial_url and initial_url != "about:blank" and not initial_url.startswith("chrome://"):
+				for candidate in pages:
+					if candidate.url == initial_url:
+						resolved_page = candidate
+						break
+				if resolved_page is None:
+					origin = _url_origin(initial_url)
+					if origin:
+						for candidate in pages:
+							if (candidate.url or "").startswith(origin):
+								resolved_page = candidate
+								break
+			page = resolved_page if resolved_page is not None else await session.get_active_page()
+			session.set_active_page(page)
+			tab_id = session.get_tab_id(page)
+		else:
+			session.set_active_page(page)
+
+		try:
+			await page.bring_to_front()
+		except Exception:
+			pass
+
+		if notify:
+			notify_proc = _notify_human(reason)
+
+		has_explicit_condition = bool(url_contains or url_not_contains or selector)
+		interval = max(0.005, float(poll_interval_s))
+		deadline = t0 + max(0.0, float(timeout_s))
+		mode_note = " (switched to headed mode)" if switched_to_headed else ""
+
+		while True:
+			session._touch_activity()
+			if page.is_closed():
+				elapsed = time.monotonic() - t0
+				return f"Human handoff ended: tab {tab_id} was closed after {elapsed:.1f}s{mode_note} (reason: {reason})"
+
+			current_url = page.url or ""
+			matched_condition = ""
+			if url_contains and url_contains in current_url:
+				matched_condition = f"url_contains='{url_contains}'"
+			elif url_not_contains and url_not_contains not in current_url:
+				matched_condition = f"url_not_contains='{url_not_contains}'"
+			elif selector:
+				try:
+					visible = await asyncio.wait_for(page.locator(selector).first.is_visible(), timeout=2.0)
+				except Exception:
+					visible = False
+				if visible:
+					matched_condition = f"selector='{selector}' visible"
+			elif not has_explicit_condition and current_url != initial_url:
+				matched_condition = f"URL changed from '{initial_url}'"
+
+			if matched_condition:
+				elapsed = time.monotonic() - t0
+				try:
+					title = await asyncio.wait_for(page.title(), timeout=2.0)
+				except Exception:
+					title = "(Unavailable)"
+				return (
+					f"Human handoff completed ({matched_condition}) in {elapsed:.1f}s{mode_note} "
+					f"[tab_id={tab_id}] - Title: '{title}' - URL: {current_url}"
+				)
+
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				elapsed = time.monotonic() - t0
+				try:
+					title = await asyncio.wait_for(page.title(), timeout=2.0)
+				except Exception:
+					title = "(Unavailable)"
+				return (
+					f"Timed out after {elapsed:.1f}s waiting for human ({reason}){mode_note} "
+					f"[tab_id={tab_id}] - Title: '{title}' - URL: {current_url}"
+				)
+
+			await asyncio.sleep(min(interval, remaining))
+	except Exception as exc:
+		return f"Error during human handoff: {exc}"
+	finally:
+		if notify_proc is not None:
+			try:
+				notify_proc.poll()
+			except Exception:
+				pass
 
 
 @mcp.tool()
