@@ -35,6 +35,17 @@ from adblock import Engine, FilterSet
 from mcp.server.fastmcp import FastMCP
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 
+try:
+	from pydantic import ConfigDict
+	import mcp.server.fastmcp.utilities.func_metadata as _fm
+
+	class _StrictArgModel(_fm.ArgModelBase):
+		model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+	_fm.ArgModelBase = _StrictArgModel
+except Exception:
+	pass
+
 mcp = FastMCP(
 	"stealth-browser",
 	instructions=(
@@ -44,6 +55,7 @@ mcp = FastMCP(
 		"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
 		"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
 		"- snapshot(selector='body', max_elements=80, tab=-1) | get_content(selector='body', max_length=4000, interactive_only=False, clean=True, tab=-1)\n"
+		"- extract(container_selector='.product-card', fields={title: 'text:.title', link: '@href a'}, limit=20, tab=-1) for repeated-card structured JSON rows\n"
 		"- click(selector, tab=-1, timeout_ms=5000) | type(selector, text, clear_first=True, press_enter=False, tab=-1, timeout_ms=5000)\n"
 		"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1)\n"
 		"- batch(actions=[{action, selector, text, key, value, state, ms, expression, timeout_ms}], tab=-1)\n"
@@ -463,9 +475,16 @@ async def _network_route_handler(route, request):
 		res_type = request.resource_type or "other"
 
 		if res_type == "document":
-			handled = True
-			await route.continue_()
-			return
+			is_main_frame = True
+			try:
+				is_main_frame = frame.parent_frame is None
+			except Exception:
+				is_main_frame = True
+			uncommitted = (not frame_url.strip()) or frame_url.strip().lower() == "about:blank"
+			if is_main_frame or uncommitted:
+				handled = True
+				await route.continue_()
+				return
 
 		engine = get_adblock_engine()
 		if engine is not None:
@@ -1123,6 +1142,16 @@ async def status() -> str:
 			except Exception:
 				title = "(Unresponsive / Busy)"
 			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
+		dialog_lines = []
+		for p, tab_id in list(session._page_to_id.items()):
+			history = getattr(p, "_dialog_history", None)
+			if not history:
+				continue
+			for entry in list(history)[-3:]:
+				dialog_lines.append(f"\t[{tab_id}] {entry['type']}: {entry['message'][:120]} @ {entry['timestamp']}")
+		if dialog_lines:
+			lines.append(f"Recent dialogs (last {len(dialog_lines)}, auto-dismissed unless beforeunload):")
+			lines.extend(dialog_lines[-5:])
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Disconnected: {exc}"
@@ -1661,6 +1690,96 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 	});
 }"""
 
+_EXTRACT_JS = r"""({ containerSelector, fields, limit, includeShadow, includeIframes }) => {
+	const TEXT_MAX = 500;
+	const HTML_MAX = 1500;
+	const cap = (v, max) => {
+		if (v === null || v === undefined) return null;
+		const s = String(v);
+		if (s.length > max) return s.slice(0, max) + '... [truncated]';
+		return s;
+	};
+	const roots = [];
+	const seen = new Set();
+	const addRoot = (root) => {
+		if (root && !seen.has(root)) {
+			seen.add(root);
+			roots.push(root);
+		}
+	};
+	addRoot(document);
+	if (includeIframes) {
+		for (const f of document.querySelectorAll('iframe, frame')) {
+			try {
+				const d = f.contentDocument;
+				if (d && d.documentElement) addRoot(d);
+			} catch (_) {}
+		}
+	}
+	let total = 0;
+	const countIn = (root) => {
+		try {
+			total += root.querySelectorAll(containerSelector).length;
+		} catch (_) {}
+		if (!includeShadow) return;
+		try {
+			for (const el of root.querySelectorAll('*')) {
+				if (el.shadowRoot) countIn(el.shadowRoot);
+			}
+		} catch (_) {}
+	};
+	for (const root of roots) countIn(root);
+	const containers = [];
+	const scan = (root) => {
+		if (containers.length >= limit) return;
+		try {
+			for (const el of root.querySelectorAll(containerSelector)) {
+				containers.push(el);
+				if (containers.length >= limit) return;
+			}
+		} catch (_) {}
+		if (!includeShadow) return;
+		try {
+			for (const el of root.querySelectorAll('*')) {
+				if (el.shadowRoot) scan(el.shadowRoot);
+				if (containers.length >= limit) return;
+			}
+		} catch (_) {}
+	};
+	if (total > 0) {
+		for (const root of roots) {
+			scan(root);
+			if (containers.length >= limit) break;
+		}
+	}
+	const rows = containers.map((c, i) => {
+		const row = { _index: i };
+		for (const [name, spec] of Object.entries(fields)) {
+			let val = null;
+			try {
+				let el = c;
+				if (spec.selector) el = c.querySelector(spec.selector);
+				if (el) {
+					if (spec.mode === 'attr') {
+						val = cap(el.getAttribute(spec.attr), TEXT_MAX);
+					} else if (spec.mode === 'html') {
+						val = cap(el.outerHTML, HTML_MAX);
+					} else if (spec.mode === 'inner_html') {
+						val = cap(el.innerHTML, HTML_MAX);
+					} else {
+						val = cap((el.innerText !== undefined ? el.innerText : el.textContent) || '', TEXT_MAX);
+					}
+				}
+			} catch (_) {
+				val = null;
+			}
+			row[name] = val;
+		}
+		return row;
+	});
+	return { url: location.href, title: document.title, total_matched: total, returned: rows.length, rows };
+}"""
+
 _JS_FIND_REF_HELPER = r"""const findByRef = (root, refId, visited) => {
 	if (!root || visited.has(root)) return null;
 	visited.add(root);
@@ -2150,6 +2269,127 @@ async def get_content(
 		return text if text else "(Page element contains no visible text)"
 	except Exception as exc:
 		return f"Error extracting content: {exc}"
+
+
+_EXTRACT_MAX_FIELDS = 12
+_EXTRACT_MAX_LIMIT = 200
+
+
+def _normalize_extract_fields(fields) -> Optional[dict[str, dict[str, str]]]:
+	if not isinstance(fields, dict) or not fields:
+		return None
+	if len(fields) > _EXTRACT_MAX_FIELDS:
+		return None
+	normalized: dict[str, dict[str, str]] = {}
+	for name, spec in fields.items():
+		key = str(name).strip()
+		if not key or len(key) > 64:
+			return None
+		mode, selector, attr = "text", "", ""
+		if isinstance(spec, dict):
+			mode = str(spec.get("mode") or "text").strip().lower()
+			selector = str(spec.get("selector") or "").strip()
+			attr = str(spec.get("attr") or "").strip()
+		elif isinstance(spec, str) and spec.strip():
+			raw = spec.strip()
+			head, sep, tail = raw.partition(" ")
+			head_l = head.strip().lower()
+			if sep and head_l in ("text", "html", "inner_html"):
+				mode, selector = head_l, tail.strip()
+			elif sep and head_l.startswith("@") and len(head_l) > 1:
+				mode, attr, selector = "attr", head_l[1:], tail.strip()
+			else:
+				m = re.match(r"^(text|html|inner_html):(.+)$", raw)
+				if m:
+					mode, selector = m.group(1), m.group(2).strip()
+				elif re.match(r"^@([\w.-]+)$", raw):
+					mode, attr = "attr", raw[1:]
+				elif raw in ("text", "html", "inner_html"):
+					mode = raw
+				else:
+					mode, selector = "text", raw
+		else:
+			return None
+		if mode not in ("text", "attr", "html", "inner_html"):
+			return None
+		if mode == "attr" and not attr:
+			return None
+		normalized[key] = {"mode": mode, "selector": selector, "attr": attr}
+	return normalized
+
+
+@mcp.tool()
+async def extract(
+	container_selector: str,
+	fields: dict[str, Union[str, dict]],
+	limit: int = 20,
+	include_shadow: bool = True,
+	include_iframes: bool = True,
+	tab: Union[int, str] = -1,
+	max_length: int = 20000,
+) -> str:
+	"""Extract structured rows from repeated card/list containers (search results, product cards, tables) as JSON.
+
+	Scans container_selector across the DOM, open Shadow DOM, and same-origin iframes, and evaluates a field mapping
+	for each matched container — the structured alternative to evaluate_js scraping loops.
+
+	Parameters:
+	- container_selector: CSS selector matching each repeating container (e.g. '.product-card', 'table tbody tr').
+	- fields: Map of output field name to spec. Spec shorthand (string):
+	  'text' (container innerText), '.title' (innerText of sub-element), 'text:.title', '@href' (container attr),
+	  '@href a.link' (attr of sub-element), 'html:.thumb' (outerHTML of sub-element), 'inner_html:.body'.
+	  Spec object form (explicit): {"selector": ".price", "mode": "text"|"attr"|"html"|"inner_html", "attr": "href"}.
+	  Missing elements/attributes yield null per field (null-tolerant). Max 12 fields.
+	- limit: Maximum rows to return (default 20, max 200). total_matched reports the real match count.
+	- include_shadow: Include open Shadow DOM roots (default True).
+	- include_iframes: Include same-origin iframes (default True).
+	- tab: Target tab index (-1 for active tab).
+	- max_length: Output JSON truncation bound in characters (default 20000, 0 disables).
+	"""
+	t0 = time.perf_counter()
+	try:
+		normalized = _normalize_extract_fields(fields)
+		if normalized is None:
+			return (
+				"Error extracting rows: 'fields' must be a non-empty map of at most "
+				f"{_EXTRACT_MAX_FIELDS} field names to a spec string (e.g. '.title', 'text:.title', '@href a.link', "
+				"'html:.thumb') or {'selector': ..., 'mode': 'text'|'attr'|'html'|'inner_html', 'attr': ...}."
+			)
+		limit = min(max(1, int(limit)), _EXTRACT_MAX_LIMIT)
+		container_selector = (container_selector or "").strip()
+		if not container_selector:
+			return "Error extracting rows: 'container_selector' must be non-empty."
+		page = await session.resolve_page(tab)
+		result = await asyncio.wait_for(
+			page.evaluate(
+				_EXTRACT_JS,
+				{
+					"containerSelector": container_selector,
+					"fields": normalized,
+					"limit": limit,
+					"includeShadow": include_shadow,
+					"includeIframes": include_iframes,
+				},
+			),
+			timeout=15.0,
+		)
+		elapsed_ms = int((time.perf_counter() - t0) * 1000)
+		if not isinstance(result, dict) or "rows" not in result:
+			return f"Error extracting rows: unexpected result from page ({result.__class__.__name__})."
+		if not result["rows"]:
+			return (
+				f"No elements matched '{container_selector}' on {page.url} "
+				f"({elapsed_ms}ms, total_matched={result.get('total_matched', 0)})."
+			)
+		formatted = json.dumps(result, indent=2, default=str)
+		if max_length > 0 and len(formatted) > max_length:
+			total_len = len(formatted)
+			formatted = formatted[:max_length] + f"\n... [Truncated: {total_len} total characters]"
+		return f"Extracted {result['returned']} row(s) from '{container_selector}' ({elapsed_ms}ms):\n{formatted}"
+	except asyncio.TimeoutError:
+		return "Error extracting rows: Timed out after 15000ms"
+	except Exception as exc:
+		return f"Error extracting rows: {exc}"
 
 
 @mcp.tool()
@@ -2683,6 +2923,7 @@ class TelemetryTracker:
 		page.on("response", lambda resp: self._on_response(page, resp))
 		page.on("requestfailed", lambda req: self._on_requestfailed(page, req))
 		page.on("close", lambda _=None: self._on_close(page))
+		page.on("crash", lambda _=None: self._on_crash(page))
 
 	async def ensure_console_capture(self, page: Page) -> bool:
 		"""Attach a raw-CDP Runtime console listener to a tab (lazily, on first console_logs call).
@@ -2702,7 +2943,6 @@ class TelemetryTracker:
 			cdp = await asyncio.wait_for(context.new_cdp_session(page), timeout=10.0)
 		except Exception:
 			return False
-		self._cdp_sessions[page] = cdp
 
 		def _on_console_api(ev: Any) -> None:
 			try:
@@ -2749,19 +2989,46 @@ class TelemetryTracker:
 		cdp.on("Runtime.consoleAPICalled", _on_console_api)
 		cdp.on("Runtime.exceptionThrown", _on_exception_thrown)
 
-		def _on_close(_=None) -> None:
-			self._cdp_sessions.pop(page, None)
+		def _drop_session(_=None) -> None:
+			self._drop_cdp_session(page, cdp)
 
-		page.on("close", _on_close)
+		page.on("close", _drop_session)
+		page.on("crash", _drop_session)
 		try:
-			await cdp.send("Runtime.enable")
+			await asyncio.wait_for(cdp.send("Runtime.enable"), timeout=5.0)
 		except Exception:
-			pass
+			await self._detach_quiet(cdp)
+			return False
+		self._cdp_sessions[page] = cdp
 		return True
 
+	def _drop_cdp_session(self, page: Page, cdp) -> None:
+		if self._cdp_sessions.get(page) is cdp:
+			self._cdp_sessions.pop(page, None)
+			self._schedule_detach(cdp)
+
+	@staticmethod
+	async def _detach_quiet(cdp) -> None:
+		try:
+			await cdp.detach()
+		except Exception:
+			pass
+
+	@staticmethod
+	def _schedule_detach(cdp) -> None:
+		try:
+			asyncio.get_running_loop().create_task(TelemetryTracker._detach_quiet(cdp))
+		except Exception:
+			pass
+
 	def _on_close(self, page: Page) -> None:
+		cdp = self._cdp_sessions.pop(page, None)
 		self._console.pop(page, None)
 		self._network.pop(page, None)
+		if cdp is not None:
+			self._schedule_detach(cdp)
+
+	def _on_crash(self, page: Page) -> None:
 		self._cdp_sessions.pop(page, None)
 
 	def _truncate_text(self, text: str) -> str:

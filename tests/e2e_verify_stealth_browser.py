@@ -49,6 +49,11 @@ FIXTURE_HTML = """<!doctype html>
 		document.body.appendChild(d);
 	}, 400)">Load Delayed</button>
 	<div id="shadow-host"></div>
+	<div id="results">
+		<div class="result-card" data-id="A1"><a class="card-link" href="/account/details">Card Alpha</a><span class="card-price">US$10.99</span></div>
+		<div class="result-card" data-id="B2"><a class="card-link" href="/statement.pdf">Card Beta</a><span class="card-price">US$20.50</span></div>
+		<div class="result-card" data-id="C3"><a class="card-link" href="/account/details">Card Gamma</a></div>
+	</div>
 	<iframe id="inner-frame" src="/iframe" width="300" height="80"></iframe>
 	<embed id="pdf-embed" type="application/pdf" width="200" height="50" />
 	<script>
@@ -214,6 +219,10 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 					after_alert = await call("evaluate_js", {"expression": "document.body.dataset.afterAlert || 'no'"})
 					check("dialog auto-handled without hang", "Clicked" in dlg_click and "yes" in after_alert, f"{dlg_click} | {after_alert}")
 
+					# Dialog history surfaced in status()
+					st = await call("status", {})
+					check("status surfaces dialog history", "Recent dialogs" in st and "Session warning!" in st, st)
+
 					# Standalone wait_for
 					await call("click", {"selector": "#delayed-btn"})
 					wf = await call("wait_for", {"selector": "#late-card", "text": "25000 pts", "timeout_ms": 5000})
@@ -227,12 +236,33 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 					cl = await call("close_tab", {"tab": 1})
 					check("close_tab accepts tab= alias", "Closed tab [1]" in cl, cl)
 
+					# Unknown params must fail loudly (strict argument validation)
+					bad = await call("switch_tab", {"tab": 0, "typo_param": 1})
+					check("unknown param rejected loudly", "Extra inputs" in bad or "extra" in bad.lower(), bad[:200])
+
 				if suite in ("interact", "all"):
 					snap = await call("snapshot", {})
 					check("snapshot includes href", "/account/details" in snap and "/statement.pdf" in snap, snap[:600])
 					check("snapshot includes shadow DOM btn", "Shadow Confirm" in snap, snap)
 					check("snapshot includes iframe btn", "Iframe Submit" in snap, snap)
 					check("snapshot assigns eN refs", bool(re.search(r"\be\d+\b", snap)), snap[:600])
+
+					# extract: structured repeated-card rows with null-tolerant fields
+					extr = await call("extract", {
+						"container_selector": ".result-card",
+						"fields": {
+							"title": "text:.card-link",
+							"link": "@href .card-link",
+							"price": "text:.card-price",
+							"id": "@data-id",
+						},
+					})
+					check("extract returns structured rows",
+						'"title": "Card Alpha"' in extr and '"price": "US$10.99"' in extr and '"total_matched": 3' in extr,
+						extr[:500])
+					check("extract null-tolerant missing fields",
+						'"price": null' in extr and '"link": "/account/details"' in extr and '"id": "C3"' in extr,
+						extr)
 
 					# Find ref for "Second Action", "Shadow Confirm", "Iframe Submit", and input
 					def find_ref(label_sub):

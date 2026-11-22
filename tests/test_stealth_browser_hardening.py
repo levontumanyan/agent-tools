@@ -724,5 +724,159 @@ def test_mcp_tool_schemas_accept_expected_params(sb):
 		)
 		assert {"tab", "index"} <= set(tools["switch_tab"].inputSchema["properties"].keys())
 		assert {"tab", "index"} <= set(tools["close_tab"].inputSchema["properties"].keys())
+		assert set(tools["extract"].inputSchema["properties"].keys()) >= {
+			"container_selector", "fields", "limit", "include_shadow", "include_iframes", "tab", "max_length",
+		}
+
+
+def test_mcp_tool_schemas_forbid_extra_params(sb):
+	async def scenario():
+		tools = {t.name: t for t in await sb.mcp.list_tools()}
+		for name in ("navigate", "click", "switch_tab", "close_tab", "evaluate_js", "extract"):
+			assert tools[name].inputSchema.get("additionalProperties") is False, name
+
+		for name, bad_args in (
+			("navigate", {"url": "https://x.example", "typo": 1}),
+			("switch_tab", {"tab": 0, "tab_index": 0}),
+		):
+			try:
+				await sb.mcp._tool_manager.call_tool(name, bad_args, convert_result=False)
+				raise AssertionError(f"{name} accepted unknown params {bad_args}")
+			except Exception as exc:
+				assert "extra_forbidden" in str(exc) or "Extra inputs" in str(exc), f"{name}: {exc}"
+
+	asyncio.run(scenario())
+
+
+def test_mcp_tool_call_unknown_param_error_names_offender(sb):
+	async def scenario():
+		try:
+			await sb.mcp._tool_manager.call_tool("close_tab", {"tab_index": 2}, convert_result=False)
+			raise AssertionError("expected validation error")
+		except Exception as exc:
+			assert "tab_index" in str(exc), str(exc)
+
+	asyncio.run(scenario())
+
+
+def test_network_route_handler_document_policy(sb, monkeypatch):
+	class TrackingEngine:
+		def __init__(self, matched: bool):
+			self.matched = matched
+			self.calls = []
+
+		def check_network_urls(self, url, frame_url, res_type):
+			self.calls.append((url, frame_url, res_type))
+			result = MagicMock()
+			result.matched = self.matched
+			return result
+
+	async def scenario():
+		engine = TrackingEngine(matched=True)
+		monkeypatch.setattr(sb, "get_adblock_engine", lambda: engine)
+
+		subframe = MagicMock()
+		subframe.url = "https://old.example/widget"
+		subframe.parent_frame = MagicMock()
+		subframe.page = FakePage()
+		main_frame = MagicMock()
+		main_frame.url = "https://site.example"
+		main_frame.parent_frame = None
+		main_frame.page = FakePage()
+		fresh_frame = MagicMock()
+		fresh_frame.url = "about:blank"
+		fresh_frame.parent_frame = MagicMock()
+		fresh_frame.page = FakePage()
+
+		route = FakeRoute()
+		req = FakeRequest(url="https://ads.example/iframe.html", resource_type="document", frame=subframe)
+		await sb._network_route_handler(route, req)
+		assert route.aborted == 1
+		assert route.continued == 0
+		assert engine.calls[-1] == ("https://ads.example/iframe.html", "https://old.example/widget", "document")
+
+		route = FakeRoute()
+		req = FakeRequest(url="https://site.example/page2", resource_type="document", frame=main_frame)
+		await sb._network_route_handler(route, req)
+		assert route.continued == 1
+		assert route.aborted == 0
+
+		route = FakeRoute()
+		req = FakeRequest(url="https://site.example/first", resource_type="document", frame=fresh_frame)
+		await sb._network_route_handler(route, req)
+		assert route.continued == 1
+		assert route.aborted == 0
+
+		uncommitted_subframe = MagicMock()
+		uncommitted_subframe.url = "about:blank"
+		uncommitted_subframe.parent_frame = MagicMock()
+		uncommitted_subframe.page = FakePage()
+		route = FakeRoute()
+		req = FakeRequest(url="https://ads.example/late.html", resource_type="document", frame=uncommitted_subframe)
+		await sb._network_route_handler(route, req)
+		assert route.continued == 1
+		assert route.aborted == 0
+
+		engine_ok = TrackingEngine(matched=False)
+		monkeypatch.setattr(sb, "get_adblock_engine", lambda: engine_ok)
+		route = FakeRoute()
+		req = FakeRequest(url="https://ok.example/frame.html", resource_type="document", frame=subframe)
+		await sb._network_route_handler(route, req)
+		assert route.continued == 1
+		assert route.aborted == 0
+		assert engine_ok.calls[-1][2] == "document"
+
+	asyncio.run(scenario())
+
+
+def test_network_route_handler_document_policy_parent_frame_absent(sb, monkeypatch):
+	class TrackingEngine:
+		def check_network_urls(self, url, frame_url, res_type):
+			result = MagicMock()
+			result.matched = True
+			return result
+
+	async def scenario():
+		engine = TrackingEngine()
+		monkeypatch.setattr(sb, "get_adblock_engine", lambda: engine)
+		frame = MagicMock(spec=[])
+		frame.url = "https://old.example"
+		frame.page = FakePage()
+		route = FakeRoute()
+		req = FakeRequest(url="https://x.example/doc.html", resource_type="document", frame=frame)
+		await sb._network_route_handler(route, req)
+		assert route.continued == 1
+		assert route.aborted == 0
+
+	asyncio.run(scenario())
+
+
+def test_status_surfaces_recent_dialog_history(sb, monkeypatch):
+	async def scenario():
+		p1 = FakePage(url="https://app.example/settings", title="Settings")
+		p2 = FakePage(url="https://app.example/list", title="List")
+		pages = [p1, p2]
+		tid1 = sb.session.get_tab_id(p1)
+		sb.session._active_page = p2
+		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=pages))
+
+		p1._dialog_history = deque([
+			{"type": "alert", "message": "Session expired", "url": p1.url,
+				"timestamp": "2026-11-22T10:00:00+00:00"},
+			{"type": "confirm", "message": "Delete item?", "url": p1.url,
+				"timestamp": "2026-11-22T10:05:00+00:00"},
+		], maxlen=sb.MAX_DIALOG_HISTORY)
+
+		out = await sb.status()
+		assert "Recent dialogs" in out
+		assert f"[{tid1}] confirm: Delete item?" in out
+		assert f"[{tid1}] alert: Session expired" in out
+		assert "auto-dismissed" in out
+
+		p1._dialog_history.clear()
+		out_clean = await sb.status()
+		assert "Recent dialogs" not in out_clean
+
+	asyncio.run(scenario())
 
 	asyncio.run(scenario())

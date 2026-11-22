@@ -568,3 +568,154 @@ def test_session_manager_hooks_attach_trackers_on_existing_and_active_pages(monk
 		assert getattr(p3, "_telemetry_tracker_attached", False) is True
 
 	_run(_scenario())
+
+
+class FakeCdpSession:
+	def __init__(self, enable_fails: bool = False, enable_delay: float = 0.0, enable_exc: Any = None):
+		self.enable_fails = enable_fails
+		self.enable_delay = enable_delay
+		self.enable_exc = enable_exc
+		self.detached = 0
+		self.sent: list[str] = []
+		self.handlers: dict[str, list] = {}
+
+	async def send(self, method: str, params: Any = None) -> Any:
+		self.sent.append(method)
+		if method == "Runtime.enable":
+			if self.enable_exc is not None:
+				raise self.enable_exc
+			if self.enable_delay:
+				await asyncio.sleep(self.enable_delay)
+			if self.enable_fails:
+				raise RuntimeError("Runtime.enable rejected")
+		return {}
+
+	def on(self, event: str, cb) -> None:
+		self.handlers.setdefault(event, []).append(cb)
+
+	async def detach(self) -> None:
+		self.detached += 1
+
+
+class FakeCdpContext:
+	def __init__(self, sessions: list[FakeCdpSession]):
+		self._sessions = list(sessions)
+		self.created: list[FakeCdpSession] = []
+
+	async def new_cdp_session(self, page: Any) -> FakeCdpSession:
+		session = self._sessions.pop(0)
+		self.created.append(session)
+		return session
+
+
+def _cdp_page(page: FakePage, context: FakeCdpContext) -> FakePage:
+	page.context = context
+	return page
+
+
+def test_console_capture_enable_failure_returns_false_no_registration(monkeypatch):
+	async def _scenario():
+		tracker = sb.TelemetryTracker()
+		bad = FakeCdpSession(enable_fails=True)
+		bad2 = FakeCdpSession(enable_fails=True)
+		ctx = FakeCdpContext([bad, bad2])
+		page = _cdp_page(FakePage("https://app.example/console"), ctx)
+
+		assert await tracker.ensure_console_capture(page) is False
+		assert tracker._cdp_sessions == {}
+		assert bad.detached == 1
+
+		assert await tracker.ensure_console_capture(page) is False
+		assert len(ctx.created) == 2
+
+	_run(_scenario())
+
+
+def test_console_capture_enable_success_registers_and_captures(monkeypatch):
+	async def _scenario():
+		tracker = sb.TelemetryTracker()
+		good = FakeCdpSession()
+		ctx = FakeCdpContext([good])
+		page = _cdp_page(FakePage("https://app.example/console"), ctx)
+		tracker.attach(page)
+
+		assert await tracker.ensure_console_capture(page) is True
+		assert tracker._cdp_sessions[page] is good
+		assert "Runtime.enable" in good.sent
+
+		assert await tracker.ensure_console_capture(page) is True
+		assert len(ctx.created) == 1
+
+		for cb in good.handlers["Runtime.consoleAPICalled"]:
+			cb({"type": "error", "args": [{"value": "boom"}], "stackTrace": [{"url": "app.js", "lineNumber": 7}]})
+		page.emit("console", FakeConsoleMessage("log", "browser log"))
+		entries, total = tracker.get_console(page)
+		assert total == 2
+		assert entries[0]["level"] == "error"
+		assert entries[0]["text"] == "boom"
+		assert entries[0]["location"] == "app.js:7"
+		assert entries[1]["level"] == "log"
+		assert entries[1]["text"] == "browser log"
+
+	_run(_scenario())
+
+
+def test_console_capture_enable_timeouterror_does_not_wedge(monkeypatch):
+	async def _scenario():
+		tracker = sb.TelemetryTracker()
+		slow = FakeCdpSession(enable_exc=asyncio.TimeoutError())
+		ctx = FakeCdpContext([slow, FakeCdpSession()])
+		page = _cdp_page(FakePage("https://app.example/console"), ctx)
+
+		assert await tracker.ensure_console_capture(page) is False
+		assert tracker._cdp_sessions == {}
+
+		assert await tracker.ensure_console_capture(page) is True
+
+	_run(_scenario())
+
+
+def test_console_capture_crash_and_close_drop_session(monkeypatch):
+	async def _scenario():
+		tracker = sb.TelemetryTracker()
+		good = FakeCdpSession()
+		ctx = FakeCdpContext([good, FakeCdpSession()])
+		page = _cdp_page(FakePage("https://app.example/console"), ctx)
+
+		assert await tracker.ensure_console_capture(page) is True
+		assert page in tracker._cdp_sessions
+
+		page.emit("crash")
+		await asyncio.sleep(0)
+		assert page not in tracker._cdp_sessions
+		assert good.detached == 1
+
+		assert await tracker.ensure_console_capture(page) is True
+		assert page in tracker._cdp_sessions
+		reattached = tracker._cdp_sessions[page]
+
+		page.close_now()
+		await asyncio.sleep(0)
+		assert page not in tracker._cdp_sessions
+		assert reattached.detached == 1
+
+	_run(_scenario())
+
+
+def test_console_capture_close_keeps_buffers_popped_and_no_cross_tab_leak(monkeypatch):
+	async def _scenario():
+		tracker = sb.TelemetryTracker()
+		page = FakePage("https://app.example/console")
+		tracker.attach(page)
+		page.emit("console", FakeConsoleMessage("log", "pre-crash history"))
+		assert tracker.get_console(page)[1] == 1
+
+		page.emit("crash")
+		assert tracker.get_console(page)[1] == 1
+
+		page.close_now()
+		assert tracker.get_console(page) == ([], 0)
+		assert tracker._console == {}
+		assert tracker._network == {}
+
+	_run(_scenario())
