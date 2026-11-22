@@ -1213,52 +1213,495 @@ async def set_media(enable_media: bool = True, tab: int = -1) -> str:
 		return f"Error updating media state: {exc}"
 
 
+_SB_REF_SELECTOR_RE = re.compile(r'^\[data-sb-ref=["\']([^"\']+)["\']\]$')
+
+_SNAPSHOT_JS = r"""({ targetSelector, maxElements, includeShadow, includeIframes }) => {
+	const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'HEAD', 'TITLE', 'TEMPLATE']);
+	const INTERACTIVE_SEL = 'button, input, select, textarea, a[href], summary, [role="button"], [role="link"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"]';
+	const limit = Math.max(1, Number(maxElements) || 80);
+
+	const escIdent = (s) => (typeof CSS !== 'undefined' && CSS.escape)
+		? CSS.escape(String(s))
+		: String(s).replace(/([^\w-])/g, '\\$1');
+	const escAttr = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+	const isVisible = (el) => {
+		try {
+			const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+			const style = win.getComputedStyle(el);
+			if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+			const rect = el.getBoundingClientRect();
+			return rect.width > 0 && rect.height > 0;
+		} catch (_) {
+			return false;
+		}
+	};
+
+	const clearRefs = (root, visited) => {
+		if (!root || visited.has(root)) return;
+		visited.add(root);
+		try {
+			root.querySelectorAll('[data-sb-ref]').forEach((el) => el.removeAttribute('data-sb-ref'));
+		} catch (_) {}
+		let all = [];
+		try {
+			all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+		} catch (_) {}
+		for (const el of all) {
+			if (el.shadowRoot) clearRefs(el.shadowRoot, visited);
+			const tn = (el.tagName || '').toUpperCase();
+			if (tn === 'IFRAME' || tn === 'FRAME') {
+				try {
+					if (el.contentDocument) clearRefs(el.contentDocument, visited);
+				} catch (_) {}
+			}
+		}
+	};
+
+	clearRefs(document, new Set());
+
+	let startNode = document;
+	if (targetSelector && targetSelector !== 'body') {
+		try {
+			startNode = document.querySelector(targetSelector) || document;
+		} catch (_) {
+			startNode = document;
+		}
+	} else if (document.body) {
+		startNode = document.body;
+	}
+
+	const collected = [];
+	const seen = new Set();
+
+	const walk = (node, ctx) => {
+		if (!node || collected.length >= limit) return;
+		if (node.nodeType === 1) {
+			const tn = (node.tagName || '').toUpperCase();
+			if (SKIP_TAGS.has(tn) || seen.has(node)) return;
+			seen.add(node);
+
+			try {
+				if (node.matches && node.matches(INTERACTIVE_SEL) && isVisible(node)) {
+					collected.push({ el: node, ctx });
+					if (collected.length >= limit) return;
+				}
+			} catch (_) {}
+
+			if (includeShadow && node.shadowRoot) {
+				const shadowCtx = { rootNode: node.shadowRoot, inShadow: true, inIframe: ctx.inIframe };
+				for (const child of node.shadowRoot.children) {
+					walk(child, shadowCtx);
+					if (collected.length >= limit) return;
+				}
+			}
+
+			if (includeIframes && (tn === 'IFRAME' || tn === 'FRAME') && isVisible(node)) {
+				try {
+					const doc = node.contentDocument;
+					if (doc && doc.documentElement) {
+						const iframeCtx = { rootNode: doc, inShadow: ctx.inShadow, inIframe: true };
+						walk(doc.documentElement, iframeCtx);
+						if (collected.length >= limit) return;
+					}
+				} catch (_) {}
+			}
+
+			for (const child of node.children) {
+				walk(child, ctx);
+				if (collected.length >= limit) return;
+			}
+		} else if (node.children) {
+			for (const child of node.children) {
+				walk(child, ctx);
+				if (collected.length >= limit) return;
+			}
+		}
+	};
+
+	walk(startNode, { rootNode: document, inShadow: false, inIframe: false });
+
+	const isUnique = (root, sel, target) => {
+		if (!sel || !root || !root.querySelectorAll) return false;
+		try {
+			const matches = root.querySelectorAll(sel);
+			return matches.length === 1 && matches[0] === target;
+		} catch (_) {
+			return false;
+		}
+	};
+
+	const buildSelector = (el, tag, ref, ctx) => {
+		const refSel = `[data-sb-ref="${ref}"]`;
+		if (ctx.inShadow || ctx.inIframe) return refSel;
+
+		const candidates = [];
+		if (el.id) candidates.push(`#${escIdent(el.id)}`);
+		const testid = el.getAttribute('data-testid');
+		if (testid) candidates.push(`[data-testid="${escAttr(testid)}"]`);
+		if (el.name) candidates.push(`${tag}[name="${escAttr(el.name)}"]`);
+		const ariaLabel = el.getAttribute('aria-label');
+		if (ariaLabel && ariaLabel.length <= 60) {
+			candidates.push(`${tag}[aria-label="${escAttr(ariaLabel)}"]`);
+		}
+		if (typeof el.className === 'string' && el.className.trim()) {
+			const classes = el.className.trim().split(/\s+/).filter((c) => c && !c.includes(':'));
+			for (const cls of classes.slice(0, 3)) {
+				candidates.push(`${tag}.${escIdent(cls)}`);
+			}
+		}
+		if (el.type) candidates.push(`${tag}[type="${escAttr(el.type)}"]`);
+		candidates.push(tag);
+
+		for (const cand of candidates) {
+			if (isUnique(document, cand, el)) return cand;
+		}
+		return refSel;
+	};
+
+	return collected.map(({ el, ctx }, i) => {
+		const ref = `e${i}`;
+		el.setAttribute('data-sb-ref', ref);
+		const tag = (el.tagName || '').toLowerCase();
+		const id = el.id ? `#${el.id}` : '';
+		const name = el.name ? `[name="${el.name}"]` : '';
+		const type = el.type ? `[type="${el.type}"]` : '';
+		const role = el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]` : '';
+		const aria = el.getAttribute('aria-label') ? `aria-label="${el.getAttribute('aria-label')}"` : '';
+		const val = (el.value !== undefined && el.value !== '' && tag !== 'button') ? `val="${String(el.value).slice(0, 60)}"` : '';
+		const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+
+		let href = '';
+		if (tag === 'a') {
+			const rawHref = (el.getAttribute('href') || '').trim();
+			if (rawHref.startsWith('#') || rawHref.toLowerCase().startsWith('javascript:')) {
+				href = rawHref;
+			} else {
+				href = el.href || rawHref;
+			}
+			if (href.length > 120) href = href.slice(0, 117) + '...';
+		}
+
+		const scopeTags = [];
+		if (ctx.inIframe) scopeTags.push('[iframe]');
+		if (ctx.inShadow) scopeTags.push('[shadow]');
+
+		return {
+			index: i,
+			ref,
+			tag,
+			selector: buildSelector(el, tag, ref, ctx),
+			text,
+			href,
+			attrs: [id, name, type, role, aria, val, ...scopeTags].filter(Boolean).join(' ')
+		};
+	});
+}"""
+
+_JS_FIND_REF_HELPER = r"""const findByRef = (root, refId, visited) => {
+	if (!root || visited.has(root)) return null;
+	visited.add(root);
+	const safe = String(refId).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+	try {
+		const direct = root.querySelector('[data-sb-ref="' + safe + '"]');
+		if (direct) return direct;
+	} catch (_) {}
+	let all = [];
+	try {
+		all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+	} catch (_) {}
+	for (const el of all) {
+		if (el.shadowRoot) {
+			const hit = findByRef(el.shadowRoot, refId, visited);
+			if (hit) return hit;
+		}
+		const tn = (el.tagName || '').toUpperCase();
+		if (tn === 'IFRAME' || tn === 'FRAME') {
+			try {
+				if (el.contentDocument) {
+					const hit = findByRef(el.contentDocument, refId, visited);
+					if (hit) return hit;
+				}
+			} catch (_) {}
+		}
+	}
+	return null;
+};"""
+
+_JS_CLICK_REF = "({ refId }) => {\n" + _JS_FIND_REF_HELPER + r"""
+	const target = findByRef(document, refId, new Set());
+	if (!target) return false;
+	if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'center' });
+	target.click();
+	return true;
+}"""
+
+_JS_TYPE_REF = "({ refId, text, clearFirst, pressEnter }) => {\n" + _JS_FIND_REF_HELPER + r"""
+	const target = findByRef(document, refId, new Set());
+	if (!target) return false;
+	if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'center' });
+	if (target.focus) target.focus();
+	const nextVal = clearFirst ? String(text) : (String(target.value || '') + String(text));
+	const win = (target.ownerDocument && target.ownerDocument.defaultView) || window;
+	const proto = target.tagName === 'TEXTAREA'
+		? win.HTMLTextAreaElement && win.HTMLTextAreaElement.prototype
+		: win.HTMLInputElement && win.HTMLInputElement.prototype;
+	const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+	if (desc && desc.set) {
+		desc.set.call(target, nextVal);
+	} else {
+		target.value = nextVal;
+	}
+	target.dispatchEvent(new Event('input', { bubbles: true }));
+	target.dispatchEvent(new Event('change', { bubbles: true }));
+	if (pressEnter) {
+		target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+		target.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+	}
+	return true;
+}"""
+
+_JS_ANNOTATE_OVERLAY = r"""() => {
+	const existing = document.getElementById('__sb_annotation_overlay__');
+	if (existing) existing.remove();
+
+	const entries = [];
+	const collect = (root, ox, oy, visited) => {
+		if (!root || visited.has(root)) return;
+		visited.add(root);
+		let refs = [];
+		try {
+			refs = root.querySelectorAll ? root.querySelectorAll('[data-sb-ref]') : [];
+		} catch (_) {}
+		for (const el of refs) {
+			try {
+				const rect = el.getBoundingClientRect();
+				if (rect.width > 0 && rect.height > 0) {
+					entries.push({
+						ref: el.getAttribute('data-sb-ref') || '',
+						left: rect.left + ox,
+						top: rect.top + oy,
+						width: rect.width,
+						height: rect.height
+					});
+				}
+			} catch (_) {}
+		}
+		let all = [];
+		try {
+			all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+		} catch (_) {}
+		for (const el of all) {
+			if (el.shadowRoot) collect(el.shadowRoot, ox, oy, visited);
+			const tn = (el.tagName || '').toUpperCase();
+			if (tn === 'IFRAME' || tn === 'FRAME') {
+				try {
+					if (el.contentDocument) {
+						const ir = el.getBoundingClientRect();
+						collect(el.contentDocument, ox + ir.left, oy + ir.top, visited);
+					}
+				} catch (_) {}
+			}
+		}
+	};
+
+	collect(document, window.scrollX || 0, window.scrollY || 0, new Set());
+	if (entries.length === 0) return 0;
+
+	const container = document.createElement('div');
+	container.id = '__sb_annotation_overlay__';
+	container.style.cssText = 'position:absolute;top:0;left:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
+
+	for (const item of entries) {
+		const box = document.createElement('div');
+		box.style.cssText = `position:absolute;left:${item.left}px;top:${item.top}px;width:${item.width}px;height:${item.height}px;border:2px solid #e11d48;box-sizing:border-box;pointer-events:none;`;
+		const label = document.createElement('span');
+		label.textContent = item.ref;
+		const labelTop = item.top < 16 ? '0px' : '-16px';
+		label.style.cssText = `position:absolute;left:-2px;top:${labelTop};background:#e11d48;color:#ffffff;font:bold 11px/14px monospace;padding:0 4px;border-radius:2px;white-space:nowrap;pointer-events:none;`;
+		box.appendChild(label);
+		container.appendChild(box);
+	}
+
+	(document.body || document.documentElement).appendChild(container);
+	return entries.length;
+}"""
+
+_JS_REMOVE_OVERLAY = "() => { const el = document.getElementById('__sb_annotation_overlay__'); if (el) el.remove(); }"
+
+
+def _normalize_ref(ref: str) -> str:
+	r = (ref or "").strip()
+	if r.startswith("@"):
+		r = r[1:].strip()
+	return r
+
+
+def _ref_to_selector(ref_id: str) -> str:
+	escaped = ref_id.replace("\\", "\\\\").replace('"', '\\"')
+	return f'[data-sb-ref="{escaped}"]'
+
+
+def _secondary_frames(page: Page) -> list:
+	frames = getattr(page, "frames", None) or []
+	main_frame = getattr(page, "main_frame", None)
+	return [f for f in frames if f is not main_frame]
+
+
+async def _locator_has_match(loc) -> bool:
+	try:
+		cnt = await loc.count()
+		return isinstance(cnt, int) and cnt > 0
+	except Exception:
+		return False
+
+
+async def _first_visible_locator(loc):
+	try:
+		cnt = await loc.count()
+	except Exception:
+		return None
+	if not isinstance(cnt, int) or cnt <= 0:
+		return None
+	if cnt == 1:
+		first = loc.first
+		try:
+			vis = await first.is_visible()
+			if isinstance(vis, bool) and not vis:
+				return None
+		except Exception:
+			pass
+		return first
+	for idx in range(min(cnt, 10)):
+		item = loc.nth(idx)
+		try:
+			vis = await item.is_visible()
+			if not isinstance(vis, bool) or vis:
+				return item
+		except Exception:
+			return item
+	return None
+
+
+async def _resolve_locator(page: Page, selector: str = "", ref: str = "", text: str = "") -> tuple:
+	ref_id = _normalize_ref(ref)
+	if not ref_id and selector:
+		m = _SB_REF_SELECTOR_RE.match(selector.strip())
+		if m:
+			ref_id = m.group(1)
+
+	if ref_id:
+		ref_sel = _ref_to_selector(ref_id)
+		label = f"ref '{ref_id}'" if ref else f"'{selector}'"
+		main_loc = page.locator(ref_sel)
+		if await _locator_has_match(main_loc):
+			return main_loc.first, label, ref_id, True
+		for frame in _secondary_frames(page):
+			try:
+				floc = frame.locator(ref_sel)
+				if await _locator_has_match(floc):
+					return floc.first, label, ref_id, True
+			except Exception:
+				continue
+		return main_loc.first, label, ref_id, False
+
+	if selector:
+		return page.locator(selector).first, f"'{selector}'", "", True
+
+	if text:
+		label = f"text '{text}'"
+		scopes = [page] + _secondary_frames(page)
+		for scope in scopes:
+			if hasattr(scope, "get_by_role"):
+				for role in ("button", "link", "tab", "menuitem", "option"):
+					try:
+						cand = await _first_visible_locator(scope.get_by_role(role, name=text))
+						if cand is not None:
+							return cand, label, "", True
+					except Exception:
+						continue
+			if hasattr(scope, "get_by_text"):
+				try:
+					cand = await _first_visible_locator(scope.get_by_text(text))
+					if cand is not None:
+						return cand, label, "", True
+				except Exception:
+					continue
+		return page.get_by_text(text).first, label, "", False
+
+	return None, "", "", False
+
+
+async def _js_click_ref(page: Page, ref_id: str) -> bool:
+	try:
+		return bool(await asyncio.wait_for(page.evaluate(_JS_CLICK_REF, {"refId": ref_id}), timeout=5.0))
+	except Exception:
+		return False
+
+
+async def _js_type_ref(page: Page, ref_id: str, text: str, clear_first: bool = True, press_enter: bool = False) -> bool:
+	try:
+		return bool(
+			await asyncio.wait_for(
+				page.evaluate(
+					_JS_TYPE_REF,
+					{"refId": ref_id, "text": text, "clearFirst": clear_first, "pressEnter": press_enter},
+				),
+				timeout=5.0,
+			)
+		)
+	except Exception:
+		return False
+
+
+def _format_snapshot_row(el: dict, fallback_idx: int) -> str:
+	ref = el.get("ref") or f"e{el.get('index', fallback_idx)}"
+	tag = el.get("tag", "")
+	sel = str(el.get("selector", "")).replace("|", "\\|")
+	text = str(el.get("text", "")).replace("\n", " ").replace("|", "\\|").strip()
+	attrs = str(el.get("attrs", "")).replace("\n", " ").replace("|", "\\|").strip()
+	href = str(el.get("href", "") or "").replace("\n", " ").replace("|", "\\|").strip()
+	if href:
+		if len(href) > 120:
+			href = href[:117] + "..."
+		href_part = f"href={href}"
+		attrs = f"{attrs} {href_part}".strip() if attrs else href_part
+	if text and attrs:
+		desc = f"{text} ({attrs})"
+	elif attrs:
+		desc = f"({attrs})"
+	else:
+		desc = text
+	return f"| {ref} | `<{tag}>` | `{sel}` | {desc} |"
+
+
 @mcp.tool()
-async def snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1) -> str:
-	"""Extract interactive elements (buttons, inputs, links, selects, dropdowns) with exact selectors and values in a single high-speed call."""
+async def snapshot(
+	selector: str = "body",
+	max_elements: int = 80,
+	tab: int = -1,
+	include_shadow: bool = True,
+	include_iframes: bool = True,
+) -> str:
+	"""Extract interactive elements (buttons, inputs, links, selects, dropdowns) with ephemeral refs (e0, e1, ...), unique selectors, and link hrefs across DOM, open Shadow DOM, and same-origin iframes."""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
-		js_code = """({ targetSelector }) => {
-			const isVisible = (el) => {
-				const style = window.getComputedStyle(el);
-				return style && style.visibility !== 'hidden' && style.display !== 'none' && el.offsetWidth > 0 && el.offsetHeight > 0;
-			};
-			const root = (targetSelector && targetSelector !== 'body') ? (document.querySelector(targetSelector) || document) : document;
-			const nodes = Array.from(root.querySelectorAll(
-				'button, input, select, textarea, a[href], [role="button"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"]'
-			)).filter(isVisible);
-
-			return nodes.slice(0, 100).map((el, i) => {
-				const tag = el.tagName.toLowerCase();
-				const id = el.id ? `#${el.id}` : '';
-				const name = el.name ? `[name="${el.name}"]` : '';
-				const type = el.type ? `[type="${el.type}"]` : '';
-				const role = el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]` : '';
-				const aria = el.getAttribute('aria-label') ? `aria-label="${el.getAttribute('aria-label')}"` : '';
-				const val = el.value !== undefined && el.value !== '' ? `val="${el.value}"` : '';
-				const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 60);
-
-				let selector = el.id ? `#${el.id}` : (el.name ? `${tag}[name="${el.name}"]` : (el.getAttribute('data-testid') ? `[data-testid="${el.getAttribute('data-testid')}"]` : ''));
-				if (!selector && el.className && typeof el.className === 'string') {
-					const firstClass = el.className.split(' ').filter(c => c && !c.includes(':'))[0];
-					if (firstClass) selector = `${tag}.${firstClass}`;
-				}
-				if (!selector) selector = tag;
-
-				return {
-					index: i,
-					tag,
-					selector,
-					text,
-					attrs: [id, name, type, role, aria, val].filter(Boolean).join(' ')
-				};
-			});
-		}"""
 		try:
-			elements = await asyncio.wait_for(page.evaluate(js_code, {"targetSelector": selector}), timeout=10.0)
+			elements = await asyncio.wait_for(
+				page.evaluate(
+					_SNAPSHOT_JS,
+					{
+						"targetSelector": selector,
+						"maxElements": max_elements,
+						"includeShadow": include_shadow,
+						"includeIframes": include_iframes,
+					},
+				),
+				timeout=10.0,
+			)
 		except asyncio.TimeoutError:
-			return f"Error capturing snapshot: Timed out after 10000ms"
+			return "Error capturing snapshot: Timed out after 10000ms"
 		elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
 		if not elements:
@@ -1266,11 +1709,10 @@ async def snapshot(selector: str = "body", max_elements: int = 80, tab: int = -1
 
 		elements = elements[:max_elements]
 		lines = [f"Interactive elements snapshot for {page.url} ({elapsed_ms}ms, {len(elements)} items):", ""]
-		lines.append("| # | Tag | Selector | Text / Details |")
+		lines.append("| Ref | Tag | Selector | Text / Details |")
 		lines.append("|---|---|---|---|")
-		for el in elements:
-			desc = f"{el['text']} ({el['attrs']})" if el['attrs'] else el['text']
-			lines.append(f"| {el['index']} | `<{el['tag']}>` | `{el['selector']}` | {desc} |")
+		for idx, el in enumerate(elements):
+			lines.append(_format_snapshot_row(el, idx))
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Error capturing snapshot: {exc}"
@@ -1281,12 +1723,12 @@ async def batch(actions: list[dict], tab: int = -1) -> str:
 	"""Execute a pipeline of browser actions sequentially in a single turn for maximum speed (10-100x faster than roundtrips).
 
 	Supported action types in the dict:
-	- {"action": "click", "selector": "#btn", "timeout_ms": 3000}
-	- {"action": "fill", "selector": "#input", "text": "hello", "timeout_ms": 3000}
-	- {"action": "type", "selector": "#input", "text": "hello", "press_enter": True, "timeout_ms": 3000}
-	- {"action": "select", "selector": "select#country", "value": "CA", "timeout_ms": 3000}
+	- {"action": "click", "selector": "#btn", "ref": "e5", "text": "Sign In", "force": False, "timeout_ms": 3000}
+	- {"action": "fill", "selector": "#input", "ref": "e2", "text": "hello", "force": False, "timeout_ms": 3000}
+	- {"action": "type", "selector": "#input", "ref": "e2", "text": "hello", "press_enter": True, "timeout_ms": 3000}
+	- {"action": "select", "selector": "select#country", "ref": "e4", "value": "CA", "force": False, "timeout_ms": 3000}
 	- {"action": "press", "key": "Enter"}
-	- {"action": "wait_for", "selector": ".modal", "timeout_ms": 3000, "state": "visible"}
+	- {"action": "wait_for", "selector": ".modal", "ref": "e7", "timeout_ms": 3000, "state": "visible"}
 	- {"action": "sleep", "ms": 500}
 	- {"action": "evaluate", "expression": "window.scrollTo(0, 500)"}
 	"""
@@ -1297,45 +1739,69 @@ async def batch(actions: list[dict], tab: int = -1) -> str:
 		for idx, item in enumerate(actions):
 			act = item.get("action", "").lower()
 			timeout = item.get("timeout_ms", 4000)
+			sel = (item.get("selector") or "").strip()
+			ref = _normalize_ref(item.get("ref") or "")
+			force = bool(item.get("force", False))
 
 			if act == "click":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] click: SKIPPED (missing 'selector')")
+				text_target = item.get("text") or ""
+				if not (sel or ref or text_target):
+					results.append(f"[{idx}] click: SKIPPED (missing 'selector', 'ref', or 'text')")
 					continue
-				await page.locator(sel).first.click(timeout=timeout)
-				results.append(f"[{idx}] click '{sel}': OK")
+				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref, text=text_target)
+				try:
+					await loc.click(timeout=timeout, force=force)
+				except Exception:
+					if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
+						pass
+					else:
+						raise
+				force_tag = " (force)" if force else ""
+				results.append(f"[{idx}] click {label}{force_tag}: OK")
 
 			elif act == "fill":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] fill: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] fill: SKIPPED (missing 'selector' or 'ref')")
 					continue
-				text = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
-				await page.locator(sel).first.fill(text, timeout=timeout)
-				results.append(f"[{idx}] fill '{sel}': OK")
+				text_val = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
+				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref)
+				try:
+					await loc.fill(text_val, timeout=timeout, force=force)
+				except Exception:
+					if ref_id and (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=True, press_enter=False):
+						pass
+					else:
+						raise
+				results.append(f"[{idx}] fill {label}: OK")
 
 			elif act == "type":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] type: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] type: SKIPPED (missing 'selector' or 'ref')")
 					continue
-				text = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
-				press_enter = item.get("press_enter", False)
-				loc = page.locator(sel).first
-				await loc.type(text, timeout=timeout)
-				if press_enter:
-					await loc.press("Enter")
-				results.append(f"[{idx}] type '{sel}' ({'with Enter' if press_enter else ''}): OK")
+				text_val = str(item.get("text") if item.get("text") is not None else item.get("value", ""))
+				press_enter = bool(item.get("press_enter", False))
+				loc, label, ref_id, matched = await _resolve_locator(page, selector=sel, ref=ref)
+				try:
+					if force:
+						await loc.click(timeout=timeout, force=True)
+					await loc.type(text_val, timeout=timeout)
+					if press_enter:
+						await loc.press("Enter")
+				except Exception:
+					if ref_id and (not matched or force) and await _js_type_ref(page, ref_id, text_val, clear_first=False, press_enter=press_enter):
+						pass
+					else:
+						raise
+				results.append(f"[{idx}] type {label} ({'with Enter' if press_enter else ''}): OK")
 
 			elif act == "select":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] select: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] select: SKIPPED (missing 'selector' or 'ref')")
 					continue
 				val = str(item.get("value") if item.get("value") is not None else item.get("text", ""))
-				await page.locator(sel).first.select_option(val, timeout=timeout)
-				results.append(f"[{idx}] select '{sel}' option '{val}': OK")
+				loc, label, _, _ = await _resolve_locator(page, selector=sel, ref=ref)
+				await loc.select_option(val, timeout=timeout, force=force)
+				results.append(f"[{idx}] select {label} option '{val}': OK")
 
 			elif act == "press":
 				key = item.get("key") or item.get("button", "Enter")
@@ -1343,13 +1809,13 @@ async def batch(actions: list[dict], tab: int = -1) -> str:
 				results.append(f"[{idx}] press '{key}': OK")
 
 			elif act == "wait_for":
-				sel = item.get("selector")
-				if not sel:
-					results.append(f"[{idx}] wait_for: SKIPPED (missing 'selector')")
+				if not (sel or ref):
+					results.append(f"[{idx}] wait_for: SKIPPED (missing 'selector' or 'ref')")
 					continue
 				state = item.get("state", "visible")
-				await page.locator(sel).first.wait_for(state=state, timeout=timeout)
-				results.append(f"[{idx}] wait_for '{sel}' ({state}): OK")
+				loc, label, _, _ = await _resolve_locator(page, selector=sel, ref=ref)
+				await loc.wait_for(state=state, timeout=timeout)
+				results.append(f"[{idx}] wait_for {label} ({state}): OK")
 
 			elif act == "sleep":
 				ms = item.get("ms") or item.get("duration_ms", 200)
@@ -1414,34 +1880,73 @@ async def get_content(
 
 
 @mcp.tool()
-async def click(selector: str, tab: int = -1, timeout_ms: int = 5000) -> str:
-	"""Click an element on the active page or specified tab index by CSS selector, text, or XPath."""
+async def click(
+	selector: str = "",
+	ref: str = "",
+	text: str = "",
+	force: bool = False,
+	tab: int = -1,
+	timeout_ms: int = 5000,
+) -> str:
+	"""Click an element on the active page or specified tab index by CSS selector, snapshot ref (e.g. 'e12' or '@e12'), or visible text. Set force=True to bypass pointer-interception overlays."""
+	sel_clean = (selector or "").strip()
+	ref_clean = _normalize_ref(ref)
+	if not (sel_clean or ref_clean or text):
+		return "Error clicking element: provide at least one of 'selector', 'ref', or 'text'"
+	label = f"ref '{ref_clean}'" if ref_clean else (f"'{sel_clean}'" if sel_clean else f"text '{text}'")
 	try:
 		page = await session.resolve_page(tab)
-		locator = page.locator(selector).first
-		await locator.click(timeout=timeout_ms)
-		return f"Clicked element matching '{selector}' on {page.url}"
+		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean, text=text)
+		try:
+			await locator.click(timeout=timeout_ms, force=force)
+		except Exception:
+			if ref_id and (not matched or force) and await _js_click_ref(page, ref_id):
+				pass
+			else:
+				raise
+		force_tag = " (force)" if force else ""
+		return f"Clicked element matching {label}{force_tag} on {page.url}"
 	except Exception as exc:
-		return f"Error clicking element '{selector}': {exc}"
+		return f"Error clicking element {label}: {exc}"
 
 
 @mcp.tool()
-async def type(selector: str, text: str, clear_first: bool = True, press_enter: bool = False, tab: int = -1, timeout_ms: int = 5000) -> str:
-	"""Type text into an input field or textarea on the active page or specified tab index."""
+async def type(
+	selector: str = "",
+	text: str = "",
+	clear_first: bool = True,
+	press_enter: bool = False,
+	tab: int = -1,
+	timeout_ms: int = 5000,
+	ref: str = "",
+) -> str:
+	"""Type text into an input field or textarea on the active page or specified tab index by CSS selector or snapshot ref (e.g. 'e3' or '@e3')."""
+	sel_clean = (selector or "").strip()
+	ref_clean = _normalize_ref(ref)
+	if not (sel_clean or ref_clean):
+		return "Error typing: provide either 'selector' or 'ref'"
+	label = f"ref '{ref_clean}'" if ref_clean else f"'{sel_clean}'"
 	try:
 		page = await session.resolve_page(tab)
-		locator = page.locator(selector).first
-		if clear_first:
-			await locator.fill(text, timeout=timeout_ms)
-		else:
-			await locator.type(text, timeout=timeout_ms)
+		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean)
+		try:
+			if clear_first:
+				await locator.fill(text, timeout=timeout_ms)
+			else:
+				await locator.type(text, timeout=timeout_ms)
+			if press_enter:
+				await locator.press("Enter")
+		except Exception:
+			if ref_id and not matched and await _js_type_ref(page, ref_id, text, clear_first=clear_first, press_enter=press_enter):
+				pass
+			else:
+				raise
 
 		if press_enter:
-			await locator.press("Enter")
-			return f"Typed text into '{selector}' and pressed Enter"
-		return f"Typed text into '{selector}'"
+			return f"Typed text into {label} and pressed Enter"
+		return f"Typed text into {label}"
 	except Exception as exc:
-		return f"Error typing into '{selector}': {exc}"
+		return f"Error typing into {label}: {exc}"
 
 
 @mcp.tool()
@@ -1468,17 +1973,53 @@ async def scroll(direction: str = "down", amount: int = 600, tab: int = -1) -> s
 
 
 @mcp.tool()
-async def screenshot(save_path: str = "", tab: int = -1) -> str:
-	"""Capture a screenshot of the active page view or specified tab index and return the file path."""
+async def screenshot(
+	save_path: str = "",
+	tab: int = -1,
+	full_page: bool = False,
+	selector: str = "",
+	ref: str = "",
+	annotate: bool = False,
+) -> str:
+	"""Capture a screenshot of the active page, full page, or a specific element (by selector or snapshot ref). Set annotate=True to temporarily overlay snapshot ref labels (e0, e1, ...)."""
 	try:
 		page = await session.resolve_page(tab)
 		if not save_path:
 			timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 			save_path = f"/tmp/screenshot_{timestamp}.png"
 
-		await page.screenshot(path=save_path, full_page=False)
+		sel_clean = (selector or "").strip()
+		ref_clean = _normalize_ref(ref)
+		annotated_count = 0
+		try:
+			if annotate:
+				annotated_count = int(await asyncio.wait_for(page.evaluate(_JS_ANNOTATE_OVERLAY), timeout=10.0) or 0)
+				if annotated_count == 0:
+					await snapshot(tab=tab)
+					annotated_count = int(await asyncio.wait_for(page.evaluate(_JS_ANNOTATE_OVERLAY), timeout=10.0) or 0)
+
+			if sel_clean or ref_clean:
+				locator, _, _, _ = await _resolve_locator(page, selector=sel_clean, ref=ref_clean)
+				await locator.screenshot(path=save_path)
+			else:
+				await page.screenshot(path=save_path, full_page=full_page)
+		finally:
+			if annotate:
+				try:
+					await asyncio.wait_for(page.evaluate(_JS_REMOVE_OVERLAY), timeout=5.0)
+				except Exception:
+					pass
+
 		title = await page.title()
-		return f"Screenshot saved to: {save_path}\nPage Title: {title}\nURL: {page.url}"
+		extras = []
+		if sel_clean or ref_clean:
+			extras.append(f"Element: {f'ref {ref_clean}' if ref_clean else sel_clean}")
+		elif full_page:
+			extras.append("Mode: full_page")
+		if annotate:
+			extras.append(f"Annotated: {annotated_count} ref(s)")
+		extra_line = ("\n" + " | ".join(extras)) if extras else ""
+		return f"Screenshot saved to: {save_path}\nPage Title: {title}\nURL: {page.url}{extra_line}"
 	except Exception as exc:
 		return f"Error taking screenshot: {exc}"
 
