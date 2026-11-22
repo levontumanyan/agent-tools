@@ -7,7 +7,7 @@ name = "airbnb"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-	"pyairbnb>=0.0.12",
+	"pyairbnb>=2.2.8",
 	"geopy>=2.4.1",
 	"python-dotenv>=1.0.1",
 	"tqdm>=4.66.0",

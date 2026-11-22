@@ -100,7 +100,7 @@ def test_get_listing_calendar(mocker):
 	}
 	mock_session.get.return_value = mock_response
 	mocker.patch("src.fetcher._get_session", return_value=mock_session)
-	mocker.patch("src.fetcher._robust_pyairbnb_api_get", return_value="dummy_key")
+	mocker.patch("pyairbnb.api.get", return_value="dummy_key")
 
 	from src.fetcher import get_listing_calendar
 
@@ -136,7 +136,7 @@ def test_get_listing_calendar_node_response_and_400_retry(mocker):
 	}
 	mock_session.get.side_effect = [resp_400, resp_200]
 	mocker.patch("src.fetcher._get_session", return_value=mock_session)
-	mocker.patch("src.fetcher._robust_pyairbnb_api_get", return_value="dummy_key")
+	mocker.patch("pyairbnb.api.get", return_value="dummy_key")
 	mocker.patch(
 		"src.fetcher._get_operation_hash",
 		return_value="old_hash_" + "0" * 55,

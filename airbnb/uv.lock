@@ -25,7 +25,7 @@ dev = [
 requires-dist = [
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "geopy", specifier = ">=2.4.1" },
-    { name = "pyairbnb", specifier = ">=0.0.12" },
+    { name = "pyairbnb", specifier = ">=2.2.8" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "tqdm", specifier = ">=4.66.0" },
 ]
@@ -408,16 +408,16 @@ wheels = [
 
 [[package]]
 name = "pyairbnb"
-version = "2.2.5"
+version = "2.2.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "bs4" },
     { name = "curl-cffi" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b0/0f/894e4b26bbbbee4a0ed79b81b436a35197ef4d0347576af4299a67724d17/pyairbnb-2.2.5.tar.gz", hash = "sha256:8c48656b36f4d415d22e7463a6563e714367a1f1f80764d3bd434fe4234a850c", size = 41308, upload-time = "2026-11-20T02:12:49.127Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/50/2d8bc8ca2e1209267461394e4f9d9d81a50b7914e0ddfc79e4f8096a00c0/pyairbnb-2.2.8.tar.gz", hash = "sha256:05afcfbe5edab0233f55ce7da3f874802cbf5122c0666f450c5900bb52881ebc", size = 46872, upload-time = "2026-11-21T09:39:52.863Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e9/53/26abaef6260ee17cb8c8b112a87f9e48179a3f95b0a05bc6871435eb9882/pyairbnb-2.2.5-py3-none-any.whl", hash = "sha256:b133e727f57bfac1afc54826bbac1b5cdef08eeb91048e71ef1cf6c56fbb8dcc", size = 38805, upload-time = "2026-11-20T02:12:47.753Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/67/1e1398f6caa6f7521f49caeaa0b02685d11156211ef7a1813629c327e27c/pyairbnb-2.2.8-py3-none-any.whl", hash = "sha256:aabc2815c26b1b11fa213b6e7c0b3eb04395045254abeaec37762d92a3b86db8", size = 41236, upload-time = "2026-11-21T09:39:51.676Z" },
 ]
 
 [[package]]
