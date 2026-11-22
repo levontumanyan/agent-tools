@@ -1,0 +1,1488 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Audit local AGY transcripts and OpenCode databases for stealth-browser usage, errors, latency, and workarounds."""
+
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import re
+import sqlite3
+import statistics
+import sys
+import urllib.parse
+from pathlib import Path
+from typing import Any, Optional
+
+SCHEMA_VERSION = 1
+
+BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+SUMMARY_DB = Path.home() / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
+OPENCODE_DIR = Path.home() / ".local" / "share" / "opencode"
+
+KNOWN_TOOLS = (
+	"status",
+	"keep_alive",
+	"navigate",
+	"new_tab",
+	"set_media",
+	"snapshot",
+	"batch",
+	"get_content",
+	"click",
+	"type",
+	"press_key",
+	"scroll",
+	"screenshot",
+	"fetch",
+	"state",
+	"evaluate_js",
+	"switch_tab",
+	"close_tab",
+	"close_browser",
+	"restart_browser",
+	"set_headless",
+)
+
+SOFT_OUTCOMES = frozenset({"set_headless_refused", "snapshot_empty", "state_empty"})
+
+AUTH_KEYWORDS = (
+	"2fa",
+	"mfa",
+	"log in",
+	"login",
+	"sign in",
+	"captcha",
+	"passcode",
+	"apple passwords",
+)
+
+HEADER_LINE_RE = re.compile(r"^(Created At|Completed At):\s*(\S+)\s*$")
+NET_ERR_RE = re.compile(r"(net::ERR_[A-Z0-9_]+)")
+VALIDATION_RE = re.compile(
+	r"validation error for\s+(\S+)\s*\n\s*([^\n]+)",
+	re.IGNORECASE,
+)
+URL_HOST_RE = re.compile(r"https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
+STEALTH_OPENCODE_RE = re.compile(
+	r"^(?:mcp__)?stealth[-_]browser(?:__|:|_|\.)([a-z0-9_]+)$",
+	re.IGNORECASE,
+)
+
+
+def parse_since(spec: Optional[str]) -> Optional[datetime.datetime]:
+	if not spec:
+		return None
+	s = spec.strip()
+	now = datetime.datetime.now(datetime.timezone.utc)
+	m = re.fullmatch(r"(\d+)\s*([dhmw])", s.lower())
+	if m:
+		val = int(m.group(1))
+		unit = m.group(2)
+		delta = {
+			"m": datetime.timedelta(minutes=val),
+			"h": datetime.timedelta(hours=val),
+			"d": datetime.timedelta(days=val),
+			"w": datetime.timedelta(weeks=val),
+		}[unit]
+		return now - delta
+	try:
+		dt = datetime.datetime.fromisoformat(s)
+		if dt.tzinfo is None:
+			dt = dt.replace(tzinfo=datetime.datetime.now().astimezone().tzinfo)
+		return dt.astimezone(datetime.timezone.utc)
+	except ValueError as exc:
+		raise argparse.ArgumentTypeError(
+			f"Invalid --since value {spec!r}. Use e.g. 7d, 30d, 24h, or YYYY-MM-DD."
+		) from exc
+
+
+def parse_ts(value: Any) -> Optional[datetime.datetime]:
+	if value is None or value == "":
+		return None
+	if isinstance(value, (int, float)):
+		ts = value / 1000.0 if value > 1e11 else float(value)
+		try:
+			return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+		except (OSError, OverflowError, ValueError):
+			return None
+	if isinstance(value, str):
+		s = value.strip()
+		if s.endswith("Z"):
+			s = s[:-1] + "+00:00"
+		try:
+			dt = datetime.datetime.fromisoformat(s)
+			if dt.tzinfo is None:
+				dt = dt.replace(tzinfo=datetime.datetime.now().astimezone().tzinfo)
+			return dt.astimezone(datetime.timezone.utc)
+		except ValueError:
+			return None
+	return None
+
+
+def unquote(val: Any) -> Any:
+	if isinstance(val, str):
+		try:
+			return json.loads(val)
+		except Exception:
+			return val
+	return val
+
+
+def normalize_args(raw: Any) -> dict[str, Any]:
+	val = unquote(raw)
+	if isinstance(val, str):
+		try:
+			val = json.loads(val)
+		except Exception:
+			return {}
+	return val if isinstance(val, dict) else {}
+
+
+def strip_agy_headers(text: str) -> tuple[str, Optional[datetime.datetime], Optional[datetime.datetime]]:
+	if not text:
+		return "", None, None
+	lines = text.splitlines()
+	created: Optional[datetime.datetime] = None
+	completed: Optional[datetime.datetime] = None
+	body_start = 0
+	for idx, line in enumerate(lines):
+		m = HEADER_LINE_RE.match(line)
+		if not m:
+			body_start = idx
+			break
+		label, ts_str = m.group(1), m.group(2)
+		if label == "Created At" and created is None:
+			created = parse_ts(ts_str)
+		elif label == "Completed At" and completed is None:
+			completed = parse_ts(ts_str)
+		body_start = idx + 1
+	body = "\n".join(lines[body_start:]).strip()
+	return body, created, completed
+
+
+def matches_any_prefix(session_id: str, prefixes: list[str]) -> bool:
+	for prefix in prefixes:
+		if session_id == prefix or session_id.startswith(prefix):
+			return True
+	return False
+
+
+def should_audit_session(session_id: str, includes: list[str], excludes: list[str]) -> bool:
+	if includes and not matches_any_prefix(session_id, includes):
+		return False
+	if excludes and matches_any_prefix(session_id, excludes):
+		return False
+	return True
+
+
+def load_agy_titles() -> dict[str, str]:
+	titles: dict[str, str] = {}
+	if not SUMMARY_DB.exists():
+		return titles
+	try:
+		conn = sqlite3.connect(f"file:{SUMMARY_DB}?mode=ro", uri=True)
+		cur = conn.cursor()
+		tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+		for table in tables:
+			cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})")]
+			id_col = "conversation_id" if "conversation_id" in cols else ("id" if "id" in cols else None)
+			if id_col and "title" in cols:
+				for cid, title in cur.execute(f"SELECT {id_col}, title FROM {table}"):
+					if cid and title:
+						titles[str(cid)] = str(title)
+		conn.close()
+	except Exception:
+		pass
+	return titles
+
+
+def classify_outcome(tool: str, body: str, explicit_error: bool = False) -> Optional[str]:
+	if not body:
+		return "other_error" if explicit_error else None
+	bl = body.lower()
+	head = bl[:350]
+
+	if ("mcp tool call" in head and "timed out after" in head) or (
+		"encountered error in step execution" in head and "context deadline exceeded" in head
+	):
+		return "mcp_timeout_3m"
+	if "validation error for" in head:
+		return "validation_error"
+	if (
+		"mcp server connection closed unexpectedly" in head
+		or "failed to load: mcp server" in head
+		or "server name stealth-browser failed to load" in head
+	):
+		return "mcp_server_disconnect"
+	if bl.startswith("refusing to restart browser"):
+		return "set_headless_refused"
+	if bl.startswith("no interactive elements found"):
+		return "snapshot_empty"
+	if bl.startswith("no in-memory state stores"):
+		return "state_empty"
+	if bl.startswith("invalid tab index"):
+		return "invalid_tab_index"
+	if bl.startswith("element ") and "not found on page" in head:
+		return "selector_not_found"
+	if bl.startswith("disconnected:"):
+		return "browser_disconnected"
+	if bl.startswith("error clicking"):
+		return "click_error"
+	if bl.startswith("error typing"):
+		return "type_error"
+	if bl.startswith("navigation error:"):
+		return "navigation_error"
+	if bl.startswith("javascript execution error:"):
+		return "js_error"
+	if bl.startswith("batch failed"):
+		return "batch_error"
+	if bl.startswith(("error executing fetch:", "fetch error")):
+		return "fetch_error"
+	if bl.startswith("error capturing snapshot:"):
+		return "snapshot_error"
+	if bl.startswith("error detecting state:"):
+		return "state_error"
+	if bl.startswith(("error switching tab:", "error closing tab:", "error closing browser:", "error restarting browser:")):
+		return "lifecycle_error"
+	if bl.startswith(("error managing keep-alive:", "error updating media state:", "error pressing key", "error scrolling:", "error taking screenshot:", "error extracting content:")):
+		return "tool_error"
+	if tool == "status" and "(unresponsive / busy)" in bl:
+		return "tab_unresponsive"
+	if bl.startswith(("encountered error", "error ", "error:", "failed ")):
+		if "disconnected" in head or "target page, context or browser has been closed" in head or "connection refused" in head:
+			return "browser_disconnected"
+		if "timed out" in head or "timeout" in head:
+			return "tool_timeout"
+		return "other_error"
+	if explicit_error:
+		if "timed out" in head or "timeout" in head:
+			return "tool_timeout"
+		return "other_error"
+	return None
+
+
+def parse_validation_signature(tool: str, body: str, raw_args: dict[str, Any]) -> str:
+	m = VALIDATION_RE.search(body)
+	field = m.group(2).strip().split()[0] if m else "unknown_field"
+	passed = ",".join(sorted(str(k) for k in raw_args.keys())) if raw_args else "none"
+	return f"{tool}: field '{field}' (passed: {passed})"
+
+
+def detect_silent_param_mismatch(tool: str, raw_args: dict[str, Any]) -> Optional[str]:
+	if tool in ("close_tab", "switch_tab") and "index" not in raw_args:
+		bad = [k for k in ("tab", "tab_index") if k in raw_args]
+		if bad:
+			return f"{tool}: ignored '{','.join(bad)}' (expects 'index')"
+	return None
+
+
+def classify_click_reason(outcome: str, body: str) -> str:
+	if outcome in ("mcp_timeout_3m", "validation_error", "browser_disconnected", "mcp_server_disconnect"):
+		return outcome
+	bl = body.lower()
+	if "invalid tab index" in bl:
+		return "invalid_tab_index"
+	if "timeout" in bl or "timed out" in bl:
+		if "element is not visible" in bl or "not visible" in bl or "hidden" in bl:
+			return "hidden_or_not_visible"
+		if "intercepts pointer" in bl:
+			return "intercepted_by_overlay"
+		if "waiting for locator" in bl:
+			return "locator_not_found_timeout"
+		return "other_timeout"
+	if "detached" in bl or "execution context was destroyed" in bl:
+		return "detached_or_navigated"
+	if "strict mode violation" in bl:
+		return "strict_mode_violation"
+	if "target page, context or browser has been closed" in bl or "disconnected" in bl:
+		return "browser_disconnected"
+	return "other"
+
+
+def classify_status_reason(outcome: str, body: str) -> str:
+	if outcome in ("mcp_timeout_3m", "validation_error", "tab_unresponsive", "browser_disconnected", "mcp_server_disconnect"):
+		return outcome
+	bl = body.lower()
+	if "timed out" in bl:
+		return "mcp_timeout_3m"
+	if "unresponsive" in bl:
+		return "tab_unresponsive"
+	if "connection closed unexpectedly" in bl or "failed to load" in bl:
+		return "mcp_server_disconnect"
+	if "disconnected" in bl or "connection refused" in bl:
+		return "browser_disconnected"
+	return "other"
+
+
+def classify_navigate_reason(outcome: str, body: str) -> str:
+	if outcome in ("mcp_timeout_3m", "validation_error", "browser_disconnected", "mcp_server_disconnect"):
+		return outcome
+	m = NET_ERR_RE.search(body)
+	if m:
+		return m.group(1)
+	bl = body.lower()
+	if "service worker" in bl:
+		return "service_worker_frame_error"
+	if "timeout" in bl or "timed out" in bl:
+		return "nav_timeout"
+	if "target page, context or browser has been closed" in bl or "disconnected" in bl:
+		return "browser_disconnected"
+	return "other"
+
+
+def classify_js_intent(expr: str) -> tuple[str, list[str]]:
+	el = (expr or "").lower()
+	flags: list[str] = []
+	if "iframe" in el or "contentdocument" in el or "contentwindow" in el:
+		flags.append("iframe")
+	if "shadowroot" in el:
+		flags.append("shadow_root")
+	if "settimeout" in el or "new promise" in el or "mutationobserver" in el or "setinterval" in el:
+		flags.append("wait_or_poll")
+	if "download" in el or "blob:" in el or "createobjecturl" in el or "pdf" in el:
+		flags.append("download_or_pdf")
+	if "performance.getentries" in el or "console." in el:
+		flags.append("console_or_perf")
+	if "document.cookie" in el or "localstorage" in el or "sessionstorage" in el:
+		flags.append("storage_or_cookies")
+
+	if ".click(" in el or "new mouseevent" in el:
+		intent = "js_click_workaround"
+	elif ".value" in el and ("dispatchevent" in el or "input" in el or "change" in el or ".focus(" in el):
+		intent = "js_fill_workaround"
+	elif "fetch(" in el or "xmlhttprequest" in el:
+		intent = "js_fetch_or_xhr"
+	elif "shadowroot" in el or "contentdocument" in el or "iframe" in el:
+		intent = "shadow_or_iframe"
+	elif "blob:" in el or "createobjecturl" in el or ("download" in el and ("a." in el or "href" in el or "pdf" in el)):
+		intent = "download_or_pdf_hack"
+	elif "performance.getentries" in el or "console." in el:
+		intent = "console_perf_network"
+	elif "settimeout" in el or "new promise" in el or "mutationobserver" in el:
+		intent = "wait_or_poll_hack"
+	elif ("queryselectorall" in el or "document.links" in el) and ("href" in el or "a[" in el or "'a'" in el or '"a"' in el):
+		intent = "extract_links"
+	elif "innertext" in el or "textcontent" in el or "innerhtml" in el or "outerhtml" in el:
+		intent = "extract_text_targeted"
+	elif "scrollto" in el or "scrollinto" in el or "scrollby" in el or "scrollheight" in el or "scrolly" in el:
+		intent = "scroll_control"
+	elif "document.cookie" in el or "localstorage" in el or "sessionstorage" in el:
+		intent = "storage_or_cookies"
+	elif "location.href" in el or "document.title" in el or "window.location" in el or "history." in el:
+		intent = "page_info_url_title"
+	elif "queryselector" in el or "getelement" in el or "getboundingclientrect" in el or "getcomputedstyle" in el:
+		intent = "dom_inspect_other"
+	else:
+		intent = "other"
+	return intent, flags
+
+
+def extract_domain(url: Any) -> Optional[str]:
+	if not isinstance(url, str) or not url:
+		return None
+	u = url.strip()
+	if u.startswith(("about:", "chrome:", "javascript:", "data:")):
+		return None
+	if "://" not in u and "." in u and " " not in u:
+		u = "https://" + u
+	host = urllib.parse.urlparse(u).netloc.lower()
+	if ":" in host:
+		host = host.split(":", 1)[0]
+	if host in ("", "127.0.0.1", "localhost"):
+		return None
+	return host
+
+
+def percentile(values: list[float], pct: float) -> float:
+	if not values:
+		return 0.0
+	s = sorted(values)
+	if len(s) == 1:
+		return float(s[0])
+	idx = (len(s) - 1) * (pct / 100.0)
+	lo = int(idx)
+	hi = min(lo + 1, len(s) - 1)
+	frac = idx - lo
+	return float(s[lo] * (1.0 - frac) + s[hi] * frac)
+
+
+def extract_opencode_tool_name(raw_name: str) -> tuple[Optional[str], Optional[str]]:
+	m = STEALTH_OPENCODE_RE.match(raw_name.strip())
+	if m:
+		return "stealth-browser", m.group(1)
+	nl = raw_name.lower()
+	if any(k in nl for k in ("playwright", "chrome-devtools", "chrome_devtools", "puppeteer", "browser_")):
+		return "other", raw_name
+	return None, None
+
+
+def extract_opencode_output(item: dict[str, Any]) -> tuple[str, bool]:
+	state = item.get("state") if isinstance(item.get("state"), dict) else {}
+	err = state.get("error") or item.get("error") or ""
+	status = str(state.get("status") or "").lower()
+	parts: list[str] = []
+	if err:
+		parts.append(str(err))
+	content = state.get("content")
+	if isinstance(content, list):
+		for chunk in content:
+			if isinstance(chunk, dict) and chunk.get("text"):
+				parts.append(str(chunk["text"]))
+			elif isinstance(chunk, str):
+				parts.append(chunk)
+	elif isinstance(content, str) and content:
+		parts.append(content)
+	out = state.get("output") or item.get("output")
+	if isinstance(out, dict):
+		parts.append(json.dumps(out))
+	elif isinstance(out, str) and out:
+		parts.append(out)
+	return "\n".join(parts).strip(), bool(err or status == "error")
+
+
+class AuditCollector:
+	def __init__(
+		self,
+		since: Optional[datetime.datetime],
+		includes: list[str],
+		excludes: list[str],
+		slow_threshold: float,
+		max_samples: int,
+	):
+		self.since = since
+		self.includes = includes
+		self.excludes = excludes
+		self.slow_threshold = slow_threshold
+		self.max_samples = max_samples
+
+		self.sessions: list[dict[str, Any]] = []
+		self.by_source = collections.Counter()
+		self.sessions_by_source = collections.Counter()
+		self.tool_counts = collections.Counter()
+		self.tool_errors = collections.defaultdict(collections.Counter)
+		self.tool_soft = collections.defaultdict(collections.Counter)
+		self.error_counts = collections.Counter()
+		self.soft_counts = collections.Counter()
+		self.error_samples: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+		self.validation_errors = collections.Counter()
+		self.silent_param_mismatches = collections.Counter()
+		self.click_reasons = collections.Counter()
+		self.click_samples: list[dict[str, Any]] = []
+		self.status_reasons = collections.Counter()
+		self.status_samples: list[dict[str, Any]] = []
+		self.navigate_reasons = collections.Counter()
+		self.js_intents = collections.Counter()
+		self.js_flags = collections.Counter()
+		self.js_samples: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+		self.domains = collections.Counter()
+		self.call_chars: dict[str, list[int]] = collections.defaultdict(list)
+		self.call_latencies: dict[str, list[float]] = collections.defaultdict(list)
+		self.slow_calls: list[dict[str, Any]] = []
+		self.approval_wait_calls: list[dict[str, Any]] = []
+		self.mcp_timeouts: list[dict[str, Any]] = []
+		self.consecutive_same_tool = collections.Counter()
+		self.error_then_retry = 0
+		self.schema_reads_total = 0
+		self.schema_reads_in_browser_sessions = 0
+		self.screenshot_total = 0
+		self.screenshot_followed_by_read = 0
+		self.headless_switches: list[dict[str, Any]] = []
+		self.other_browser_mcps = collections.Counter()
+		self.browser_subagents: list[dict[str, Any]] = []
+		self.auth_sessions = 0
+
+	def _record_call(
+		self,
+		source: str,
+		sid: str,
+		title: str,
+		tool: str,
+		raw_args: dict[str, Any],
+		body: str,
+		explicit_error: bool,
+		duration_s: Optional[float],
+		sess_state: dict[str, Any],
+	) -> None:
+		self.by_source[source] += 1
+		self.tool_counts[tool] += 1
+		self.call_chars[tool].append(len(body))
+
+		sess_state["calls"] += 1
+		sess_state["chars"] += len(body)
+		sess_state["tools"][tool] += 1
+
+		if sess_state["prev_tool"] == tool:
+			self.consecutive_same_tool[tool] += 1
+			if sess_state["prev_errored"]:
+				self.error_then_retry += 1
+
+		if tool == "screenshot":
+			self.screenshot_total += 1
+		if tool == "set_headless":
+			self.headless_switches.append({
+				"source": source,
+				"sid": sid[:12],
+				"title": title[:40],
+				"args": raw_args,
+				"out": body[:160].replace("\n", " "),
+			})
+
+		host = extract_domain(raw_args.get("url"))
+		if host:
+			self.domains[host] += 1
+			sess_state["domains"].add(host)
+		for m in URL_HOST_RE.findall(body[:4000]):
+			h = m.lower()
+			if h not in ("127.0.0.1", "localhost", "errors.pydantic.dev"):
+				sess_state["domains"].add(h)
+
+		if tool == "evaluate_js":
+			expr = str(raw_args.get("expression") or raw_args.get("script") or "")
+			intent, flags = classify_js_intent(expr)
+			self.js_intents[intent] += 1
+			for fl in flags:
+				self.js_flags[fl] += 1
+			if len(self.js_samples[intent]) < max(self.max_samples, 3):
+				self.js_samples[intent].append({
+					"sid": sid[:10],
+					"title": title[:35],
+					"expr": expr[:200].replace("\n", " "),
+				})
+
+		outcome = classify_outcome(tool, body, explicit_error=explicit_error)
+		is_hard_error = bool(outcome and outcome not in SOFT_OUTCOMES)
+
+		if outcome != "validation_error":
+			silent_mismatch = detect_silent_param_mismatch(tool, raw_args)
+			if silent_mismatch:
+				self.silent_param_mismatches[silent_mismatch] += 1
+
+		if duration_s is not None and duration_s >= 0:
+			if outcome == "mcp_timeout_3m":
+				self.mcp_timeouts.append({
+					"duration_s": round(duration_s, 1),
+					"source": source,
+					"sid": sid[:10],
+					"title": title[:35],
+					"tool": tool,
+					"args": json.dumps(raw_args)[:100],
+				})
+			elif duration_s > 180.0:
+				# AGY enforces a 180s MCP call timeout, so >180s non-timeout durations include user approval waits.
+				tail = body.splitlines()[-1][:140] if body.splitlines() else ""
+				self.approval_wait_calls.append({
+					"duration_s": round(duration_s, 1),
+					"source": source,
+					"sid": sid[:10],
+					"title": title[:35],
+					"tool": tool,
+					"args": json.dumps(raw_args)[:100],
+					"tail": tail,
+				})
+			else:
+				self.call_latencies[tool].append(duration_s)
+				if duration_s >= self.slow_threshold:
+					tail = body.splitlines()[-1][:140] if body.splitlines() else ""
+					self.slow_calls.append({
+						"duration_s": round(duration_s, 1),
+						"source": source,
+						"sid": sid[:10],
+						"title": title[:35],
+						"tool": tool,
+						"args": json.dumps(raw_args)[:100],
+						"tail": tail,
+					})
+		elif outcome == "mcp_timeout_3m":
+			self.mcp_timeouts.append({
+				"duration_s": None,
+				"source": source,
+				"sid": sid[:10],
+				"title": title[:35],
+				"tool": tool,
+				"args": json.dumps(raw_args)[:100],
+			})
+
+		if outcome in SOFT_OUTCOMES:
+			self.soft_counts[outcome] += 1
+			self.tool_soft[tool][outcome] += 1
+		elif outcome:
+			self.error_counts[outcome] += 1
+			self.tool_errors[tool][outcome] += 1
+			sess_state["errors"] += 1
+			if len(self.error_samples[outcome]) < max(self.max_samples, 4):
+				self.error_samples[outcome].append({
+					"source": source,
+					"sid": sid[:10],
+					"title": title[:35],
+					"tool": tool,
+					"args": json.dumps(raw_args)[:140],
+					"out": body[:220].replace("\n", " "),
+				})
+			if outcome == "validation_error":
+				sig = parse_validation_signature(tool, body, raw_args)
+				self.validation_errors[sig] += 1
+			if tool == "click":
+				reason = classify_click_reason(outcome, body)
+				self.click_reasons[reason] += 1
+				if len(self.click_samples) < max(self.max_samples, 5):
+					self.click_samples.append({
+						"sid": sid[:10],
+						"selector": str(raw_args.get("selector", ""))[:80],
+						"reason": reason,
+						"out": body[:180].replace("\n", " "),
+					})
+			elif tool == "status":
+				reason = classify_status_reason(outcome, body)
+				self.status_reasons[reason] += 1
+				if len(self.status_samples) < max(self.max_samples, 5):
+					self.status_samples.append({
+						"sid": sid[:10],
+						"reason": reason,
+						"out": body[:180].replace("\n", " "),
+					})
+			elif tool == "navigate":
+				reason = classify_navigate_reason(outcome, body)
+				self.navigate_reasons[reason] += 1
+
+		sess_state["prev_tool"] = tool
+		sess_state["prev_errored"] = is_hard_error
+		sess_state["prev_was_screenshot"] = tool == "screenshot"
+
+	def _finalize_session(self, source: str, sid: str, title: str, sess_state: dict[str, Any], raw_text_lower: str) -> None:
+		self.schema_reads_total += sess_state["schema_reads"]
+		if sess_state["calls"] <= 0:
+			return
+		self.sessions_by_source[source] += 1
+		self.schema_reads_in_browser_sessions += sess_state["schema_reads"]
+		if any(k in raw_text_lower for k in AUTH_KEYWORDS):
+			self.auth_sessions += 1
+		self.sessions.append({
+			"source": source,
+			"sid": sid,
+			"date": sess_state["date"],
+			"title": title or "(untitled)",
+			"calls": sess_state["calls"],
+			"errors": sess_state["errors"],
+			"schema_reads": sess_state["schema_reads"],
+			"chars": sess_state["chars"],
+			"domains": sorted(sess_state["domains"])[:5],
+			"top_tools": sess_state["tools"].most_common(4),
+		})
+
+	def collect_agy(self) -> None:
+		if not BRAIN_DIR.exists():
+			return
+		titles = load_agy_titles()
+		paths = sorted(glob.glob(str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")))
+
+		for path_str in paths:
+			path = Path(path_str)
+			cid = path.parts[-4]
+			if not should_audit_session(cid, self.includes, self.excludes):
+				continue
+
+			if self.since is not None:
+				try:
+					mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=datetime.timezone.utc)
+					if mtime < self.since:
+						continue
+				except OSError:
+					continue
+
+			try:
+				raw = path.read_text(encoding="utf-8", errors="ignore")
+			except OSError:
+				continue
+
+			if (
+				"stealth-browser" not in raw
+				and "chrome-devtools" not in raw
+				and "playwright" not in raw
+				and '"browser"' not in raw
+				and '\\"browser\\"' not in raw
+			):
+				continue
+
+			steps: list[dict[str, Any]] = []
+			for line in raw.splitlines():
+				if not line.strip():
+					continue
+				try:
+					steps.append(json.loads(line))
+				except Exception:
+					continue
+
+			sess_state: dict[str, Any] = {
+				"calls": 0,
+				"errors": 0,
+				"schema_reads": 0,
+				"chars": 0,
+				"domains": set(),
+				"tools": collections.Counter(),
+				"date": "",
+				"prev_tool": None,
+				"prev_errored": False,
+				"prev_was_screenshot": False,
+			}
+			file_dt = datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=datetime.timezone.utc)
+			title = titles.get(cid, "")
+
+			for i, step in enumerate(steps):
+				tcs = step.get("tool_calls") or []
+				if not tcs:
+					continue
+				step_dt = parse_ts(step.get("created_at")) or file_dt
+
+				generic_outputs: list[str] = []
+				j = i + 1
+				while j < len(steps) and steps[j].get("type") != "PLANNER_RESPONSE":
+					if steps[j].get("type") == "GENERIC":
+						generic_outputs.append(str(steps[j].get("content", "")))
+					j += 1
+
+				for idx, tc in enumerate(tcs):
+					name = tc.get("name", "")
+					args = tc.get("args") or {}
+					out = generic_outputs[idx] if idx < len(generic_outputs) else ""
+					body, created_dt, completed_dt = strip_agy_headers(out)
+					call_dt = created_dt or step_dt
+
+					if self.since is not None and call_dt < self.since:
+						continue
+
+					if name == "read_file":
+						p = str(unquote(args.get("Path", "")))
+						if "/mcp/stealth-browser/" in p:
+							sess_state["schema_reads"] += 1
+						if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
+							self.screenshot_followed_by_read += 1
+							sess_state["prev_was_screenshot"] = False
+						continue
+
+					if name == "invoke_subagent":
+						tn = str(unquote(args.get("TypeName", "")))
+						if "browser" in tn.lower():
+							self.browser_subagents.append({
+								"sid": cid[:10],
+								"title": title[:40],
+								"type": tn,
+								"role": str(unquote(args.get("Role", ""))),
+							})
+						continue
+
+					if name != "call_mcp_tool":
+						continue
+
+					srv = str(unquote(args.get("ServerName", "")))
+					tool = str(unquote(args.get("ToolName", "")))
+					raw_args = normalize_args(args.get("Arguments", {}))
+
+					if srv != "stealth-browser":
+						if any(k in srv.lower() for k in ("browser", "chrome", "playwright")):
+							self.other_browser_mcps[f"{srv}:{tool}"] += 1
+						continue
+
+					if not sess_state["date"]:
+						sess_state["date"] = call_dt.astimezone().strftime("%Y-%m-%d")
+
+					duration_s: Optional[float] = None
+					if created_dt and completed_dt:
+						duration_s = (completed_dt - created_dt).total_seconds()
+
+					self._record_call(
+						source="agy",
+						sid=cid,
+						title=title,
+						tool=tool,
+						raw_args=raw_args,
+						body=body,
+						explicit_error=False,
+						duration_s=duration_s,
+						sess_state=sess_state,
+					)
+
+			self._finalize_session("agy", cid, title, sess_state, raw.lower())
+
+	def collect_opencode(self) -> None:
+		if not OPENCODE_DIR.exists():
+			return
+		db_paths = sorted(p for p in OPENCODE_DIR.glob("opencode*.db") if p.is_file())
+		seen_call_ids: set[str] = set()
+
+		for db_path in db_paths:
+			try:
+				conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+			except sqlite3.Error:
+				continue
+
+			try:
+				cur = conn.cursor()
+				tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+				sess_table = "session_v2" if "session_v2" in tables else ("session" if "session" in tables else None)
+				titles: dict[str, str] = {}
+				if sess_table:
+					for sid, title in cur.execute(f"SELECT id, title FROM {sess_table}"):
+						titles[str(sid)] = str(title or "")
+
+				per_session: dict[str, dict[str, Any]] = {}
+				per_session_text: dict[str, list[str]] = collections.defaultdict(list)
+
+				def get_sess(sid: str) -> dict[str, Any]:
+					if sid not in per_session:
+						per_session[sid] = {
+							"calls": 0,
+							"errors": 0,
+							"schema_reads": 0,
+							"chars": 0,
+							"domains": set(),
+							"tools": collections.Counter(),
+							"date": "",
+							"prev_tool": None,
+							"prev_errored": False,
+							"prev_was_screenshot": False,
+						}
+					return per_session[sid]
+
+				def handle_tool_item(sid: str, row_ts: Any, item: dict[str, Any]) -> None:
+					if not should_audit_session(sid, self.includes, self.excludes):
+						return
+					call_id = str(item.get("id") or item.get("callID") or item.get("call_id") or "")
+					if call_id:
+						if call_id in seen_call_ids:
+							return
+						seen_call_ids.add(call_id)
+
+					raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "")
+					state = item.get("state") if isinstance(item.get("state"), dict) else {}
+					time_info = state.get("time") if isinstance(state.get("time"), dict) else {}
+					start_dt = parse_ts(time_info.get("start")) or parse_ts(row_ts)
+					end_dt = parse_ts(time_info.get("end"))
+					if self.since is not None and start_dt is not None and start_dt < self.since:
+						return
+
+					inp = normalize_args(item.get("args") or item.get("input") or state.get("input") or {})
+					sess_state = get_sess(sid)
+
+					if raw_name in ("read", "read_file"):
+						p = str(inp.get("path") or inp.get("filePath") or inp.get("Path") or "")
+						if "/mcp/stealth-browser/" in p:
+							sess_state["schema_reads"] += 1
+						if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
+							self.screenshot_followed_by_read += 1
+							sess_state["prev_was_screenshot"] = False
+						return
+
+					kind, tool = extract_opencode_tool_name(raw_name)
+					if kind == "other" and tool:
+						self.other_browser_mcps[f"opencode:{tool}"] += 1
+						return
+					if kind != "stealth-browser" or not tool:
+						return
+
+					if not sess_state["date"] and start_dt:
+						sess_state["date"] = start_dt.astimezone().strftime("%Y-%m-%d")
+
+					duration_s: Optional[float] = None
+					if start_dt and end_dt:
+						duration_s = (end_dt - start_dt).total_seconds()
+
+					body, explicit_err = extract_opencode_output(item)
+					self._record_call(
+						source="opencode",
+						sid=sid,
+						title=titles.get(sid, ""),
+						tool=tool,
+						raw_args=inp,
+						body=body,
+						explicit_error=explicit_err,
+						duration_s=duration_s,
+						sess_state=sess_state,
+					)
+
+				if "session_message" in tables:
+					rows = cur.execute(
+						"SELECT session_id, time_created, data FROM session_message "
+						"WHERE data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%'"
+					).fetchall()
+					for sid, tc, raw in rows:
+						sid = str(sid)
+						if not should_audit_session(sid, self.includes, self.excludes):
+							continue
+						per_session_text[sid].append(raw[:2000].lower())
+						try:
+							obj = json.loads(raw)
+						except Exception:
+							continue
+						content = obj.get("content")
+						if not isinstance(content, list):
+							continue
+						for item in content:
+							if isinstance(item, dict) and item.get("type") in ("tool", "tool-call", "tool_use"):
+								handle_tool_item(sid, tc, item)
+
+				for part_table in ("session_part", "part"):
+					if part_table not in tables:
+						continue
+					rows = cur.execute(
+						f"SELECT session_id, time_created, data FROM {part_table} "
+						"WHERE type = 'tool' AND (data LIKE '%stealth%' OR data LIKE '%playwright%' OR data LIKE '%chrome%')"
+					).fetchall()
+					for sid, tc, raw in rows:
+						sid = str(sid)
+						if not should_audit_session(sid, self.includes, self.excludes):
+							continue
+						per_session_text[sid].append(raw[:2000].lower())
+						try:
+							item = json.loads(raw)
+						except Exception:
+							continue
+						if isinstance(item, dict):
+							handle_tool_item(sid, tc, item)
+
+				for sid, sess_state in per_session.items():
+					self._finalize_session(
+						"opencode",
+						sid,
+						titles.get(sid, ""),
+						sess_state,
+						" ".join(per_session_text.get(sid, [])),
+					)
+			except sqlite3.Error:
+				pass
+			finally:
+				conn.close()
+
+	def build_snapshot(self, since_spec: Optional[str], source_filter: str) -> dict[str, Any]:
+		total_calls = sum(self.tool_counts.values())
+		total_sessions = len(self.sessions)
+		total_errors = sum(self.error_counts.values())
+		total_soft = sum(self.soft_counts.values())
+		eval_calls = self.tool_counts.get("evaluate_js", 0)
+		eval_pct = round(100.0 * eval_calls / total_calls, 2) if total_calls else 0.0
+		err_pct = round(100.0 * total_errors / total_calls, 2) if total_calls else 0.0
+
+		sess_calls = [s["calls"] for s in self.sessions]
+		sess_chars = [s["chars"] for s in self.sessions]
+		total_chars = sum(sess_chars)
+
+		tools_summary: dict[str, dict[str, Any]] = {}
+		for tool, cnt in self.tool_counts.most_common():
+			errs = sum(self.tool_errors[tool].values())
+			soft = sum(self.tool_soft[tool].values())
+			chars_list = self.call_chars[tool]
+			lats = self.call_latencies[tool]
+			tools_summary[tool] = {
+				"calls": cnt,
+				"share_pct": round(100.0 * cnt / total_calls, 2) if total_calls else 0.0,
+				"errors": errs,
+				"error_rate_pct": round(100.0 * errs / cnt, 2) if cnt else 0.0,
+				"soft_outcomes": soft,
+				"avg_chars": round(sum(chars_list) / len(chars_list), 1) if chars_list else 0.0,
+				"total_chars": sum(chars_list),
+				"median_latency_s": round(statistics.median(lats), 2) if lats else None,
+				"p95_latency_s": round(percentile(lats, 95), 2) if lats else None,
+				"error_types": dict(self.tool_errors[tool].most_common()),
+			}
+
+		underused = []
+		for tool in KNOWN_TOOLS:
+			cnt = self.tool_counts.get(tool, 0)
+			share = round(100.0 * cnt / total_calls, 2) if total_calls else 0.0
+			if cnt == 0 or share < 1.0:
+				underused.append({"tool": tool, "calls": cnt, "share_pct": share})
+		underused.sort(key=lambda x: (x["calls"], x["tool"]))
+
+		all_lats = [v for vals in self.call_latencies.values() for v in vals]
+
+		return {
+			"schema_version": SCHEMA_VERSION,
+			"generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+			"filters": {
+				"since": since_spec,
+				"since_utc": self.since.isoformat() if self.since else None,
+				"source": source_filter,
+				"included_ids": self.includes,
+				"excluded_ids": self.excludes,
+				"slow_threshold_s": self.slow_threshold,
+			},
+			"summary": {
+				"sessions": total_sessions,
+				"sessions_by_source": dict(self.sessions_by_source),
+				"total_calls": total_calls,
+				"calls_by_source": dict(self.by_source),
+				"total_errors": total_errors,
+				"error_rate_pct": err_pct,
+				"total_soft_outcomes": total_soft,
+				"evaluate_js_calls": eval_calls,
+				"evaluate_js_share_pct": eval_pct,
+				"mcp_timeouts_3m": len(self.mcp_timeouts),
+				"slow_non_timeout_calls": len(self.slow_calls),
+				"approval_wait_calls_gt_180s": len(self.approval_wait_calls),
+				"validation_errors_total": sum(self.validation_errors.values()),
+				"silent_param_mismatches_total": sum(self.silent_param_mismatches.values()),
+				"schema_reads_total": self.schema_reads_total,
+				"schema_reads_in_browser_sessions": self.schema_reads_in_browser_sessions,
+				"schema_reads_per_session": round(self.schema_reads_in_browser_sessions / total_sessions, 2) if total_sessions else 0.0,
+				"auth_or_login_sessions": self.auth_sessions,
+				"auth_or_login_pct": round(100.0 * self.auth_sessions / total_sessions, 1) if total_sessions else 0.0,
+				"screenshot_total": self.screenshot_total,
+				"screenshot_followed_by_read": self.screenshot_followed_by_read,
+				"error_then_retry": self.error_then_retry,
+				"total_output_chars": total_chars,
+				"calls_per_session": {
+					"median": round(statistics.median(sess_calls), 1) if sess_calls else 0.0,
+					"mean": round(statistics.mean(sess_calls), 1) if sess_calls else 0.0,
+					"p90": round(percentile([float(x) for x in sess_calls], 90), 1) if sess_calls else 0.0,
+					"max": max(sess_calls) if sess_calls else 0,
+				},
+				"chars_per_session": {
+					"median": int(statistics.median(sess_chars)) if sess_chars else 0,
+					"mean": int(statistics.mean(sess_chars)) if sess_chars else 0,
+					"p90": int(percentile([float(x) for x in sess_chars], 90)) if sess_chars else 0,
+					"max": max(sess_chars) if sess_chars else 0,
+				},
+				"latency_non_timeout_s": {
+					"samples": len(all_lats),
+					"median": round(statistics.median(all_lats), 2) if all_lats else 0.0,
+					"p95": round(percentile(all_lats, 95), 2) if all_lats else 0.0,
+					"max": round(max(all_lats), 2) if all_lats else 0.0,
+				},
+			},
+			"tools": tools_summary,
+			"underused_tools": underused,
+			"errors": {
+				"by_type": dict(self.error_counts.most_common()),
+				"soft_outcomes": dict(self.soft_counts.most_common()),
+				"validation_errors": dict(self.validation_errors.most_common()),
+				"silent_param_mismatches": dict(self.silent_param_mismatches.most_common()),
+				"click_reasons": dict(self.click_reasons.most_common()),
+				"status_reasons": dict(self.status_reasons.most_common()),
+				"navigate_reasons": dict(self.navigate_reasons.most_common()),
+				"samples": dict(self.error_samples),
+				"click_samples": self.click_samples,
+				"status_samples": self.status_samples,
+			},
+			"evaluate_js": {
+				"total": eval_calls,
+				"share_pct": eval_pct,
+				"intents": dict(self.js_intents.most_common()),
+				"feature_flags": dict(self.js_flags.most_common()),
+				"samples": dict(self.js_samples),
+			},
+			"latency": {
+				"mcp_timeouts": self.mcp_timeouts,
+				"slow_calls": sorted(self.slow_calls, key=lambda x: x["duration_s"], reverse=True),
+				"approval_wait_calls_gt_180s": sorted(self.approval_wait_calls, key=lambda x: x["duration_s"], reverse=True),
+			},
+			"domains": dict(self.domains.most_common()),
+			"other_browser_mcps": dict(self.other_browser_mcps.most_common()),
+			"browser_subagents": self.browser_subagents,
+			"headless_switches": self.headless_switches,
+			"consecutive_same_tool": dict(self.consecutive_same_tool.most_common()),
+			"sessions": sorted(self.sessions, key=lambda x: x["calls"], reverse=True),
+		}
+
+
+def _rate_per_1k(count: int, total_calls: int) -> float:
+	return round(1000.0 * count / total_calls, 2) if total_calls else 0.0
+
+
+def compute_diff(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+	bs = baseline.get("summary", {})
+	cs = current.get("summary", {})
+	bt = baseline.get("tools", {})
+	ct = current.get("tools", {})
+	be = baseline.get("evaluate_js", {})
+	ce = current.get("evaluate_js", {})
+
+	b_calls = bs.get("total_calls", 0)
+	c_calls = cs.get("total_calls", 0)
+
+	def row(label: str, before: float, after: float, unit: str = "", lower_is_better: Optional[bool] = True) -> dict[str, Any]:
+		delta = round(after - before, 2)
+		status = "flat"
+		if delta != 0 and lower_is_better is not None:
+			improved = (delta < 0) if lower_is_better else (delta > 0)
+			status = "improved" if improved else "regressed"
+		return {
+			"metric": label,
+			"before": before,
+			"after": after,
+			"delta": delta,
+			"unit": unit,
+			"status": status,
+		}
+
+	kpis = [
+		row("Sessions", bs.get("sessions", 0), cs.get("sessions", 0), "", None),
+		row("Total calls", b_calls, c_calls, "", None),
+		row("Calls / session (median)", bs.get("calls_per_session", {}).get("median", 0), cs.get("calls_per_session", {}).get("median", 0), "", True),
+		row("Chars / session (median)", bs.get("chars_per_session", {}).get("median", 0), cs.get("chars_per_session", {}).get("median", 0), "ch", True),
+		row("evaluate_js share", bs.get("evaluate_js_share_pct", 0), cs.get("evaluate_js_share_pct", 0), "%", True),
+		row("Overall error rate", bs.get("error_rate_pct", 0), cs.get("error_rate_pct", 0), "%", True),
+		row("click error rate", bt.get("click", {}).get("error_rate_pct", 0), ct.get("click", {}).get("error_rate_pct", 0), "%", True),
+		row("status error rate", bt.get("status", {}).get("error_rate_pct", 0), ct.get("status", {}).get("error_rate_pct", 0), "%", True),
+		row("navigate error rate", bt.get("navigate", {}).get("error_rate_pct", 0), ct.get("navigate", {}).get("error_rate_pct", 0), "%", True),
+		row("3m MCP timeouts / 1k calls", _rate_per_1k(bs.get("mcp_timeouts_3m", 0), b_calls), _rate_per_1k(cs.get("mcp_timeouts_3m", 0), c_calls), "/1k", True),
+		row("Slow non-timeout / 1k calls", _rate_per_1k(bs.get("slow_non_timeout_calls", 0), b_calls), _rate_per_1k(cs.get("slow_non_timeout_calls", 0), c_calls), "/1k", True),
+		row("Validation errors / 1k calls", _rate_per_1k(bs.get("validation_errors_total", 0), b_calls), _rate_per_1k(cs.get("validation_errors_total", 0), c_calls), "/1k", True),
+		row("Silent arg drops / 1k calls", _rate_per_1k(bs.get("silent_param_mismatches_total", 0), b_calls), _rate_per_1k(cs.get("silent_param_mismatches_total", 0), c_calls), "/1k", True),
+		row("Schema reads / session", bs.get("schema_reads_per_session", 0), cs.get("schema_reads_per_session", 0), "/sess", True),
+		row("batch share", bt.get("batch", {}).get("share_pct", 0), ct.get("batch", {}).get("share_pct", 0), "%", False),
+		row("state share", bt.get("state", {}).get("share_pct", 0), ct.get("state", {}).get("share_pct", 0), "%", False),
+	]
+
+	b_intents = be.get("intents", {})
+	c_intents = ce.get("intents", {})
+	b_eval = max(1, be.get("total", 0))
+	c_eval = max(1, ce.get("total", 0))
+	intent_keys = sorted(set(b_intents) | set(c_intents), key=lambda k: c_intents.get(k, 0) + b_intents.get(k, 0), reverse=True)
+	js_deltas = []
+	for k in intent_keys:
+		b_pct = round(100.0 * b_intents.get(k, 0) / b_eval, 1) if be.get("total", 0) else 0.0
+		c_pct = round(100.0 * c_intents.get(k, 0) / c_eval, 1) if ce.get("total", 0) else 0.0
+		js_deltas.append({
+			"intent": k,
+			"before_count": b_intents.get(k, 0),
+			"after_count": c_intents.get(k, 0),
+			"before_pct": b_pct,
+			"after_pct": c_pct,
+			"delta_pp": round(c_pct - b_pct, 1),
+		})
+
+	return {
+		"baseline_generated_at": baseline.get("generated_at"),
+		"baseline_since": baseline.get("filters", {}).get("since"),
+		"current_generated_at": current.get("generated_at"),
+		"current_since": current.get("filters", {}).get("since"),
+		"kpis": kpis,
+		"evaluate_js_intents": js_deltas,
+	}
+
+
+def format_diff(diff: dict[str, Any]) -> str:
+	lines = [
+		"# Baseline Diff Scorecard",
+		f"Baseline: {diff.get('baseline_generated_at', '?')} (since={diff.get('baseline_since') or 'all'})",
+		f"Current:  {diff.get('current_generated_at', '?')} (since={diff.get('current_since') or 'all'})",
+		"",
+		f"{'Metric':30s} | {'Before':>10s} | {'After':>10s} | {'Delta':>10s} | Status",
+		"-" * 79,
+	]
+	for item in diff["kpis"]:
+		unit = item["unit"]
+		b_str = f"{item['before']}{unit}"
+		a_str = f"{item['after']}{unit}"
+		d = item["delta"]
+		sign = "+" if d > 0 else ""
+		d_unit = "pp" if unit == "%" else unit
+		d_str = f"{sign}{d}{d_unit}"
+		tag = {"improved": "OK", "regressed": "REGRESSED", "flat": "-"}[item["status"]]
+		lines.append(f"{item['metric']:30s} | {b_str:>10s} | {a_str:>10s} | {d_str:>10s} | {tag}")
+
+	if diff["evaluate_js_intents"]:
+		lines.append("")
+		lines.append("evaluate_js Intent Shift (% of evaluate_js calls):")
+		for item in diff["evaluate_js_intents"][:10]:
+			sign = "+" if item["delta_pp"] > 0 else ""
+			lines.append(
+				f"  {item['intent']:24s}: {item['before_count']:4d} ({item['before_pct']:4.1f}%) -> "
+				f"{item['after_count']:4d} ({item['after_pct']:4.1f}%) [{sign}{item['delta_pp']}pp]"
+			)
+	return "\n".join(lines)
+
+
+def format_report(snap: dict[str, Any], top_n: int, max_samples: int, diff: Optional[dict[str, Any]] = None) -> str:
+	s = snap["summary"]
+	f = snap["filters"]
+	lines: list[str] = []
+
+	if diff is not None:
+		lines.append(format_diff(diff))
+		lines.append("")
+
+	lines.append("# Stealth-Browser Usage Audit")
+	window_parts = [
+		f"since={f['since'] or 'all-time'}",
+		f"source={f['source']}",
+	]
+	if f.get("included_ids"):
+		window_parts.append(f"session={','.join(f['included_ids'])}")
+	window_parts.append(f"excluded={len(f['excluded_ids'])}")
+	window_parts.append(f"slow>={f['slow_threshold_s']}s")
+	lines.append("Window: " + " | ".join(window_parts))
+	lines.append(
+		f"Sessions: {s['sessions']} {s['sessions_by_source']} | "
+		f"Calls: {s['total_calls']} {s['calls_by_source']} | "
+		f"Errors: {s['total_errors']} ({s['error_rate_pct']}%) | "
+		f"Soft notices: {s['total_soft_outcomes']}"
+	)
+	lines.append(
+		f"evaluate_js share: {s['evaluate_js_calls']}/{s['total_calls']} ({s['evaluate_js_share_pct']}%) | "
+		f"3m MCP timeouts: {s['mcp_timeouts_3m']} | "
+		f"Slow (>={f['slow_threshold_s']}s, non-timeout): {s['slow_non_timeout_calls']} | "
+		f"Validation errs: {s['validation_errors_total']}"
+	)
+	cps = s["calls_per_session"]
+	chps = s["chars_per_session"]
+	lat = s["latency_non_timeout_s"]
+	lines.append(
+		f"Calls/session: median={cps['median']}, mean={cps['mean']}, p90={cps['p90']}, max={cps['max']}"
+	)
+	lines.append(
+		f"Output chars/session: median={chps['median']:,}, mean={chps['mean']:,}, p90={chps['p90']:,}, max={chps['max']:,} "
+		f"(total={s['total_output_chars']:,})"
+	)
+	lines.append(
+		f"Latency (non-timeout, n={lat['samples']}): median={lat['median']}s, p95={lat['p95']}s, max={lat['max']}s"
+	)
+	lines.append(
+		f"Schema JSON read_file: {s['schema_reads_in_browser_sessions']} in browser sessions "
+		f"({s['schema_reads_per_session']}/sess, {s['schema_reads_total']} total) | "
+		f"Screenshots: {s['screenshot_total']} ({s['screenshot_followed_by_read']} read_file after)"
+	)
+	lines.append(
+		f"Auth/login/2FA/CAPTCHA sessions: {s['auth_or_login_sessions']}/{s['sessions']} ({s['auth_or_login_pct']}%) | "
+		f"Error->immediate retry: {s['error_then_retry']}"
+	)
+	if snap["other_browser_mcps"] or snap["browser_subagents"]:
+		lines.append(
+			f"Other browser MCPs: {snap['other_browser_mcps']} | Built-in browser subagents: {len(snap['browser_subagents'])}"
+		)
+
+	lines.append("\n## Tool Frequency, Errors & Latency")
+	lines.append(
+		f"{'Tool':18s} | {'Calls':>5s} | {'Share':>6s} | {'Errs':>4s} | {'Err%':>5s} | {'AvgCh':>6s} | {'MedS':>5s} | {'P95S':>5s} | Top Errors"
+	)
+	lines.append("-" * 92)
+	for tool, info in snap["tools"].items():
+		med = f"{info['median_latency_s']:.1f}" if info["median_latency_s"] is not None else "-"
+		p95 = f"{info['p95_latency_s']:.1f}" if info["p95_latency_s"] is not None else "-"
+		top_errs = ", ".join(f"{k}:{v}" for k, v in list(info["error_types"].items())[:3])
+		lines.append(
+			f"{tool:18s} | {info['calls']:5d} | {info['share_pct']:5.1f}% | {info['errors']:4d} | "
+			f"{info['error_rate_pct']:4.1f}% | {info['avg_chars']:6.0f} | {med:>5s} | {p95:>5s} | {top_errs}"
+		)
+
+	underused_str = ", ".join(f"{u['tool']}({u['calls']})" for u in snap["underused_tools"])
+	lines.append(f"\nUnderused tools (<1% share): {underused_str}")
+
+	ej = snap["evaluate_js"]
+	lines.append(f"\n## evaluate_js Breakdown ({ej['total']} calls, {ej['share_pct']}%)")
+	if ej["feature_flags"]:
+		flags_str = ", ".join(f"{k}={v}" for k, v in ej["feature_flags"].items())
+		lines.append(f"Feature flags (non-exclusive): {flags_str}")
+	for intent, cnt in ej["intents"].items():
+		pct = 100.0 * cnt / ej["total"] if ej["total"] else 0.0
+		lines.append(f"  {intent:24s}: {cnt:4d} ({pct:4.1f}%)")
+		for sample in ej["samples"].get(intent, [])[:max_samples]:
+			lines.append(f"      [{sample['sid']}] ({sample['title']}) {sample['expr']}")
+
+	errs = snap["errors"]
+	lines.append("\n## Error Breakdown")
+	for etype, cnt in errs["by_type"].items():
+		lines.append(f"  {etype:24s}: {cnt:4d}")
+		for sample in errs["samples"].get(etype, [])[:max_samples]:
+			lines.append(f"      [{sample['tool']}@{sample['sid']}] args={sample['args']} => {sample['out']}")
+	if errs["soft_outcomes"]:
+		lines.append("Soft outcomes / guardrails: " + ", ".join(f"{k}={v}" for k, v in errs["soft_outcomes"].items()))
+
+	if errs["validation_errors"] or errs.get("silent_param_mismatches"):
+		lines.append("\n## Parameter Mismatches (Validation Errors & Silently Ignored Args)")
+		for sig, cnt in errs["validation_errors"].items():
+			lines.append(f"  {cnt:3d}x  [validation_error] {sig}")
+		for sig, cnt in errs.get("silent_param_mismatches", {}).items():
+			lines.append(f"  {cnt:3d}x  [silent_ignored]   {sig}")
+
+	if errs["click_reasons"]:
+		lines.append("\n## click() Failure Root Causes")
+		for reason, cnt in errs["click_reasons"].items():
+			lines.append(f"  {reason:28s}: {cnt:3d}")
+		for sample in errs["click_samples"][:max_samples]:
+			lines.append(f"      [{sample['sid']}] ({sample['reason']}) sel={sample['selector']!r} => {sample['out']}")
+
+	if errs["status_reasons"]:
+		lines.append("\n## status() Failure Root Causes")
+		for reason, cnt in errs["status_reasons"].items():
+			lines.append(f"  {reason:28s}: {cnt:3d}")
+		for sample in errs["status_samples"][:max_samples]:
+			lines.append(f"      [{sample['sid']}] ({sample['reason']}) => {sample['out']}")
+
+	if errs["navigate_reasons"]:
+		lines.append("\n## navigate() Failure Root Causes")
+		for reason, cnt in errs["navigate_reasons"].items():
+			lines.append(f"  {reason:28s}: {cnt:3d}")
+
+	lat_data = snap["latency"]
+	gt_180 = len(lat_data.get("approval_wait_calls_gt_180s", []))
+	lines.append(
+		f"\n## Slow & Hung Calls (3m MCP Timeouts: {len(lat_data['mcp_timeouts'])}, "
+		f"Slow {f['slow_threshold_s']}s-180s: {len(lat_data['slow_calls'])}, "
+		f">180s approval-wait: {gt_180})"
+	)
+	if lat_data["mcp_timeouts"]:
+		by_tool = collections.Counter(x["tool"] for x in lat_data["mcp_timeouts"])
+		lines.append("  3m MCP timeouts by tool: " + ", ".join(f"{k}={v}" for k, v in by_tool.most_common()))
+	for item in lat_data["slow_calls"][:top_n]:
+		lines.append(
+			f"  {item['duration_s']:6.1f}s | {item['sid']} | {item['tool']:16s} | {item['args']} => {item['tail']}"
+		)
+
+	if snap["domains"]:
+		lines.append(f"\n## Top {top_n} Domains")
+		for host, cnt in list(snap["domains"].items())[:top_n]:
+			lines.append(f"  {host:36s}: {cnt:4d}")
+
+	if snap["sessions"]:
+		lines.append(f"\n## Top {top_n} Heaviest Sessions")
+		for sess in snap["sessions"][:top_n]:
+			lines.append(
+				f"  {sess['date']:10s} | {sess['source']:8s} | {sess['sid'][:10]} | "
+				f"{sess['calls']:3d} calls | {sess['errors']:2d} errs | "
+				f"{sess['schema_reads']:2d} sch | {sess['chars']:7d} ch | "
+				f"{sess['title'][:38]} | {sess['domains'][:3]}"
+			)
+
+	return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+	parser = argparse.ArgumentParser(
+		prog="stealth-browser-audit",
+		description="Audit local AGY transcripts and OpenCode databases for stealth-browser usage, errors, latency, and workarounds.",
+		formatter_class=argparse.RawDescriptionHelpFormatter,
+		epilog=(
+			"Examples:\n"
+			"  stealth-browser-audit\n"
+			"  stealth-browser-audit --session 3eeca926\n"
+			"  stealth-browser-audit --since 14d --exclude 3eeca926\n"
+			"  stealth-browser-audit --save-baseline /tmp/sb-baseline.json\n"
+			"  stealth-browser-audit --since 14d --diff /tmp/sb-baseline.json\n"
+			"  stealth-browser-audit --json | jq .summary"
+		),
+	)
+	parser.add_argument(
+		"--since",
+		help="Filter calls/sessions on or after a relative duration (7d, 30d, 24h, 2w) or ISO date (YYYY-MM-DD).",
+	)
+	parser.add_argument(
+		"--session",
+		action="append",
+		default=[],
+		help="Conversation/session ID (or prefix) to include (audit only these sessions). Repeatable or comma-separated.",
+	)
+	parser.add_argument(
+		"--exclude",
+		action="append",
+		default=[],
+		help="Conversation/session ID (or prefix) to exclude. Repeatable or comma-separated.",
+	)
+	parser.add_argument(
+		"--source",
+		choices=("all", "agy", "opencode"),
+		default="all",
+		help="Session source to mine (default: all).",
+	)
+	parser.add_argument(
+		"--slow-threshold",
+		type=float,
+		default=20.0,
+		help="Seconds threshold for reporting slow non-timeout calls (default: 20.0).",
+	)
+	parser.add_argument(
+		"--top",
+		type=int,
+		default=15,
+		help="Max rows for top domains, slow calls, and heaviest sessions (default: 15).",
+	)
+	parser.add_argument(
+		"--samples",
+		type=int,
+		default=2,
+		help="Max example snippets per error / evaluate_js category (default: 2; 0 hides samples).",
+	)
+	parser.add_argument(
+		"--json",
+		action="store_true",
+		help="Output machine-readable JSON snapshot to stdout.",
+	)
+	parser.add_argument(
+		"--save-baseline",
+		metavar="PATH",
+		help="Save the JSON snapshot to PATH for future --diff comparisons.",
+	)
+	parser.add_argument(
+		"--diff",
+		metavar="BASELINE_JSON",
+		help="Compare current audit against a previously saved JSON baseline.",
+	)
+	return parser
+
+
+def main() -> int:
+	parser = build_parser()
+	args = parser.parse_args()
+
+	since_dt = parse_since(args.since)
+	includes: list[str] = []
+	for item in args.session:
+		for part in item.split(","):
+			part = part.strip()
+			if part:
+				includes.append(part)
+	excludes: list[str] = []
+	for item in args.exclude:
+		for part in item.split(","):
+			part = part.strip()
+			if part:
+				excludes.append(part)
+	env_cid = os.environ.get("AGY_CONVERSATION_ID", "").strip()
+	if env_cid and not matches_any_prefix(env_cid, includes) and env_cid not in excludes:
+		excludes.append(env_cid)
+
+	collector = AuditCollector(
+		since=since_dt,
+		includes=includes,
+		excludes=excludes,
+		slow_threshold=args.slow_threshold,
+		max_samples=max(args.samples, 0),
+	)
+	if args.source in ("all", "agy"):
+		collector.collect_agy()
+	if args.source in ("all", "opencode"):
+		collector.collect_opencode()
+
+	snapshot = collector.build_snapshot(args.since, args.source)
+
+	diff_data: Optional[dict[str, Any]] = None
+	if args.diff:
+		diff_path = Path(args.diff).expanduser()
+		try:
+			baseline = json.loads(diff_path.read_text(encoding="utf-8"))
+		except Exception as exc:
+			print(f"Error reading baseline {diff_path}: {exc}", file=sys.stderr)
+			return 2
+		diff_data = compute_diff(baseline, snapshot)
+
+	if args.save_baseline:
+		out_path = Path(args.save_baseline).expanduser()
+		out_path.parent.mkdir(parents=True, exist_ok=True)
+		out_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+
+	if args.json:
+		payload = {"snapshot": snapshot, "diff": diff_data} if diff_data is not None else snapshot
+		print(json.dumps(payload, indent=2))
+	else:
+		print(format_report(snapshot, top_n=args.top, max_samples=args.samples, diff=diff_data))
+
+	return 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())
