@@ -122,6 +122,14 @@ def test_snapshot_compact_cap_and_total_matched(sb, monkeypatch):
 	assert payload["includeHrefs"] is True
 	assert "href=/account/item/0" in out_filtered
 
+	page_long_url = FakePage(url="https://portal.example/auth?" + "p=" + "z" * 600)
+	page_long_url.evaluate = AsyncMock(return_value={"totalMatched": 800, "totalCapped": True, "items": items})
+	monkeypatch.setattr(sb.session, "resolve_page", AsyncMock(return_value=page_long_url))
+	out_capped = asyncio.run(sb.snapshot(max_length=1200))
+	assert "of 800+ items" in out_capped
+	assert len(out_capped) <= 1250
+	assert "z" * 200 not in out_capped
+
 
 def test_snapshot_deduplicates_selector_and_omits_bare_tag(sb):
 	row_id = sb._format_snapshot_row(
@@ -166,6 +174,9 @@ def test_get_content_clean_whitespace_offset_tail_and_filter(sb, monkeypatch):
 
 	no_match = asyncio.run(sb.get_content(filter="nonexistent-token"))
 	assert "No lines matched filter" in no_match
+
+	past_eof = asyncio.run(sb.get_content(offset=99999))
+	assert "past end of content" in past_eof
 
 
 def test_compact_json_and_bounds_across_tools(sb, monkeypatch):
@@ -227,7 +238,8 @@ def test_telemetry_and_downloads_bound_urls_and_output(sb, monkeypatch):
 		})
 	net_out = asyncio.run(sb.network_requests(max_length=1500))
 	assert long_url not in net_out
-	assert "[Truncated:" in net_out
+	assert "[Truncated at 1500 chars" in net_out
+	assert net_out.count("showing ") == 1
 	assert len(net_out) <= 1600
 
 	for i in range(40):
@@ -240,7 +252,8 @@ def test_telemetry_and_downloads_bound_urls_and_output(sb, monkeypatch):
 	monkeypatch.setattr(tracker, "ensure_console_capture", AsyncMock(return_value=True))
 	con_out = asyncio.run(sb.console_logs(max_length=1200))
 	assert long_url not in con_out
-	assert "[Truncated:" in con_out
+	assert "[Truncated at 1200 chars" in con_out
+	assert con_out.count("showing ") == 1
 	assert len(con_out) <= 1300
 
 	dl_tracker = sb.DownloadTracker(maxlen=10)

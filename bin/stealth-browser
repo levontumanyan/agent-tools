@@ -1465,22 +1465,22 @@ def _truncate_url(url: str, max_len: int = 160) -> str:
 	return s[: max_len - 3] + "..."
 
 
-def _truncate_lines(header: str, lines: list[str], max_length: int, total_items: int, hint: str = "") -> str:
+def _truncate_lines(header_fn, lines: list[str], max_length: int, hint: str = "") -> str:
 	if max_length <= 0:
-		return "\n".join([header] + lines)
-	out = [header]
-	cur = len(header)
-	shown = 0
+		return "\n".join([header_fn(len(lines))] + lines)
+	sample_header = header_fn(len(lines))
+	cur = len(sample_header)
+	kept: list[str] = []
 	for line in lines:
 		add = len(line) + 1
-		if shown > 0 and cur + add + 90 > max_length:
+		if kept and cur + add + 90 > max_length:
 			break
-		out.append(line)
+		kept.append(line)
 		cur += add
-		shown += 1
-	if shown < len(lines):
+	out = [header_fn(len(kept))] + kept
+	if len(kept) < len(lines):
 		extra = f"; {hint}" if hint else ""
-		out.append(f"... [Truncated: showing {shown} of {total_items} items{extra}]")
+		out.append(f"... [Truncated at {max_length} chars{extra}]")
 	return "\n".join(out)
 
 
@@ -1643,10 +1643,11 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 
 	const collected = [];
 	let totalMatched = 0;
+	const countCap = limit * 10;
 	const seen = new Set();
 
 	const walk = (node, ctx) => {
-		if (!node) return;
+		if (!node || totalMatched >= countCap) return;
 		if (node.nodeType === 1) {
 			const tn = (node.tagName || '').toUpperCase();
 			if (SKIP_TAGS.has(tn) || seen.has(node)) return;
@@ -1658,6 +1659,7 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 					if (collected.length < limit) {
 						collected.push({ el: node, ctx });
 					}
+					if (totalMatched >= countCap) return;
 				}
 			} catch (_) {}
 
@@ -1665,6 +1667,7 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 				const shadowCtx = { rootNode: node.shadowRoot, inShadow: true, inIframe: ctx.inIframe };
 				for (const child of node.shadowRoot.children) {
 					walk(child, shadowCtx);
+					if (totalMatched >= countCap) return;
 				}
 			}
 
@@ -1674,16 +1677,19 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 					if (doc && doc.documentElement) {
 						const iframeCtx = { rootNode: doc, inShadow: ctx.inShadow, inIframe: true };
 						walk(doc.documentElement, iframeCtx);
+						if (totalMatched >= countCap) return;
 					}
 				} catch (_) {}
 			}
 
 			for (const child of node.children) {
 				walk(child, ctx);
+				if (totalMatched >= countCap) return;
 			}
 		} else if (node.children) {
 			for (const child of node.children) {
 				walk(child, ctx);
+				if (totalMatched >= countCap) return;
 			}
 		}
 	};
@@ -1813,7 +1819,7 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 			attrs: attrParts.join(' '),
 		};
 	});
-	return { totalMatched, items };
+	return { totalMatched, totalCapped: totalMatched >= countCap, items };
 }"""
 
 _EXTRACT_JS = r"""({ containerSelector, fields, limit, includeShadow, includeIframes }) => {
@@ -2230,20 +2236,26 @@ async def snapshot(
 		if isinstance(raw, dict):
 			elements = raw.get("items") or []
 			total_matched = int(raw.get("totalMatched", len(elements)))
+			total_capped = bool(raw.get("totalCapped", False))
 		else:
 			elements = raw or []
 			total_matched = len(elements)
+			total_capped = False
 
+		url_str = _truncate_url(page.url, 160)
 		if not elements:
 			filter_note = f" matching '{filter}'" if filter else ""
-			return f"No interactive elements found{filter_note} on {page.url} ({elapsed_ms}ms)"
+			return f"No interactive elements found{filter_note} on {url_str} ({elapsed_ms}ms)"
 
 		elements = elements[:max_elements]
 		rows = [_format_snapshot_row(el, idx, include_hrefs=include_hrefs) for idx, el in enumerate(elements)]
+		total_label = f"{total_matched}+" if total_capped else str(total_matched)
+		footer = "... [narrow with selector=, filter=, or viewport_only=True]"
 
 		if max_length > 0:
 			kept: list[str] = []
-			budget = max(200, max_length - 160)
+			header_reserve = len(f"Snapshot {url_str} ({elapsed_ms}ms, showing {len(rows)} of {total_label} items):") + len(footer) + 2
+			budget = max(120, max_length - header_reserve)
 			cur = 0
 			for row in rows:
 				if kept and cur + len(row) + 1 > budget:
@@ -2253,11 +2265,12 @@ async def snapshot(
 			rows = kept
 
 		shown = len(rows)
-		count_str = f"showing {shown} of {total_matched} items" if shown < total_matched else f"{shown} items"
-		header = f"Snapshot {page.url} ({elapsed_ms}ms, {count_str}):"
+		is_partial = shown < total_matched or total_capped
+		count_str = f"showing {shown} of {total_label} items" if is_partial else f"{shown} items"
+		header = f"Snapshot {url_str} ({elapsed_ms}ms, {count_str}):"
 		lines = [header] + rows
-		if shown < total_matched:
-			lines.append("... [narrow with selector=, filter=, or viewport_only=True]")
+		if is_partial:
+			lines.append(footer)
 		return "\n".join(lines)
 	except Exception as exc:
 		return f"Error capturing snapshot: {_format_playwright_error(exc)}"
@@ -2502,7 +2515,9 @@ async def get_content(
 			text = filtered
 
 		total_len = len(text)
-		start = max(0, total_len + offset) if offset < 0 else min(offset, total_len)
+		if offset > 0 and offset >= total_len:
+			return f"Offset {offset} is past end of content ({total_len} total chars)."
+		start = max(0, total_len + offset) if offset < 0 else offset
 		end = min(total_len, start + max_length) if max_length > 0 else total_len
 		if start > 0 or end < total_len:
 			chunk = text[start:end]
@@ -3518,7 +3533,6 @@ async def network_requests(
 		if not entries:
 			return f"No matching network requests for {page.url} ({total} total captured){cleared_tag}."
 
-		header = f"Network requests for {page.url} (showing {len(entries)} of {total} captured){cleared_tag}:"
 		lines: list[str] = []
 		for item in entries:
 			ts = item["timestamp"].split("T")[-1]
@@ -3535,7 +3549,12 @@ async def network_requests(
 				meta.append(f"{item['duration_ms']}ms")
 			meta_str = f" ({', '.join(meta)})" if meta else ""
 			lines.append(f"- [{ts}] {status_part} {item['method']} [{item['resource_type']}]{meta_str} {_truncate_url(item['url'], 160)}")
-		return _truncate_lines(header, lines, max_length, len(entries), hint="filter with url_filter=/resource_type=")
+		return _truncate_lines(
+			lambda shown: f"Network requests for {page.url} (showing {shown} of {total} captured){cleared_tag}:",
+			lines,
+			max_length,
+			hint="filter with url_filter=/resource_type=",
+		)
 	except Exception as exc:
 		return f"Error listing network requests: {exc}"
 
@@ -3563,13 +3582,17 @@ async def console_logs(
 		if not entries:
 			return f"No matching console logs for {page.url} ({total} total captured){cleared_tag}."
 
-		header = f"Console logs for {page.url} (showing {len(entries)} of {total} captured){cleared_tag}:"
 		lines: list[str] = []
 		for item in entries:
 			ts = item["timestamp"].split("T")[-1]
 			loc_str = f" ({_truncate_url(item['location'], 120)})" if item["location"] else ""
 			lines.append(f"- [{ts}] [{item['level']}]{loc_str} {item['text']}")
-		return _truncate_lines(header, lines, max_length, len(entries), hint="filter with level=")
+		return _truncate_lines(
+			lambda shown: f"Console logs for {page.url} (showing {shown} of {total} captured){cleared_tag}:",
+			lines,
+			max_length,
+			hint="filter with level=",
+		)
 	except Exception as exc:
 		return f"Error listing console logs: {exc}"
 
