@@ -33,8 +33,8 @@ Give the subagent a self-contained brief specifying:
 4. **Prefer structured, compact, low-roundtrip tools**:
    - `extract(container_selector=..., fields={...}, tab="tN")` for repeated cards, listings, or table rows.
    - `state(tab="tN")` for Next.js, Nuxt, Redux, React Fiber, Vue, Apollo, or React Query in-memory stores.
-   - `snapshot(filter="...", viewport_only=True, tab="tN")` to narrow interactive refs (`e0`, `e1`), followed by `batch(actions=[...], tab="tN")` for multi-step clicks/fills.
-   - `get_content(filter="...", offset=..., tab="tN")` for filtered or paginated text reads instead of dumping full pages.
+   - `snapshot(tab="tN")` (with optional `filter="..."` and/or `viewport_only=True` to narrow interactive refs `e0`, `e1`), followed by `batch(actions=[...], tab="tN")` for multi-step clicks/fills.
+   - `get_content(tab="tN")` (with optional `filter="..."` and/or `offset=...` for filtered or paginated text reads instead of dumping full pages).
    - `fetch(url=..., save_path=..., tab="tN")` for authenticated JSON APIs or binary/PDF/blob downloads directly to disk.
    - `evaluate_js(expression=..., tab="tN")` for targeted DOM reads; pass `main_world=True` only for custom page-world globals not covered by `state()`.
    - `wait_for(selector=..., text=..., url_contains=..., tab="tN")` instead of JS polling loops.
