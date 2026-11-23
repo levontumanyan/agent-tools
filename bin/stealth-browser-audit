@@ -47,6 +47,12 @@ KNOWN_TOOLS = (
 	"close_browser",
 	"restart_browser",
 	"set_headless",
+	"extract",
+	"wait_for",
+	"wait_for_human",
+	"downloads",
+	"network_requests",
+	"console_logs",
 )
 
 SOFT_OUTCOMES = frozenset({"set_headless_refused", "snapshot_empty", "state_empty"})
@@ -80,6 +86,10 @@ NESTED_SHELL_RE = re.compile(
 )
 JSONRPC_TOOLS_CALL_RE = re.compile(r'"method"\s*:\s*"tools/call"')
 JSONRPC_TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([a-zA-Z0-9_]+)"')
+AGY_OVERFLOW_RE = re.compile(
+	r"(?:output was large and was saved to:|full output in a file at)\s*(file://\S+)",
+	re.IGNORECASE,
+)
 
 
 def parse_since(spec: Optional[str]) -> Optional[datetime.datetime]:
@@ -139,6 +149,37 @@ def unquote(val: Any) -> Any:
 		except Exception:
 			return val
 	return val
+
+
+def unwrap_result_json(body: str) -> str:
+	s = body.strip()
+	if not (s.startswith("{") and s.endswith("}") and '"result"' in s):
+		return body
+	try:
+		obj = json.loads(s)
+	except Exception:
+		return body
+	result = obj.get("result") if isinstance(obj, dict) else None
+	return result if isinstance(result, str) and result else body
+
+
+def expand_agy_overflow(body: str) -> tuple[str, bool]:
+	m = AGY_OVERFLOW_RE.search(body)
+	if not m:
+		return body, False
+	raw = m.group(1).rstrip(".,;:)]}'\">")
+	parsed = urllib.parse.urlparse(raw)
+	path = Path(urllib.parse.unquote(parsed.path)) if parsed.scheme == "file" else Path(raw)
+	try:
+		resolved = path.resolve()
+		if not (resolved.is_file() and resolved.is_relative_to(BRAIN_DIR.resolve())):
+			return body, False
+		content = resolved.read_text(encoding="utf-8", errors="ignore").strip()
+	except OSError:
+		return body, False
+	if not content:
+		return body, False
+	return content, True
 
 
 def normalize_args(raw: Any) -> dict[str, Any]:
@@ -243,6 +284,8 @@ def classify_outcome(tool: str, body: str, explicit_error: bool = False) -> Opti
 		return "click_error"
 	if bl.startswith("error typing"):
 		return "type_error"
+	if bl.startswith("wait timed out"):
+		return "wait_timeout"
 	if bl.startswith("navigation error:"):
 		return "navigation_error"
 	if bl.startswith("javascript execution error:"):
@@ -257,7 +300,7 @@ def classify_outcome(tool: str, body: str, explicit_error: bool = False) -> Opti
 		return "state_error"
 	if bl.startswith(("error switching tab:", "error closing tab:", "error closing browser:", "error restarting browser:")):
 		return "lifecycle_error"
-	if bl.startswith(("error managing keep-alive:", "error updating media state:", "error pressing key", "error scrolling:", "error taking screenshot:", "error extracting content:")):
+	if bl.startswith(("error managing keep-alive:", "error updating media state:", "error pressing key", "error scrolling:", "error taking screenshot:", "error extracting content:", "error in wait_for:", "error extracting rows:", "error listing downloads:", "error listing network requests:", "error listing console logs:", "error during human handoff:")):
 		return "tool_error"
 	if tool == "status" and "(unresponsive / busy)" in bl:
 		return "tab_unresponsive"
@@ -282,10 +325,8 @@ def parse_validation_signature(tool: str, body: str, raw_args: dict[str, Any]) -
 
 
 def detect_silent_param_mismatch(tool: str, raw_args: dict[str, Any]) -> Optional[str]:
-	if tool in ("close_tab", "switch_tab") and "index" not in raw_args:
-		bad = [k for k in ("tab", "tab_index") if k in raw_args]
-		if bad:
-			return f"{tool}: ignored '{','.join(bad)}' (expects 'index')"
+	if "tab_index" in raw_args:
+		return f"{tool}: unknown 'tab_index' (use 'tab')"
 	return None
 
 
@@ -511,6 +552,7 @@ class AuditCollector:
 		self.js_samples: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
 		self.domains = collections.Counter()
 		self.call_chars: dict[str, list[int]] = collections.defaultdict(list)
+		self.call_input_chars: dict[str, list[int]] = collections.defaultdict(list)
 		self.call_latencies: dict[str, list[float]] = collections.defaultdict(list)
 		self.slow_calls: list[dict[str, Any]] = []
 		self.approval_wait_calls: list[dict[str, Any]] = []
@@ -519,6 +561,9 @@ class AuditCollector:
 		self.error_then_retry = 0
 		self.schema_reads_total = 0
 		self.schema_reads_in_browser_sessions = 0
+		self.schema_chars_total = 0
+		self.input_chars_total = 0
+		self.agy_overflow_expansions = 0
 		self.screenshot_total = 0
 		self.screenshot_followed_by_read = 0
 		self.headless_switches: list[dict[str, Any]] = []
@@ -541,13 +586,19 @@ class AuditCollector:
 		duration_s: Optional[float],
 		sess_state: dict[str, Any],
 		nested: bool = False,
+		output_chars: Optional[int] = None,
+		classify_body: Optional[str] = None,
 	) -> None:
 		self.by_source[source] += 1
 		self.tool_counts[tool] += 1
-		self.call_chars[tool].append(len(body))
+		chars = len(body) if output_chars is None else output_chars
+		self.call_chars[tool].append(chars)
+		input_chars = len(json.dumps(raw_args)) if raw_args else 0
+		self.call_input_chars[tool].append(input_chars)
 
 		sess_state["calls"] += 1
-		sess_state["chars"] += len(body)
+		sess_state["chars"] += chars
+		sess_state["input_chars"] += input_chars
 		sess_state["tools"][tool] += 1
 
 		if sess_state["prev_tool"] == tool:
@@ -588,7 +639,9 @@ class AuditCollector:
 					"expr": expr[:200].replace("\n", " "),
 				})
 
-		outcome = classify_outcome(tool, body, explicit_error=explicit_error)
+		classify_body = unwrap_result_json(body) if classify_body is None else classify_body
+		snip = classify_body
+		outcome = classify_outcome(tool, classify_body, explicit_error=explicit_error)
 		is_hard_error = bool(outcome and outcome not in SOFT_OUTCOMES)
 
 		if outcome != "validation_error":
@@ -655,32 +708,32 @@ class AuditCollector:
 					"title": title[:35],
 					"tool": tool,
 					"args": json.dumps(raw_args)[:140],
-					"out": body[:220].replace("\n", " "),
+					"out": snip[:220].replace("\n", " "),
 				})
 			if outcome == "validation_error":
-				sig = parse_validation_signature(tool, body, raw_args)
+				sig = parse_validation_signature(tool, snip, raw_args)
 				self.validation_errors[sig] += 1
 			if tool == "click":
-				reason = classify_click_reason(outcome, body)
+				reason = classify_click_reason(outcome, snip)
 				self.click_reasons[reason] += 1
 				if len(self.click_samples) < max(self.max_samples, 5):
 					self.click_samples.append({
 						"sid": sid[:10],
 						"selector": str(raw_args.get("selector", ""))[:80],
 						"reason": reason,
-						"out": body[:180].replace("\n", " "),
+						"out": snip[:180].replace("\n", " "),
 					})
 			elif tool == "status":
-				reason = classify_status_reason(outcome, body)
+				reason = classify_status_reason(outcome, snip)
 				self.status_reasons[reason] += 1
 				if len(self.status_samples) < max(self.max_samples, 5):
 					self.status_samples.append({
 						"sid": sid[:10],
 						"reason": reason,
-						"out": body[:180].replace("\n", " "),
+						"out": snip[:180].replace("\n", " "),
 					})
 			elif tool == "navigate":
-				reason = classify_navigate_reason(outcome, body)
+				reason = classify_navigate_reason(outcome, snip)
 				self.navigate_reasons[reason] += 1
 
 		sess_state["prev_tool"] = tool
@@ -689,10 +742,13 @@ class AuditCollector:
 
 	def _finalize_session(self, source: str, sid: str, title: str, sess_state: dict[str, Any], raw_text_lower: str) -> None:
 		self.schema_reads_total += sess_state["schema_reads"]
+		self.schema_chars_total += sess_state["schema_chars"]
+		self.input_chars_total += sess_state["input_chars"]
 		if sess_state["calls"] <= 0:
 			return
 		self.sessions_by_source[source] += 1
 		self.schema_reads_in_browser_sessions += sess_state["schema_reads"]
+		self.agy_overflow_expansions += sess_state["overflows"]
 		if any(k in raw_text_lower for k in AUTH_KEYWORDS):
 			self.auth_sessions += 1
 		self.sessions.append({
@@ -704,6 +760,10 @@ class AuditCollector:
 			"errors": sess_state["errors"],
 			"schema_reads": sess_state["schema_reads"],
 			"chars": sess_state["chars"],
+			"input_chars": sess_state["input_chars"],
+			"schema_chars": sess_state["schema_chars"],
+			"overflows": sess_state["overflows"],
+			"shared_execute_outputs": sess_state["shared_execute_outputs"],
 			"domains": sorted(sess_state["domains"])[:5],
 			"top_tools": sess_state["tools"].most_common(4),
 		})
@@ -714,12 +774,15 @@ class AuditCollector:
 		self._sources_collected.add("agy")
 		titles = load_agy_titles()
 		self._titles_by_source["agy"] = titles
-		paths = sorted(glob.glob(str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")))
+		log_glob = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")
+		full_glob = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript_full.jsonl")
+		compact_by_cid = {Path(p).parts[-4]: p for p in sorted(glob.glob(log_glob))}
+		full_by_cid = {Path(p).parts[-4]: p for p in glob.glob(full_glob)}
+		paths = [(cid, full_by_cid.get(cid) or compact_by_cid[cid]) for cid in sorted(set(compact_by_cid) | set(full_by_cid))]
 		matched_ids: set[str] = set()
 
-		for path_str in paths:
+		for cid, path_str in paths:
 			path = Path(path_str)
-			cid = path.parts[-4]
 			if self.includes and matches_any_prefix(cid, self.includes):
 				matched_ids.add(cid)
 
@@ -762,6 +825,10 @@ class AuditCollector:
 				"errors": 0,
 				"schema_reads": 0,
 				"chars": 0,
+				"input_chars": 0,
+				"schema_chars": 0,
+				"overflows": 0,
+				"shared_execute_outputs": 0,
 				"domains": set(),
 				"tools": collections.Counter(),
 				"date": "",
@@ -799,6 +866,7 @@ class AuditCollector:
 						p = str(unquote(args.get("Path", "")))
 						if "/mcp/stealth-browser/" in p:
 							sess_state["schema_reads"] += 1
+							sess_state["schema_chars"] += len(body)
 						if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
 							self.screenshot_followed_by_read += 1
 							sess_state["prev_was_screenshot"] = False
@@ -829,6 +897,10 @@ class AuditCollector:
 
 					if not sess_state["date"]:
 						sess_state["date"] = call_dt.astimezone().strftime("%Y-%m-%d")
+
+					body, overflowed = expand_agy_overflow(body)
+					if overflowed:
+						sess_state["overflows"] += 1
 
 					duration_s: Optional[float] = None
 					if created_dt and completed_dt:
@@ -895,7 +967,29 @@ class AuditCollector:
 		if not sess_state["date"] and start_dt:
 			sess_state["date"] = start_dt.astimezone().strftime("%Y-%m-%d")
 
-		for tool, raw_args, call_errored in nested:
+		if len(nested) > 1:
+			sess_state["shared_execute_outputs"] += 1
+
+		share = len(body) // len(nested)
+		last_share = share + (len(body) - share * len(nested))
+		errored_calls = [c for c in nested if c[2]]
+		for i, (tool, raw_args, call_errored) in enumerate(nested):
+			is_last = i == len(nested) - 1
+			if len(nested) == 1:
+				call_err = explicit_err or call_errored
+				call_classify_body = None
+			elif call_errored:
+				call_err = True
+				call_classify_body = None if len(errored_calls) == 1 else ""
+			elif is_last and explicit_err and not errored_calls:
+				call_err = True
+				call_classify_body = None
+			elif is_last:
+				call_err = False
+				call_classify_body = None if not errored_calls else ""
+			else:
+				call_err = False
+				call_classify_body = ""
 			self._record_call(
 				source="opencode",
 				sid=sid,
@@ -903,10 +997,12 @@ class AuditCollector:
 				tool=tool,
 				raw_args=raw_args,
 				body=body,
-				explicit_error=explicit_err or call_errored,
+				explicit_error=call_err,
 				duration_s=duration_s,
 				sess_state=sess_state,
 				nested=True,
+				output_chars=last_share if is_last else share,
+				classify_body=call_classify_body,
 			)
 
 	def collect_opencode(self) -> None:
@@ -947,6 +1043,10 @@ class AuditCollector:
 							"errors": 0,
 							"schema_reads": 0,
 							"chars": 0,
+							"input_chars": 0,
+							"schema_chars": 0,
+							"overflows": 0,
+							"shared_execute_outputs": 0,
 							"domains": set(),
 							"tools": collections.Counter(),
 							"date": "",
@@ -980,6 +1080,7 @@ class AuditCollector:
 						p = str(inp.get("path") or inp.get("filePath") or inp.get("Path") or "")
 						if "/mcp/stealth-browser/" in p:
 							sess_state["schema_reads"] += 1
+							sess_state["schema_chars"] += len(extract_opencode_output(item)[0])
 						if sess_state["prev_was_screenshot"] and ("screenshot" in p.lower() or p.lower().endswith(".png")):
 							self.screenshot_followed_by_read += 1
 							sess_state["prev_was_screenshot"] = False
@@ -1122,12 +1223,14 @@ class AuditCollector:
 		sess_calls = [s["calls"] for s in self.sessions]
 		sess_chars = [s["chars"] for s in self.sessions]
 		total_chars = sum(sess_chars)
+		agy_sessions = self.sessions_by_source.get("agy", 0)
 
 		tools_summary: dict[str, dict[str, Any]] = {}
 		for tool, cnt in self.tool_counts.most_common():
 			errs = sum(self.tool_errors[tool].values())
 			soft = sum(self.tool_soft[tool].values())
 			chars_list = self.call_chars[tool]
+			input_list = self.call_input_chars[tool]
 			lats = self.call_latencies[tool]
 			tools_summary[tool] = {
 				"calls": cnt,
@@ -1137,6 +1240,8 @@ class AuditCollector:
 				"soft_outcomes": soft,
 				"avg_chars": round(sum(chars_list) / len(chars_list), 1) if chars_list else 0.0,
 				"total_chars": sum(chars_list),
+				"avg_input_chars": round(sum(input_list) / len(input_list), 1) if input_list else 0.0,
+				"total_input_chars": sum(input_list),
 				"median_latency_s": round(statistics.median(lats), 2) if lats else None,
 				"p95_latency_s": round(percentile(lats, 95), 2) if lats else None,
 				"error_types": dict(self.tool_errors[tool].most_common()),
@@ -1181,6 +1286,11 @@ class AuditCollector:
 				"schema_reads_total": self.schema_reads_total,
 				"schema_reads_in_browser_sessions": self.schema_reads_in_browser_sessions,
 				"schema_reads_per_session": round(self.schema_reads_in_browser_sessions / total_sessions, 2) if total_sessions else 0.0,
+				"schema_reads_per_agy_session": round(sum(s["schema_reads"] for s in self.sessions if s["source"] == "agy") / agy_sessions, 2) if agy_sessions else 0.0,
+				"schema_read_chars": self.schema_chars_total,
+				"total_input_chars": self.input_chars_total,
+				"agy_output_overflows": self.agy_overflow_expansions,
+				"shared_execute_outputs": sum(s.get("shared_execute_outputs", 0) for s in self.sessions),
 				"auth_or_login_sessions": self.auth_sessions,
 				"auth_or_login_pct": round(100.0 * self.auth_sessions / total_sessions, 1) if total_sessions else 0.0,
 				"screenshot_total": self.screenshot_total,
@@ -1257,6 +1367,20 @@ def compute_diff(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str,
 	b_calls = bs.get("total_calls", 0)
 	c_calls = cs.get("total_calls", 0)
 
+	def schema_reads_per_agy(s: dict[str, Any]) -> float:
+		val = s.get("schema_reads_per_agy_session")
+		if val is not None:
+			return val
+		agy = s.get("sessions_by_source", {}).get("agy", 0)
+		return round(s.get("schema_reads_in_browser_sessions", 0) / agy, 2) if agy else 0.0
+
+	notes = []
+	if bs.get("schema_reads_per_agy_session") is None:
+		notes.append(
+			"Legacy baseline: 'Schema reads / AGY session' before-value derived from "
+			"schema_reads_in_browser_sessions / AGY sessions; the historical numerator may include non-AGY reads."
+		)
+
 	def row(label: str, before: float, after: float, unit: str = "", lower_is_better: Optional[bool] = True) -> dict[str, Any]:
 		delta = round(after - before, 2)
 		status = "flat"
@@ -1287,6 +1411,7 @@ def compute_diff(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str,
 		row("Validation errors / 1k calls", _rate_per_1k(bs.get("validation_errors_total", 0), b_calls), _rate_per_1k(cs.get("validation_errors_total", 0), c_calls), "/1k", True),
 		row("Silent arg drops / 1k calls", _rate_per_1k(bs.get("silent_param_mismatches_total", 0), b_calls), _rate_per_1k(cs.get("silent_param_mismatches_total", 0), c_calls), "/1k", True),
 		row("Schema reads / session", bs.get("schema_reads_per_session", 0), cs.get("schema_reads_per_session", 0), "/sess", True),
+		row("Schema reads / AGY session", schema_reads_per_agy(bs), schema_reads_per_agy(cs), "/agy", True),
 		row("batch share", bt.get("batch", {}).get("share_pct", 0), ct.get("batch", {}).get("share_pct", 0), "%", False),
 		row("state share", bt.get("state", {}).get("share_pct", 0), ct.get("state", {}).get("share_pct", 0), "%", False),
 	]
@@ -1314,6 +1439,7 @@ def compute_diff(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str,
 		"baseline_since": baseline.get("filters", {}).get("since"),
 		"current_generated_at": current.get("generated_at"),
 		"current_since": current.get("filters", {}).get("since"),
+		"notes": notes,
 		"kpis": kpis,
 		"evaluate_js_intents": js_deltas,
 	}
@@ -1328,6 +1454,8 @@ def format_diff(diff: dict[str, Any]) -> str:
 		f"{'Metric':30s} | {'Before':>10s} | {'After':>10s} | {'Delta':>10s} | Status",
 		"-" * 79,
 	]
+	for note in diff.get("notes", []):
+		lines.append(f"NOTE: {note}")
 	for item in diff["kpis"]:
 		unit = item["unit"]
 		b_str = f"{item['before']}{unit}"
@@ -1405,7 +1533,9 @@ def format_report(snap: dict[str, Any], top_n: int, max_samples: int, diff: Opti
 	)
 	lines.append(
 		f"Schema JSON read_file: {s['schema_reads_in_browser_sessions']} in browser sessions "
-		f"({s['schema_reads_per_session']}/sess, {s['schema_reads_total']} total) | "
+		f"({s['schema_reads_per_session']}/sess overall, {s['schema_reads_per_agy_session']}/AGY sess, {s['schema_reads_total']} total, "
+		f"{s['schema_read_chars']:,} ch) | "
+		f"Input arg chars: {s['total_input_chars']:,} | AGY output overflows expanded: {s['agy_output_overflows']} | "
 		f"Screenshots: {s['screenshot_total']} ({s['screenshot_followed_by_read']} read_file after)"
 	)
 	lines.append(
@@ -1419,16 +1549,16 @@ def format_report(snap: dict[str, Any], top_n: int, max_samples: int, diff: Opti
 
 	lines.append("\n## Tool Frequency, Errors & Latency")
 	lines.append(
-		f"{'Tool':18s} | {'Calls':>5s} | {'Share':>6s} | {'Errs':>4s} | {'Err%':>5s} | {'AvgCh':>6s} | {'MedS':>5s} | {'P95S':>5s} | Top Errors"
+		f"{'Tool':18s} | {'Calls':>5s} | {'Share':>6s} | {'Errs':>4s} | {'Err%':>5s} | {'AvgCh':>6s} | {'AvgIn':>6s} | {'MedS':>5s} | {'P95S':>5s} | Top Errors"
 	)
-	lines.append("-" * 92)
+	lines.append("-" * 100)
 	for tool, info in snap["tools"].items():
 		med = f"{info['median_latency_s']:.1f}" if info["median_latency_s"] is not None else "-"
 		p95 = f"{info['p95_latency_s']:.1f}" if info["p95_latency_s"] is not None else "-"
 		top_errs = ", ".join(f"{k}:{v}" for k, v in list(info["error_types"].items())[:3])
 		lines.append(
 			f"{tool:18s} | {info['calls']:5d} | {info['share_pct']:5.1f}% | {info['errors']:4d} | "
-			f"{info['error_rate_pct']:4.1f}% | {info['avg_chars']:6.0f} | {med:>5s} | {p95:>5s} | {top_errs}"
+			f"{info['error_rate_pct']:4.1f}% | {info['avg_chars']:6.0f} | {info['avg_input_chars']:6.0f} | {med:>5s} | {p95:>5s} | {top_errs}"
 		)
 
 	underused_str = ", ".join(f"{u['tool']}({u['calls']})" for u in snap["underused_tools"])
