@@ -361,7 +361,7 @@ def test_fetch_standard_json_behavior_preserved(monkeypatch):
 
 		res = await sb.fetch(url="/api/me")
 		assert "[JSON]" in res
-		assert '"user": "levon"' in res
+		assert '"user":"levon"' in res
 
 	_run(_scenario())
 

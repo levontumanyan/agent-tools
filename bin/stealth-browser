@@ -49,21 +49,24 @@ except Exception:
 mcp = FastMCP(
 	"stealth-browser",
 	instructions=(
-		"Stay headless by default. Only call set_headless(headless=False) for interactive login/2FA/CAPTCHA or when asked.\n"
-		"Tool cheat-sheet (tab=-1 targets active tab):\n"
+		"Stay headless by default. Use wait_for_human() for interactive login/2FA/CAPTCHA (switches headed & polls); only call set_headless(headless=False) when asked.\n"
+		"Use this cheat-sheet instead of reading individual tool schemas; prefer snapshot(filter=...)/extract()/batch() over evaluate_js(). tab=-1 targets active tab (or index / stable 'tN').\n"
 		"- status() | new_tab(url='about:blank', block_media=None) | switch_tab(tab=0) | close_tab(tab=-1)\n"
 		"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
 		"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
-		"- snapshot(selector='body', max_elements=80, tab=-1) | get_content(selector='body', max_length=4000, interactive_only=False, clean=True, tab=-1)\n"
-		"- extract(container_selector='.product-card', fields={title: 'text:.title', link: '@href a'}, limit=20, tab=-1) for repeated-card structured JSON rows\n"
-		"- click(selector, tab=-1, timeout_ms=5000) | type(selector, text, clear_first=True, press_enter=False, tab=-1, timeout_ms=5000)\n"
-		"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1)\n"
-		"- batch(actions=[{action, selector, text, key, value, state, ms, expression, timeout_ms}], tab=-1)\n"
-		"- evaluate_js(expression='', tab=-1, timeout_ms=15000, max_length=40000, main_world=False) (alias: script=...; main_world=True for page globals)\n"
-		"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000)\n"
-		"- state(framework='auto', selector='', tab=-1) | set_media(enable_media=True, tab=-1)\n"
-		"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None)\n"
-		"- set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
+		"- wait_for_human(reason='...', url_contains='', url_not_contains='', selector='', timeout_s=180, poll_interval_s=1.5, notify=True, tab=-1)\n"
+		"- snapshot(selector='body', max_elements=80, tab=-1, include_shadow=True, include_iframes=True, include_hrefs=False, filter='', viewport_only=False, max_length=8000)\n"
+		"- get_content(selector='body', max_length=4000, interactive_only=False, clean=True, tab=-1, offset=0, filter='')\n"
+		"- extract(container_selector, fields={k:'text:.sel'|'@attr .sel'|'html:.sel'}, limit=20, include_shadow=True, include_iframes=True, tab=-1, max_length=8000)\n"
+		"- click(selector='', ref='', text='', force=False, tab=-1, timeout_ms=5000)\n"
+		"- type(selector='', text='', clear_first=True, press_enter=False, tab=-1, timeout_ms=5000, ref='')\n"
+		"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1, full_page=False, selector='', ref='', annotate=False)\n"
+		"- batch(actions=[{action:'click'|'fill'|'type'|'select'|'press'|'wait_for'|'sleep'|'evaluate', selector, ref, text, value, key, state, ms, force, expression, main_world, timeout_ms}], tab=-1)\n"
+		"- evaluate_js(expression='', tab=-1, timeout_ms=15000, script='', max_length=8000, main_world=False)\n"
+		"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000, save_path='', max_length=8000)\n"
+		"- state(framework='auto', selector='', tab=-1, max_length=8000) | set_media(enable_media=True, tab=-1)\n"
+		"- downloads(limit=20, include_dir=False) | network_requests(url_filter='', resource_type='', content_type='', status_min=0, limit=30, clear=False, tab=-1, max_length=8000) | console_logs(level='', limit=50, clear=False, tab=-1, max_length=8000)\n"
+		"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
 	),
 )
 
@@ -1165,21 +1168,7 @@ async def keep_alive(
 	max_seconds: int = 90,
 	ping_url: Optional[str] = None,
 ) -> str:
-	"""Keep a web session alive with randomized jitter intervals and automatic modal dismissal.
-
-	Runs a background worker for the tab that:
-	- Periodically dispatches randomized human-like mouse movements and scroll events.
-	- Detects and automatically clicks common session-timeout dialogs (e.g. 'Keep Working', 'Stay Signed In').
-	- Optionally pings a specified session heartbeat endpoint with HTTP requests.
-	- Prevents the stealth-browser MCP driver from shutting down on idle.
-
-	Parameters:
-	- enable: Set to True to activate keep-alive on the tab; False to disable.
-	- tab: Target tab index (-1 for active tab).
-	- min_seconds: Minimum randomized interval between heartbeats (default 45).
-	- max_seconds: Maximum randomized interval between heartbeats (default 90).
-	- ping_url: Optional relative or absolute URL to fetch periodically for server-side token refresh.
-	"""
+	"""Keep a tab session alive with jittered mouse/scroll activity, modal auto-dismissal, and optional heartbeat ping_url."""
 	try:
 		page = await session.resolve_page(tab)
 		pages = await session.get_pages()
@@ -1213,16 +1202,7 @@ async def navigate(
 	timeout_ms: int = 30000,
 	wait_until: str = "domcontentloaded",
 ) -> str:
-	"""Navigate a browser tab to a specific URL with optional media blocking and fast execution.
-
-	Parameters:
-	- url: Destination web address (http, https, or about:).
-	- block_media: Optional boolean. If True, blocks heavy media (images, videos, custom web fonts) for maximum loading speed (up to 3x faster). If False, enables media loading. If omitted (None), preserves current tab media state.
-	- new_tab: If True, opens in a brand new tab.
-	- tab: Target tab index (-1 for active tab).
-	- timeout_ms: Maximum navigation timeout in milliseconds (default 30000).
-	- wait_until: Navigation wait condition: 'domcontentloaded' for mounted DOM (default), 'commit' for ultra-fast response headers, or 'load'/'networkidle'.
-	"""
+	"""Navigate a tab to url. block_media=True blocks images/fonts/video (None preserves state); wait_until: 'domcontentloaded'|'commit'|'load'|'networkidle'."""
 	t0 = time.perf_counter()
 	try:
 		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
@@ -1284,7 +1264,7 @@ async def navigate(
 	except Exception as exc:
 		if "timeout" in exc.__class__.__name__.lower():
 			return f"Navigation error: Timed out after {timeout_ms}ms navigating to '{url}'"
-		return f"Navigation error: {exc}"
+		return f"Navigation error: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
@@ -1346,18 +1326,7 @@ async def wait_for_human(
 	notify: bool = True,
 	tab: Union[int, str] = -1,
 ) -> str:
-	"""Hand off a tab to the human for interactive login/2FA/CAPTCHA, switching to headed mode if needed, and poll until complete.
-
-	Parameters:
-	- reason: Human-readable prompt shown in the macOS notification and timeout message.
-	- url_contains: Complete when the tab URL contains this substring.
-	- url_not_contains: Complete when the tab URL no longer contains this substring.
-	- selector: Complete when this CSS/Playwright selector becomes visible on the tab.
-	- timeout_s: Maximum seconds to wait before timing out (default 180).
-	- poll_interval_s: Seconds between completion checks (default 1.5).
-	- notify: Send a best-effort non-blocking macOS notification via osascript (default True).
-	- tab: Target tab index or stable tab ID like 't1' (-1 for active tab).
-	"""
+	"""Hand off a tab to the human for login/2FA/CAPTCHA (switches to headed mode if needed, sends optional macOS notification) and poll until url_contains, url_not_contains, selector visible, or URL change."""
 	t0 = time.monotonic()
 	notify_proc: Optional[subprocess.Popen] = None
 	try:
@@ -1462,12 +1431,7 @@ async def wait_for_human(
 
 @mcp.tool()
 async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str:
-	"""Toggle media loading (images, videos, web fonts) on the current or specified tab.
-
-	Parameters:
-	- enable_media: Set to True (default) to allow full image and media loading. Set to False to block images and fonts for blazing-fast text-only scraping.
-	- tab: Target tab index (-1 for active tab).
-	"""
+	"""Toggle media loading (images, videos, web fonts) on a tab. enable_media=False blocks heavy media for fast text-only browsing."""
 	try:
 		page = await session.resolve_page(tab)
 		await set_page_media_state(page, block_media=not enable_media)
@@ -1479,12 +1443,132 @@ async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str
 		return f"Error updating media state: {exc}"
 
 
+_BATCH_EVAL_MAX_CHARS = 2000
+_BATCH_TOTAL_MAX_CHARS = 8000
+_DEFAULT_OUTPUT_MAX_CHARS = 8000
+
+
+def _compact_json(obj: Any) -> str:
+	return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _truncate_text(text: str, max_length: int) -> str:
+	if max_length > 0 and len(text) > max_length:
+		return text[:max_length] + f"\n... [Truncated: {len(text)} total characters]"
+	return text
+
+
+def _truncate_url(url: str, max_len: int = 160) -> str:
+	s = str(url or "")
+	if len(s) <= max_len:
+		return s
+	return s[: max_len - 3] + "..."
+
+
+def _truncate_lines(header_fn, lines: list[str], max_length: int, hint: str = "") -> str:
+	if max_length <= 0:
+		return "\n".join([header_fn(len(lines))] + lines)
+	sample_header = header_fn(len(lines))
+	cur = len(sample_header)
+	kept: list[str] = []
+	for line in lines:
+		add = len(line) + 1
+		if kept and cur + add + 90 > max_length:
+			break
+		kept.append(line)
+		cur += add
+	out = [header_fn(len(kept))] + kept
+	if len(kept) < len(lines):
+		extra = f"; {hint}" if hint else ""
+		out.append(f"... [Truncated at {max_length} chars{extra}]")
+	return "\n".join(out)
+
+
+def _compact_html_tag(tag_str: str) -> str:
+	m = re.match(r"<([a-zA-Z0-9_-]+)([^>]*)>", tag_str)
+	if not m:
+		return tag_str[:80]
+	tag, attrs = m.group(1).lower(), m.group(2)
+	id_m = re.search(r'\bid=["\']([^"\']+)["\']', attrs)
+	cls_m = re.search(r'\bclass=["\']([^"\']+)["\']', attrs)
+	parts = [tag]
+	if id_m:
+		parts.append(f"#{id_m.group(1)[:40]}")
+	if cls_m:
+		first_cls = cls_m.group(1).strip().split()[0][:40]
+		if first_cls:
+			parts.append(f".{first_cls}")
+	return f"<{''.join(parts)}>"
+
+
+def _format_playwright_error(exc: Exception, max_chars: int = 300) -> str:
+	raw = str(exc).strip()
+	if not raw:
+		return exc.__class__.__name__
+	parts = re.split(r"\n\s*Call log:\s*\n?", raw, maxsplit=1)
+	summary = " ".join(parts[0].strip().split())
+	if len(parts) == 1:
+		return summary if len(summary) <= max_chars else summary[: max_chars - 3] + "..."
+
+	log_lines = [ln.strip().lstrip("- ").strip() for ln in parts[1].splitlines() if ln.strip()]
+	reason = ""
+	hint = ""
+	for ln in log_lines:
+		low = ln.lower()
+		if "intercepts pointer events" in low:
+			tag_m = re.search(r"<[^>]+>", ln)
+			blocker = _compact_html_tag(tag_m.group(0)) if tag_m else "overlay"
+			reason = f"{blocker} intercepts pointer events"
+			hint = " (try force=True)"
+			break
+		if any(k in low for k in (
+			"element is not visible",
+			"element is not enabled",
+			"element is outside of the viewport",
+			"element was detached",
+			"strict mode violation",
+		)):
+			reason = re.sub(r"<[^>]+>", lambda m: _compact_html_tag(m.group(0)), ln)[:120]
+			break
+	if not reason:
+		for ln in reversed(log_lines):
+			low = ln.lower()
+			if not low.startswith(("retrying ", "waiting ")) and "× waiting" not in low:
+				reason = re.sub(r"<[^>]+>", lambda m: _compact_html_tag(m.group(0)), ln)[:120]
+				break
+
+	msg = f"{summary} — {reason}{hint}" if reason else summary
+	return msg if len(msg) <= max_chars else msg[: max_chars - 3] + "..."
+
+
+def _action_delta_suffix(page: Page, before_url: str, before_dialogs: int) -> str:
+	notes: list[str] = []
+	after_url = getattr(page, "url", "") or ""
+	if after_url and after_url != before_url:
+		notes.append(f"navigated -> {after_url}")
+	hist = getattr(page, "_dialog_history", None)
+	if hist is not None and len(hist) > before_dialogs:
+		last = list(hist)[-1]
+		notes.append(f"dialog[{last.get('type', 'alert')}]: {str(last.get('message', ''))[:80]}")
+	return f" | {'; '.join(notes)}" if notes else ""
+
+
 _SB_REF_SELECTOR_RE = re.compile(r'^\[data-sb-ref=["\']([^"\']+)["\']\]$')
 
-_SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeIframes }) => {
+_SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeIframes, includeHrefs, filter, viewportOnly }) => {
 	const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'HEAD', 'TITLE', 'TEMPLATE']);
 	const INTERACTIVE_SEL = 'button, input, select, textarea, a[href], summary, [role="button"], [role="link"], [role="combobox"], [role="option"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"]';
 	const limit = Math.max(1, Number(maxElements) || 80);
+	const filterStr = String(filter || '').trim();
+	let filterRe = null;
+	if (filterStr) {
+		try {
+			filterRe = new RegExp(filterStr, 'i');
+		} catch (_) {
+			filterRe = null;
+		}
+	}
+	const filterLow = filterStr.toLowerCase();
 
 	const escIdent = (s) => (typeof CSS !== 'undefined' && CSS.escape)
 		? CSS.escape(String(s))
@@ -1497,10 +1581,30 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 			const style = win.getComputedStyle(el);
 			if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
 			const rect = el.getBoundingClientRect();
-			return rect.width > 0 && rect.height > 0;
+			if (!(rect.width > 0 && rect.height > 0)) return false;
+			if (viewportOnly) {
+				const vw = win.innerWidth || document.documentElement.clientWidth || 0;
+				const vh = win.innerHeight || document.documentElement.clientHeight || 0;
+				if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= vh || rect.left >= vw) return false;
+			}
+			return true;
 		} catch (_) {
 			return false;
 		}
+	};
+
+	const matchesFilter = (el) => {
+		if (!filterStr) return true;
+		const hay = [
+			(el.innerText || el.textContent || '').trim(),
+			el.getAttribute('aria-label') || '',
+			el.getAttribute('placeholder') || '',
+			el.name || '',
+			el.id || '',
+			el.getAttribute('href') || '',
+			el.href || '',
+		].filter(Boolean).join(' ');
+		return filterRe ? filterRe.test(hay) : hay.toLowerCase().includes(filterLow);
 	};
 
 	const clearRefs = (root, visited) => {
@@ -1538,19 +1642,24 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 	}
 
 	const collected = [];
+	let totalMatched = 0;
+	const countCap = limit * 10;
 	const seen = new Set();
 
 	const walk = (node, ctx) => {
-		if (!node || collected.length >= limit) return;
+		if (!node || totalMatched >= countCap) return;
 		if (node.nodeType === 1) {
 			const tn = (node.tagName || '').toUpperCase();
 			if (SKIP_TAGS.has(tn) || seen.has(node)) return;
 			seen.add(node);
 
 			try {
-				if (node.matches && node.matches(INTERACTIVE_SEL) && isVisible(node)) {
-					collected.push({ el: node, ctx });
-					if (collected.length >= limit) return;
+				if (node.matches && node.matches(INTERACTIVE_SEL) && isVisible(node) && matchesFilter(node)) {
+					totalMatched++;
+					if (collected.length < limit) {
+						collected.push({ el: node, ctx });
+					}
+					if (totalMatched >= countCap) return;
 				}
 			} catch (_) {}
 
@@ -1558,7 +1667,7 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 				const shadowCtx = { rootNode: node.shadowRoot, inShadow: true, inIframe: ctx.inIframe };
 				for (const child of node.shadowRoot.children) {
 					walk(child, shadowCtx);
-					if (collected.length >= limit) return;
+					if (totalMatched >= countCap) return;
 				}
 			}
 
@@ -1568,19 +1677,19 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 					if (doc && doc.documentElement) {
 						const iframeCtx = { rootNode: doc, inShadow: ctx.inShadow, inIframe: true };
 						walk(doc.documentElement, iframeCtx);
-						if (collected.length >= limit) return;
+						if (totalMatched >= countCap) return;
 					}
 				} catch (_) {}
 			}
 
 			for (const child of node.children) {
 				walk(child, ctx);
-				if (collected.length >= limit) return;
+				if (totalMatched >= countCap) return;
 			}
 		} else if (node.children) {
 			for (const child of node.children) {
 				walk(child, ctx);
-				if (collected.length >= limit) return;
+				if (totalMatched >= countCap) return;
 			}
 		}
 	};
@@ -1651,43 +1760,66 @@ _SNAPSHOT_JS = r"""async ({ targetSelector, maxElements, includeShadow, includeI
 		return refSel;
 	};
 
-	return collected.map(({ el, ctx }, i) => {
+	const origin = (window.location && window.location.origin) || '';
+	const items = collected.map(({ el, ctx }, i) => {
 		const ref = `e${i}`;
 		el.setAttribute('data-sb-ref', ref);
 		const tag = (el.tagName || '').toLowerCase();
-		const id = el.id ? `#${el.id}` : '';
-		const name = el.name ? `[name="${el.name}"]` : '';
-		const type = el.type ? `[type="${el.type}"]` : '';
-		const role = el.getAttribute('role') ? `[role="${el.getAttribute('role')}"]` : '';
-		const aria = el.getAttribute('aria-label') ? `aria-label="${el.getAttribute('aria-label')}"` : '';
-		const val = (el.value !== undefined && el.value !== '' && tag !== 'button') ? `val="${String(el.value).slice(0, 60)}"` : '';
+		const selector = buildSelector(el, tag, ref, ctx);
 		const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+		const ariaRaw = (el.getAttribute('aria-label') || '').trim();
+		const placeholderRaw = (el.getAttribute('placeholder') || '').trim();
+		const roleRaw = (el.getAttribute('role') || '').trim();
+
+		const attrParts = [];
+		if (el.id && !selector.includes(`#${el.id}`) && !selector.includes(`#${escIdent(el.id)}`)) {
+			attrParts.push(`#${el.id}`);
+		}
+		if (el.name && !selector.includes('[name=')) {
+			attrParts.push(`name=${el.name}`);
+		}
+		if (el.type && !selector.includes('[type=')) {
+			attrParts.push(`type=${el.type}`);
+		}
+		if (roleRaw) {
+			attrParts.push(`role=${roleRaw}`);
+		}
+		if (ariaRaw && !selector.includes('[aria-label=') && ariaRaw.toLowerCase() !== text.toLowerCase()) {
+			attrParts.push(`aria="${ariaRaw.slice(0, 50)}"`);
+		}
+		if (placeholderRaw && !text && !ariaRaw) {
+			attrParts.push(`placeholder="${placeholderRaw.slice(0, 40)}"`);
+		}
+		if (el.value !== undefined && el.value !== '' && tag !== 'button') {
+			attrParts.push(`val="${String(el.value).slice(0, 40)}"`);
+		}
+		if (ctx.inIframe) attrParts.push('[iframe]');
+		if (ctx.inShadow) attrParts.push('[shadow]');
 
 		let href = '';
-		if (tag === 'a') {
+		if (includeHrefs && tag === 'a') {
 			const rawHref = (el.getAttribute('href') || '').trim();
-			if (rawHref.startsWith('#') || rawHref.toLowerCase().startsWith('javascript:')) {
-				href = rawHref;
-			} else {
+			const lowHref = rawHref.toLowerCase();
+			if (rawHref && rawHref !== '#' && !lowHref.startsWith('javascript:')) {
 				href = el.href || rawHref;
+				if (origin && href.startsWith(origin)) {
+					href = href.slice(origin.length) || '/';
+				}
+				if (href.length > 80) href = href.slice(0, 77) + '...';
 			}
-			if (href.length > 120) href = href.slice(0, 117) + '...';
 		}
-
-		const scopeTags = [];
-		if (ctx.inIframe) scopeTags.push('[iframe]');
-		if (ctx.inShadow) scopeTags.push('[shadow]');
 
 		return {
 			index: i,
 			ref,
 			tag,
-			selector: buildSelector(el, tag, ref, ctx),
+			selector,
 			text,
 			href,
-			attrs: [id, name, type, role, aria, val, ...scopeTags].filter(Boolean).join(' ')
+			attrs: attrParts.join(' '),
 		};
 	});
+	return { totalMatched, totalCapped: totalMatched >= countCap, items };
 }"""
 
 _EXTRACT_JS = r"""({ containerSelector, fields, limit, includeShadow, includeIframes }) => {
@@ -2036,25 +2168,33 @@ async def _js_type_ref(page: Page, ref_id: str, text: str, clear_first: bool = T
 		return False
 
 
-def _format_snapshot_row(el: dict, fallback_idx: int) -> str:
+def _format_snapshot_row(el: dict, fallback_idx: int, include_hrefs: bool = False) -> str:
 	ref = el.get("ref") or f"e{el.get('index', fallback_idx)}"
 	tag = el.get("tag", "")
-	sel = str(el.get("selector", "")).replace("|", "\\|")
-	text = str(el.get("text", "")).replace("\n", " ").replace("|", "\\|").strip()
-	attrs = str(el.get("attrs", "")).replace("\n", " ").replace("|", "\\|").strip()
-	href = str(el.get("href", "") or "").replace("\n", " ").replace("|", "\\|").strip()
+	sel = str(el.get("selector", "")).strip()
+	text = " ".join(str(el.get("text", "")).split())
+	attrs_raw = " ".join(str(el.get("attrs", "")).split())
+	href = " ".join(str(el.get("href", "") or "").split()) if include_hrefs else ""
+
+	show_sel = bool(sel) and sel != tag and not _SB_REF_SELECTOR_RE.match(sel)
+	if show_sel and attrs_raw:
+		dedup_tokens = [tok for tok in attrs_raw.split(" ") if tok and tok != sel]
+		attrs_raw = " ".join(dedup_tokens)
+
 	if href:
-		if len(href) > 120:
-			href = href[:117] + "..."
+		if len(href) > 80:
+			href = href[:77] + "..."
 		href_part = f"href={href}"
-		attrs = f"{attrs} {href_part}".strip() if attrs else href_part
-	if text and attrs:
-		desc = f"{text} ({attrs})"
-	elif attrs:
-		desc = f"({attrs})"
-	else:
-		desc = text
-	return f"| {ref} | `<{tag}>` | `{sel}` | {desc} |"
+		attrs_raw = f"{attrs_raw} {href_part}".strip() if attrs_raw else href_part
+
+	parts = [f"[{ref}]", f"<{tag}>"]
+	if show_sel:
+		parts.append(sel)
+	if text:
+		parts.append(f'"{text}"')
+	if attrs_raw:
+		parts.append(f"({attrs_raw})")
+	return " ".join(parts)
 
 
 @mcp.tool()
@@ -2064,13 +2204,17 @@ async def snapshot(
 	tab: Union[int, str] = -1,
 	include_shadow: bool = True,
 	include_iframes: bool = True,
+	include_hrefs: bool = False,
+	filter: str = "",
+	viewport_only: bool = False,
+	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 ) -> str:
-	"""Extract interactive elements (buttons, inputs, links, selects, dropdowns) with ephemeral refs (e0, e1, ...), unique selectors, and link hrefs across DOM, open Shadow DOM, and same-origin iframes."""
+	"""List visible interactive elements with refs (e0, e1, ...) across DOM, Shadow DOM, and same-origin iframes. Use filter/viewport_only to narrow; include_hrefs=True to show link URLs."""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
 		try:
-			elements = await asyncio.wait_for(
+			raw = await asyncio.wait_for(
 				page.evaluate(
 					_SNAPSHOT_JS,
 					{
@@ -2078,6 +2222,9 @@ async def snapshot(
 						"maxElements": max_elements,
 						"includeShadow": include_shadow,
 						"includeIframes": include_iframes,
+						"includeHrefs": include_hrefs,
+						"filter": filter,
+						"viewportOnly": viewport_only,
 					},
 				),
 				timeout=10.0,
@@ -2086,37 +2233,57 @@ async def snapshot(
 			return "Error capturing snapshot: Timed out after 10000ms"
 		elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
+		if isinstance(raw, dict):
+			elements = raw.get("items") or []
+			total_matched = int(raw.get("totalMatched", len(elements)))
+			total_capped = bool(raw.get("totalCapped", False))
+		else:
+			elements = raw or []
+			total_matched = len(elements)
+			total_capped = False
+
+		url_str = _truncate_url(page.url, 160)
 		if not elements:
-			return f"No interactive elements found on {page.url} ({elapsed_ms}ms)"
+			filter_note = f" matching '{filter}'" if filter else ""
+			return f"No interactive elements found{filter_note} on {url_str} ({elapsed_ms}ms)"
 
 		elements = elements[:max_elements]
-		lines = [f"Interactive elements snapshot for {page.url} ({elapsed_ms}ms, {len(elements)} items):", ""]
-		lines.append("| Ref | Tag | Selector | Text / Details |")
-		lines.append("|---|---|---|---|")
-		for idx, el in enumerate(elements):
-			lines.append(_format_snapshot_row(el, idx))
+		rows = [_format_snapshot_row(el, idx, include_hrefs=include_hrefs) for idx, el in enumerate(elements)]
+		total_label = f"{total_matched}+" if total_capped else str(total_matched)
+		footer = "... [narrow with selector=, filter=, or viewport_only=True]"
+
+		if max_length > 0:
+			kept: list[str] = []
+			header_reserve = len(f"Snapshot {url_str} ({elapsed_ms}ms, showing {len(rows)} of {total_label} items):") + len(footer) + 2
+			budget = max(120, max_length - header_reserve)
+			cur = 0
+			for row in rows:
+				if kept and cur + len(row) + 1 > budget:
+					break
+				kept.append(row)
+				cur += len(row) + 1
+			rows = kept
+
+		shown = len(rows)
+		is_partial = shown < total_matched or total_capped
+		count_str = f"showing {shown} of {total_label} items" if is_partial else f"{shown} items"
+		header = f"Snapshot {url_str} ({elapsed_ms}ms, {count_str}):"
+		lines = [header] + rows
+		if is_partial:
+			lines.append(footer)
 		return "\n".join(lines)
 	except Exception as exc:
-		return f"Error capturing snapshot: {exc}"
+		return f"Error capturing snapshot: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
 async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
-	"""Execute a pipeline of browser actions sequentially in a single turn for maximum speed (10-100x faster than roundtrips).
-
-	Supported action types in the dict:
-	- {"action": "click", "selector": "#btn", "ref": "e5", "text": "Sign In", "force": False, "timeout_ms": 3000}
-	- {"action": "fill", "selector": "#input", "ref": "e2", "text": "hello", "force": False, "timeout_ms": 3000}
-	- {"action": "type", "selector": "#input", "ref": "e2", "text": "hello", "press_enter": True, "timeout_ms": 3000}
-	- {"action": "select", "selector": "select#country", "ref": "e4", "value": "CA", "force": False, "timeout_ms": 3000}
-	- {"action": "press", "key": "Enter"}
-	- {"action": "wait_for", "selector": ".modal", "ref": "e7", "timeout_ms": 3000, "state": "visible"}
-	- {"action": "sleep", "ms": 500}
-	- {"action": "evaluate", "expression": "window.scrollTo(0, 500)", "main_world": False}
-	"""
+	"""Run sequential actions in one turn. Valid actions: click, fill, type, select, press, wait_for, sleep, evaluate (fields: selector, ref, text, value, key, state, ms, force, expression, main_world, timeout_ms)."""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
+		before_url = getattr(page, "url", "") or ""
+		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		results = []
 		for idx, item in enumerate(actions):
 			act = item.get("action", "").lower()
@@ -2221,16 +2388,93 @@ async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 					page.evaluate(expr, isolated_context=not main_world),
 					timeout=timeout / 1000.0,
 				)
-				results.append(f"[{idx}] evaluate: {res}")
+				res_str = _compact_json(res) if isinstance(res, (dict, list)) else str(res)
+				res_str = _truncate_text(res_str, _BATCH_EVAL_MAX_CHARS)
+				results.append(f"[{idx}] evaluate: {res_str}")
 
 			else:
 				results.append(f"[{idx}] Unknown action '{act}': SKIPPED")
 
 		elapsed = int((time.perf_counter() - t0) * 1000)
-		return f"Batch completed ({len(results)} steps in {elapsed}ms) on {page.url}:\n" + "\n".join(results)
+		delta = _action_delta_suffix(page, before_url, before_dialogs)
+		out = f"Batch completed ({len(results)} steps in {elapsed}ms) on {page.url}{delta}:\n" + "\n".join(results)
+		return _truncate_text(out, _BATCH_TOTAL_MAX_CHARS)
 	except Exception as exc:
 		elapsed = int((time.perf_counter() - t0) * 1000)
-		return f"Batch failed after {elapsed}ms: {exc}"
+		return f"Batch failed after {elapsed}ms: {_format_playwright_error(exc)}"
+
+
+_GET_CONTENT_CLEAN_JS = r"""({ sel }) => {
+	const el = document.querySelector(sel);
+	if (!el) return '';
+	const JUNK_SEL = 'script, style, svg, noscript, nav, header, footer, [role="banner"], [role="navigation"], [aria-hidden="true"], .cookie-banner, .cookie-consent, #cookie-banner, .advertisement, .ad-banner';
+	const BLOCK_DISPLAY = new Set(['block', 'flex', 'grid', 'list-item', 'table', 'table-row', 'table-caption', 'flow-root']);
+	const parts = [];
+	const walk = (node) => {
+		if (!node) return;
+		if (node.nodeType === 3) {
+			const t = (node.nodeValue || '').replace(/[\t\r\n ]+/g, ' ');
+			if (t.trim()) {
+				parts.push(t);
+			} else if (t && parts.length && !parts[parts.length - 1].endsWith('\n') && !parts[parts.length - 1].endsWith(' ')) {
+				parts.push(' ');
+			}
+			return;
+		}
+		if (node.nodeType !== 1) return;
+		if (node !== el) {
+			if (node.hidden) return;
+			try { if (node.matches && node.matches(JUNK_SEL)) return; } catch (_) {}
+			try {
+				const cs = window.getComputedStyle(node);
+				if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return;
+			} catch (_) {}
+		}
+		const tag = (node.tagName || '').toUpperCase();
+		if (tag === 'BR') {
+			parts.push('\n');
+			return;
+		}
+		let isBlock = false;
+		try {
+			const cs = window.getComputedStyle(node);
+			if (cs && BLOCK_DISPLAY.has(cs.display)) isBlock = true;
+		} catch (_) {}
+		if (isBlock && parts.length && !parts[parts.length - 1].endsWith('\n')) parts.push('\n');
+		for (const child of node.childNodes) walk(child);
+		if (isBlock && parts.length && !parts[parts.length - 1].endsWith('\n')) parts.push('\n');
+	};
+	walk(el);
+	return parts.join('')
+		.split('\n')
+		.map((l) => l.replace(/[ \t]+/g, ' ').trim())
+		.join('\n')
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
+}"""
+
+
+def _filter_content_lines(text: str, pattern: str) -> Optional[str]:
+	lines = text.splitlines()
+	try:
+		rx = re.compile(pattern, re.IGNORECASE)
+	except re.error:
+		rx = re.compile(re.escape(pattern), re.IGNORECASE)
+	matched_indices = [i for i, ln in enumerate(lines) if rx.search(ln)]
+	if not matched_indices:
+		return None
+	keep: set[int] = set()
+	for idx in matched_indices:
+		for j in range(max(0, idx - 1), min(len(lines), idx + 2)):
+			keep.add(j)
+	out: list[str] = []
+	prev = -2
+	for idx in sorted(keep):
+		if prev >= 0 and idx > prev + 1:
+			out.append("--")
+		out.append(lines[idx])
+		prev = idx
+	return "\n".join(out)
 
 
 @mcp.tool()
@@ -2240,11 +2484,13 @@ async def get_content(
 	interactive_only: bool = False,
 	clean: bool = True,
 	tab: Union[int, str] = -1,
+	offset: int = 0,
+	filter: str = "",
 ) -> str:
-	"""Extract visible text content or interactive elements from the active tab. Set interactive_only=True for compact semantic elements snapshot, or clean=False for raw text."""
+	"""Extract visible text from a tab. Supports offset (negative for tail, e.g. -3000), filter (regex/substring with context), clean=True (strips nav/hidden/whitespace), or interactive_only=True (calls snapshot)."""
 	try:
 		if interactive_only:
-			return await snapshot(selector=selector, tab=tab)
+			return await snapshot(selector=selector, tab=tab, filter=filter)
 
 		page = await session.resolve_page(tab)
 		element = page.locator(selector).first
@@ -2252,27 +2498,34 @@ async def get_content(
 			return f"Element '{selector}' not found on page {page.url}"
 
 		if clean:
-			js_clean = """({ sel }) => {
-				const el = document.querySelector(sel);
-				if (!el) return '';
-				const clone = el.cloneNode(true);
-				const junk = clone.querySelectorAll(
-					'script, style, svg, noscript, nav, header, footer, [role="banner"], [role="navigation"], [aria-hidden="true"], .cookie-banner, .cookie-consent, #cookie-banner, .advertisement, .ad-banner'
-				);
-				junk.forEach(n => n.remove());
-				return (clone.innerText || clone.textContent || '').trim().replace(/\\n{3,}/g, '\\n\\n');
-			}"""
-			text = await asyncio.wait_for(page.evaluate(js_clean, {"sel": selector}), timeout=10.0)
+			text = await asyncio.wait_for(page.evaluate(_GET_CONTENT_CLEAN_JS, {"sel": selector}), timeout=10.0)
+			text = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in str(text or "").splitlines())
+			text = re.sub(r"\n{3,}", "\n\n", text).strip()
 		else:
-			text = await asyncio.wait_for(element.inner_text(), timeout=10.0)
+			text = str(await asyncio.wait_for(element.inner_text(), timeout=10.0) or "").strip()
 
-		text = text.strip()
-		if len(text) > max_length:
-			truncated = text[:max_length]
-			return f"[Showing first {max_length} characters of {len(text)}]:\n{truncated}\n... (truncated)"
-		return text if text else "(Page element contains no visible text)"
+		if not text:
+			return "(Page element contains no visible text)"
+
+		filter_clean = (filter or "").strip()
+		if filter_clean:
+			filtered = _filter_content_lines(text, filter_clean)
+			if filtered is None:
+				return f"No lines matched filter '{filter_clean}' in '{selector}' on {page.url} ({len(text)} total chars)"
+			text = filtered
+
+		total_len = len(text)
+		if offset > 0 and offset >= total_len:
+			return f"Offset {offset} is past end of content ({total_len} total chars)."
+		start = max(0, total_len + offset) if offset < 0 else offset
+		end = min(total_len, start + max_length) if max_length > 0 else total_len
+		if start > 0 or end < total_len:
+			chunk = text[start:end]
+			tail_note = f"\n... (truncated; pass offset={end} for next chunk)" if end < total_len else ""
+			return f"[Showing chars {start}-{end} of {total_len}]:\n{chunk}{tail_note}"
+		return text
 	except Exception as exc:
-		return f"Error extracting content: {exc}"
+		return f"Error extracting content: {_format_playwright_error(exc)}"
 
 
 _EXTRACT_MAX_FIELDS = 12
@@ -2330,26 +2583,9 @@ async def extract(
 	include_shadow: bool = True,
 	include_iframes: bool = True,
 	tab: Union[int, str] = -1,
-	max_length: int = 20000,
+	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 ) -> str:
-	"""Extract structured rows from repeated card/list containers (search results, product cards, tables) as JSON.
-
-	Scans container_selector across the DOM, open Shadow DOM, and same-origin iframes, and evaluates a field mapping
-	for each matched container — the structured alternative to evaluate_js scraping loops.
-
-	Parameters:
-	- container_selector: CSS selector matching each repeating container (e.g. '.product-card', 'table tbody tr').
-	- fields: Map of output field name to spec. Spec shorthand (string):
-	  'text' (container innerText), '.title' (innerText of sub-element), 'text:.title', '@href' (container attr),
-	  '@href a.link' (attr of sub-element), 'html:.thumb' (outerHTML of sub-element), 'inner_html:.body'.
-	  Spec object form (explicit): {"selector": ".price", "mode": "text"|"attr"|"html"|"inner_html", "attr": "href"}.
-	  Missing elements/attributes yield null per field (null-tolerant). Max 12 fields.
-	- limit: Maximum rows to return (default 20, max 200). total_matched reports the real match count.
-	- include_shadow: Include open Shadow DOM roots (default True).
-	- include_iframes: Include same-origin iframes (default True).
-	- tab: Target tab index (-1 for active tab).
-	- max_length: Output JSON truncation bound in characters (default 20000, 0 disables).
-	"""
+	"""Extract structured JSON rows from repeated containers (cards, tables) across DOM/Shadow/iframes. fields maps name -> 'text:.sel' | '@attr .sel' | 'html:.sel' | {selector, mode, attr} (max 12 fields, limit<=200)."""
 	t0 = time.perf_counter()
 	try:
 		normalized = _normalize_extract_fields(fields)
@@ -2385,15 +2621,12 @@ async def extract(
 				f"No elements matched '{container_selector}' on {page.url} "
 				f"({elapsed_ms}ms, total_matched={result.get('total_matched', 0)})."
 			)
-		formatted = json.dumps(result, indent=2, default=str)
-		if max_length > 0 and len(formatted) > max_length:
-			total_len = len(formatted)
-			formatted = formatted[:max_length] + f"\n... [Truncated: {total_len} total characters]"
+		formatted = _truncate_text(_compact_json(result), max_length)
 		return f"Extracted {result['returned']} row(s) from '{container_selector}' ({elapsed_ms}ms):\n{formatted}"
 	except asyncio.TimeoutError:
 		return "Error extracting rows: Timed out after 15000ms"
 	except Exception as exc:
-		return f"Error extracting rows: {exc}"
+		return f"Error extracting rows: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
@@ -2405,7 +2638,7 @@ async def click(
 	tab: Union[int, str] = -1,
 	timeout_ms: int = 5000,
 ) -> str:
-	"""Click an element on the active page or specified tab index by CSS selector, snapshot ref (e.g. 'e12' or '@e12'), or visible text. Set force=True to bypass pointer-interception overlays."""
+	"""Click an element by CSS selector, snapshot ref ('e12' or '@e12'), or visible text. Set force=True to bypass pointer-interception overlays."""
 	sel_clean = (selector or "").strip()
 	ref_clean = _normalize_ref(ref)
 	if not (sel_clean or ref_clean or text):
@@ -2413,6 +2646,8 @@ async def click(
 	label = f"ref '{ref_clean}'" if ref_clean else (f"'{sel_clean}'" if sel_clean else f"text '{text}'")
 	try:
 		page = await session.resolve_page(tab)
+		before_url = getattr(page, "url", "") or ""
+		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean, text=text)
 		try:
 			if force:
@@ -2432,9 +2667,10 @@ async def click(
 			else:
 				raise
 		force_tag = " (force)" if force else ""
-		return f"Clicked element matching {label}{force_tag} on {page.url}"
+		delta = _action_delta_suffix(page, before_url, before_dialogs)
+		return f"Clicked element matching {label}{force_tag} on {page.url}{delta}"
 	except Exception as exc:
-		return f"Error clicking element {label}: {exc}"
+		return f"Error clicking element {label}: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
@@ -2447,7 +2683,7 @@ async def type(
 	timeout_ms: int = 5000,
 	ref: str = "",
 ) -> str:
-	"""Type text into an input field or textarea on the active page or specified tab index by CSS selector or snapshot ref (e.g. 'e3' or '@e3')."""
+	"""Type text into an input/textarea by CSS selector or snapshot ref ('e3' or '@e3')."""
 	sel_clean = (selector or "").strip()
 	ref_clean = _normalize_ref(ref)
 	if not (sel_clean or ref_clean):
@@ -2455,6 +2691,8 @@ async def type(
 	label = f"ref '{ref_clean}'" if ref_clean else f"'{sel_clean}'"
 	try:
 		page = await session.resolve_page(tab)
+		before_url = getattr(page, "url", "") or ""
+		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		locator, label, ref_id, matched = await _resolve_locator(page, selector=sel_clean, ref=ref_clean)
 		try:
 			if clear_first:
@@ -2469,34 +2707,38 @@ async def type(
 			else:
 				raise
 
+		delta = _action_delta_suffix(page, before_url, before_dialogs)
 		if press_enter:
-			return f"Typed text into {label} and pressed Enter"
-		return f"Typed text into {label}"
+			return f"Typed text into {label} and pressed Enter{delta}"
+		return f"Typed text into {label}{delta}"
 	except Exception as exc:
-		return f"Error typing into {label}: {exc}"
+		return f"Error typing into {label}: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
 async def press_key(key: str, tab: Union[int, str] = -1) -> str:
-	"""Press a keyboard key on the active page or specified tab index (e.g., 'Enter', 'Tab', 'Escape')."""
+	"""Press a keyboard key (e.g., 'Enter', 'Tab', 'Escape')."""
 	try:
 		page = await session.resolve_page(tab)
+		before_url = getattr(page, "url", "") or ""
+		before_dialogs = len(getattr(page, "_dialog_history", None) or ())
 		await page.keyboard.press(key)
-		return f"Pressed key '{key}' on {page.url}"
+		delta = _action_delta_suffix(page, before_url, before_dialogs)
+		return f"Pressed key '{key}' on {page.url}{delta}"
 	except Exception as exc:
-		return f"Error pressing key '{key}': {exc}"
+		return f"Error pressing key '{key}': {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
 async def scroll(direction: str = "down", amount: int = 600, tab: Union[int, str] = -1) -> str:
-	"""Scroll the active page or specified tab index up or down (direction: 'up' or 'down', amount in pixels)."""
+	"""Scroll up or down by amount pixels."""
 	try:
 		page = await session.resolve_page(tab)
 		delta = amount if direction.lower() == "down" else -amount
 		await page.mouse.wheel(0, delta)
 		return f"Scrolled {direction} by {amount}px"
 	except Exception as exc:
-		return f"Error scrolling: {exc}"
+		return f"Error scrolling: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
@@ -2548,7 +2790,7 @@ async def screenshot(
 		extra_line = ("\n" + " | ".join(extras)) if extras else ""
 		return f"Screenshot saved to: {save_path}\nPage Title: {title}\nURL: {page.url}{extra_line}"
 	except Exception as exc:
-		return f"Error taking screenshot: {exc}"
+		return f"Error taking screenshot: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
@@ -2561,19 +2803,9 @@ async def fetch(
 	tab: Union[int, str] = -1,
 	timeout_ms: int = 15000,
 	save_path: str = "",
+	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 ) -> str:
-	"""Execute an in-browser HTTP request in the active tab origin using authenticated cookies and session state.
-
-	Parameters:
-	- url: Target URL or endpoint path (can be relative e.g. '/api/accounts', absolute, or a 'blob:' URL).
-	- method: HTTP method ('GET', 'POST', 'PUT', 'DELETE', etc. Default 'GET').
-	- headers: Optional dictionary of HTTP request headers.
-	- body: Optional request payload (string, dict, or list; dict/list will be serialized as JSON with Content-Type header).
-	- response_type: Expected format: 'auto' (parses JSON if possible, else text), 'json', or 'text'. Ignored when save_path is set.
-	- tab: Target tab index (-1 for active tab).
-	- timeout_ms: Maximum request timeout in milliseconds (default 15000).
-	- save_path: Optional local file path (supports '~') to save binary/PDF/blob responses directly to disk without dumping contents into context.
-	"""
+	"""Execute an authenticated in-browser fetch (supports relative, absolute, and blob: URLs). Pass save_path to write binary/PDF responses to disk without entering context."""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
@@ -2712,14 +2944,10 @@ async def fetch(
 
 		data = result.get("data")
 		if result.get("isJson") and data is not None:
-			dumped = json.dumps(data, indent=2)
-			if len(dumped) > 60000:
-				dumped = dumped[:60000] + f"\n... [Truncated: {len(dumped)} total characters]"
+			dumped = _truncate_text(_compact_json(data), max_length)
 			return f"{status_str} [JSON] from {result['url']}:\n\n{dumped}"
 		else:
-			text = str(data or "")
-			if len(text) > 60000:
-				text = text[:60000] + f"\n... [Truncated: {len(text)} total characters]"
+			text = _truncate_text(str(data or ""), max_length)
 			return f"{status_str} [TEXT] from {result['url']}:\n\n{text}"
 	except Exception as exc:
 		return f"Error executing fetch: {exc}"
@@ -3236,12 +3464,7 @@ def _attach_page_trackers(page: Page) -> None:
 
 @mcp.tool()
 async def downloads(limit: int = 20, include_dir: bool = False) -> str:
-	"""List tracked browser downloads (and optionally recent files in the Downloads directory).
-
-	Parameters:
-	- limit: Maximum number of downloads (and directory files, if include_dir=True) to show (default 20).
-	- include_dir: If True, also list the most recent files in DOWNLOADS_DIR with modified time and size.
-	"""
+	"""List tracked browser downloads (and recent DOWNLOADS_DIR files when include_dir=True)."""
 	try:
 		entries = download_tracker.list_entries(limit=limit)
 		sections: list[str] = []
@@ -3250,9 +3473,10 @@ async def downloads(limit: int = 20, include_dir: bool = False) -> str:
 			for item in entries:
 				size_str = _format_byte_size(item["size_bytes"])
 				dest = item["save_path"] or "(pending)"
+				url_str = _truncate_url(item["url"], 140)
 				line = (
 					f"- [#{item['id']}] [{item['status']}] {item['suggested_filename'] or '(unnamed)'} "
-					f"({size_str}) -> {dest} | url: {item['url']} | started: {item['started_at']}"
+					f"({size_str}) -> {dest} | url: {url_str} | started: {item['started_at']}"
 				)
 				if item["completed_at"]:
 					line += f" | completed: {item['completed_at']}"
@@ -3287,21 +3511,12 @@ async def network_requests(
 	resource_type: str = "",
 	content_type: str = "",
 	status_min: int = 0,
-	limit: int = 50,
+	limit: int = 30,
 	clear: bool = False,
 	tab: Union[int, str] = -1,
+	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 ) -> str:
-	"""List captured network responses and failed requests for a tab from its bounded ring buffer.
-
-	Parameters:
-	- url_filter: Optional case-insensitive substring filter on request URL.
-	- resource_type: Optional resource type filter (comma-separated, e.g. 'fetch', 'xhr,fetch', 'document').
-	- content_type: Optional case-insensitive substring filter on response Content-Type (e.g. 'json', 'pdf').
-	- status_min: Optional minimum HTTP status code (e.g. 400 for errors). Default 0 returns all responses and failures.
-	- limit: Maximum number of matching entries to return (default 50, most recent).
-	- clear: If True, clear this tab's network buffer after reading.
-	- tab: Target tab index (-1 for active tab).
-	"""
+	"""List captured network responses/failures for a tab. Filter by url_filter, resource_type ('xhr,fetch'), content_type ('json','pdf'), or status_min (e.g. 400)."""
 	try:
 		page = await session.resolve_page(tab)
 		_attach_page_trackers(page)
@@ -3318,7 +3533,7 @@ async def network_requests(
 		if not entries:
 			return f"No matching network requests for {page.url} ({total} total captured){cleared_tag}."
 
-		lines = [f"Network requests for {page.url} (showing {len(entries)} of {total} captured){cleared_tag}:"]
+		lines: list[str] = []
 		for item in entries:
 			ts = item["timestamp"].split("T")[-1]
 			if item["failure"]:
@@ -3333,8 +3548,13 @@ async def network_requests(
 			if item["duration_ms"] is not None:
 				meta.append(f"{item['duration_ms']}ms")
 			meta_str = f" ({', '.join(meta)})" if meta else ""
-			lines.append(f"- [{ts}] {status_part} {item['method']} [{item['resource_type']}]{meta_str} {item['url']}")
-		return "\n".join(lines)
+			lines.append(f"- [{ts}] {status_part} {item['method']} [{item['resource_type']}]{meta_str} {_truncate_url(item['url'], 160)}")
+		return _truncate_lines(
+			lambda shown: f"Network requests for {page.url} (showing {shown} of {total} captured){cleared_tag}:",
+			lines,
+			max_length,
+			hint="filter with url_filter=/resource_type=",
+		)
 	except Exception as exc:
 		return f"Error listing network requests: {exc}"
 
@@ -3345,19 +3565,9 @@ async def console_logs(
 	limit: int = 50,
 	clear: bool = False,
 	tab: Union[int, str] = -1,
+	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 ) -> str:
-	"""List captured browser console messages and uncaught page errors for a tab from its bounded ring buffer.
-
-	Note: on the first call for a tab, attaches an on-demand CDP console listener so future
-	script console.log/warn/error calls on that tab are captured (browser-generated messages
-	like network errors are always captured).
-
-	Parameters:
-	- level: Optional level filter (comma-separated, e.g. 'error', 'warning', 'log', 'pageerror').
-	- limit: Maximum number of matching entries to return (default 50, most recent).
-	- clear: If True, clear this tab's console buffer after reading.
-	- tab: Target tab index (-1 for active tab).
-	"""
+	"""List captured browser console messages and page errors (filter by comma-separated level: 'error,warning,log,pageerror'). Attaches CDP console listener on first call."""
 	try:
 		page = await session.resolve_page(tab)
 		_attach_page_trackers(page)
@@ -3372,12 +3582,17 @@ async def console_logs(
 		if not entries:
 			return f"No matching console logs for {page.url} ({total} total captured){cleared_tag}."
 
-		lines = [f"Console logs for {page.url} (showing {len(entries)} of {total} captured){cleared_tag}:"]
+		lines: list[str] = []
 		for item in entries:
 			ts = item["timestamp"].split("T")[-1]
-			loc_str = f" ({item['location']})" if item["location"] else ""
+			loc_str = f" ({_truncate_url(item['location'], 120)})" if item["location"] else ""
 			lines.append(f"- [{ts}] [{item['level']}]{loc_str} {item['text']}")
-		return "\n".join(lines)
+		return _truncate_lines(
+			lambda shown: f"Console logs for {page.url} (showing {shown} of {total} captured){cleared_tag}:",
+			lines,
+			max_length,
+			hint="filter with level=",
+		)
 	except Exception as exc:
 		return f"Error listing console logs: {exc}"
 
@@ -3387,14 +3602,9 @@ async def state(
 	framework: str = "auto",
 	selector: str = "",
 	tab: Union[int, str] = -1,
+	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 ) -> str:
-	"""Inspect and extract in-memory client-side application state (Next.js, Redux, React Fiber, Vue, Apollo, React Query).
-
-	Parameters:
-	- framework: Target framework to probe ('auto', 'next', 'redux', 'react', 'vue', 'apollo', 'query').
-	- selector: Optional DOM selector to inspect a specific component's React Fiber props/state (e.g. '#root', '.portfolio-table').
-	- tab: Target tab index (-1 for active tab).
-	"""
+	"""Inspect in-memory client-side state (framework: 'auto'|'next'|'redux'|'react'|'vue'|'apollo'|'query'; optional selector for React Fiber)."""
 	t0 = time.perf_counter()
 	try:
 		page = await session.resolve_page(tab)
@@ -3598,14 +3808,15 @@ async def state(
 				lines.append(f"- **Top-Level Keys ({len(item['keys'])} total)**: {key_preview}")
 
 			payload = item["data"] if "data" in item else {"props": item.get("props"), "state": item.get("state")}
-			dumped = json.dumps(payload, indent=2)
-			if len(dumped) > 40000:
-				dumped = dumped[:40000] + f"\n... [Truncated: {len(dumped)} total characters]"
+			dumped = _compact_json(payload)
 			lines.append("```json")
 			lines.append(dumped)
 			lines.append("```\n")
 
-		return "\n".join(lines)
+		out = "\n".join(lines)
+		if max_length > 0 and len(out) > max_length:
+			out = out[:max_length] + f"\n... [Truncated: {len(out)} total characters; narrow with framework= or selector=]"
+		return out
 	except Exception as exc:
 		return f"Error detecting state: {exc}"
 
@@ -3616,14 +3827,10 @@ async def evaluate_js(
 	tab: Union[int, str] = -1,
 	timeout_ms: int = 15000,
 	script: str = "",
-	max_length: int = 40000,
+	max_length: int = _DEFAULT_OUTPUT_MAX_CHARS,
 	main_world: bool = False,
 ) -> str:
-	"""Evaluate a JavaScript expression in the active page or specified tab index and return the result.
-
-	Runs in Patchright's isolated world by default (stealthy; full DOM access). Set main_world=True
-	to access page-world globals (e.g. window.__NEXT_DATA__, window.store, React/Vue internals).
-	"""
+	"""Evaluate JS in isolated world by default (alias: script=). Set main_world=True for page globals."""
 	code = expression if expression and expression.strip() else script
 	if not code or not code.strip():
 		return "JavaScript execution error: 'expression' (or alias 'script') must be non-empty."
@@ -3634,12 +3841,10 @@ async def evaluate_js(
 			timeout=timeout_ms / 1000.0,
 		)
 		if isinstance(result, (dict, list)):
-			formatted = json.dumps(result, indent=2, default=str)
+			formatted = _compact_json(result)
 		else:
 			formatted = str(result)
-		if max_length > 0 and len(formatted) > max_length:
-			total_len = len(formatted)
-			formatted = formatted[:max_length] + f"\n... [Truncated: {total_len} total characters]"
+		formatted = _truncate_text(formatted, max_length)
 		return f"Result: {formatted}"
 	except asyncio.TimeoutError:
 		return f"JavaScript execution error: Timed out after {timeout_ms}ms"
@@ -3734,7 +3939,7 @@ async def wait_for(
 		if "timeout" in exc.__class__.__name__.lower():
 			curr_url = page.url if page is not None else "unknown"
 			return f"Wait timed out after {timeout_ms}ms waiting for {pending_desc or 'condition'} on {curr_url}"
-		return f"Error in wait_for: {exc}"
+		return f"Error in wait_for: {_format_playwright_error(exc)}"
 
 
 @mcp.tool()
@@ -3945,14 +4150,7 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 
 @mcp.tool()
 async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = None) -> str:
-	"""Force terminate all browser instances, clean up lingering renderer processes, and start a fresh session.
-
-	Preserves and reopens non-blank tabs across the restart (unless `url` overrides tab [0]).
-
-	Args:
-		headless: Optional boolean to explicitly set headless mode (True) or headed mode with visible UI window (False). If omitted, retains current mode.
-		url: Optional URL to navigate to in tab [0] after restarting. If omitted, retains existing open tabs if active, otherwise opens about:blank.
-	"""
+	"""Restart Chromium cleanly, preserving non-blank tabs unless url overrides tab [0]. headless=None keeps current mode."""
 	try:
 		return await asyncio.wait_for(
 			_restart_browser_inner(headless=headless, url=url),
@@ -3966,12 +4164,7 @@ async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = 
 
 @mcp.tool()
 async def set_headless(headless: bool = True, force: bool = False) -> str:
-	"""Switch between headless (default) and headed mode. Restarts Chromium if mode changes; refuses if non-blank tabs are open unless force=True.
-
-	Args:
-		headless: True for background headless (default); False only for interactive login/2FA/CAPTCHA or when asked.
-		force: Set True to restart Chromium even when non-blank tabs are open.
-	"""
+	"""Switch headless (default) vs headed mode; restarts Chromium on change (refuses if non-blank tabs exist unless force=True). Prefer wait_for_human() for login/2FA."""
 	pages: list[Page] = []
 	try:
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)

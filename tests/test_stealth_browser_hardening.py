@@ -909,7 +909,7 @@ def test_state_evaluates_in_main_world_and_formats_stores(sb, monkeypatch):
 		assert len(page.evaluate_calls) == 1
 		assert page.evaluate_calls[0][2] is False
 		assert "Next.js (__NEXT_DATA__)" in out
-		assert '"user": "levon"' in out
+		assert '"user":"levon"' in out
 		assert "Redux (window.store)" in out
 		assert "```json\n{}\n```" in out
 
