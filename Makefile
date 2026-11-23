@@ -1,7 +1,7 @@
 SWIFT_SRCS := $(wildcard src/*.swift)
 SWIFT_BINS := $(patsubst src/%.swift,bin/%,$(SWIFT_SRCS))
 
-.PHONY: all build clean
+.PHONY: all build clean install-skills
 
 all: build
 
@@ -16,6 +16,13 @@ bin/antigravity-shipper: $(wildcard src/antigravity-shipper/*.go) src/antigravit
 	@mkdir -p bin
 	go -C src/antigravity-shipper build -o ../../bin/antigravity-shipper .
 	@grep -qxF "/$@" .gitignore || echo "/$@" >> .gitignore
+
+install-skills:
+	@mkdir -p "$(HOME)/.agents/skills"
+	@for s in $(CURDIR)/skills/*/; do \
+		name=$$(basename "$$s"); \
+		ln -sfn "$${s%/}" "$(HOME)/.agents/skills/$$name"; \
+	done
 
 clean:
 	rm -f $(SWIFT_BINS) bin/antigravity-shipper

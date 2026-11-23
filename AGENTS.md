@@ -22,5 +22,5 @@
 - **Swift tools (`src/*.swift`)**: Edit source in `src/` and run `make` to compile optimized binaries into `bin/`. Compiled binaries in `bin/` are gitignored.
 - **Script tools (`bin/*`)**: Standalone executables edited directly in `bin/`.
 - **Python tools (`airbnb/`)**: Managed with `uv`. Follow centralized instructions in `airbnb/AGENTS.md`.
-- **Make targets**: `make` / `make build` (compiles `src/*.swift` -> `bin/%`), `make clean` (removes compiled binaries).
+- **Make targets**: `make` / `make build` (compiles `src/*.swift` -> `bin/%`), `make install-skills` (symlinks `skills/*` into `~/.agents/skills/`), `make clean` (removes compiled binaries).
 
