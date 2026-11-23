@@ -343,6 +343,11 @@ class TestComputeDiff:
 		row = next(k for k in diff["kpis"] if k["metric"] == "Schema reads / AGY session")
 		assert row["delta"] == -3.0 and row["status"] == "improved"
 
+	def test_legacy_baseline_notes_and_clean_baseline_has_none(self):
+		legacy_diff = sba.compute_diff(self._baseline(legacy=True), self._baseline(legacy=False))
+		assert legacy_diff["notes"] and "Legacy baseline" in legacy_diff["notes"][0]
+		assert sba.compute_diff(self._baseline(legacy=False), self._baseline(legacy=False))["notes"] == []
+
 
 class TestInputCharTracking:
 	def test_record_call_tracks_input_chars(self):

@@ -640,7 +640,7 @@ class AuditCollector:
 				})
 
 		classify_body = unwrap_result_json(body) if classify_body is None else classify_body
-		snip = body if classify_body is None else classify_body
+		snip = classify_body
 		outcome = classify_outcome(tool, classify_body, explicit_error=explicit_error)
 		is_hard_error = bool(outcome and outcome not in SOFT_OUTCOMES)
 
@@ -1230,6 +1230,7 @@ class AuditCollector:
 			errs = sum(self.tool_errors[tool].values())
 			soft = sum(self.tool_soft[tool].values())
 			chars_list = self.call_chars[tool]
+			input_list = self.call_input_chars[tool]
 			lats = self.call_latencies[tool]
 			tools_summary[tool] = {
 				"calls": cnt,
@@ -1239,7 +1240,7 @@ class AuditCollector:
 				"soft_outcomes": soft,
 				"avg_chars": round(sum(chars_list) / len(chars_list), 1) if chars_list else 0.0,
 				"total_chars": sum(chars_list),
-				"avg_input_chars": round(sum(input_list) / len(input_list), 1) if (input_list := self.call_input_chars[tool]) else 0.0,
+				"avg_input_chars": round(sum(input_list) / len(input_list), 1) if input_list else 0.0,
 				"total_input_chars": sum(input_list),
 				"median_latency_s": round(statistics.median(lats), 2) if lats else None,
 				"p95_latency_s": round(percentile(lats, 95), 2) if lats else None,
@@ -1373,6 +1374,13 @@ def compute_diff(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str,
 		agy = s.get("sessions_by_source", {}).get("agy", 0)
 		return round(s.get("schema_reads_in_browser_sessions", 0) / agy, 2) if agy else 0.0
 
+	notes = []
+	if bs.get("schema_reads_per_agy_session") is None:
+		notes.append(
+			"Legacy baseline: 'Schema reads / AGY session' before-value derived from "
+			"schema_reads_in_browser_sessions / AGY sessions; the historical numerator may include non-AGY reads."
+		)
+
 	def row(label: str, before: float, after: float, unit: str = "", lower_is_better: Optional[bool] = True) -> dict[str, Any]:
 		delta = round(after - before, 2)
 		status = "flat"
@@ -1431,6 +1439,7 @@ def compute_diff(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str,
 		"baseline_since": baseline.get("filters", {}).get("since"),
 		"current_generated_at": current.get("generated_at"),
 		"current_since": current.get("filters", {}).get("since"),
+		"notes": notes,
 		"kpis": kpis,
 		"evaluate_js_intents": js_deltas,
 	}
@@ -1445,6 +1454,8 @@ def format_diff(diff: dict[str, Any]) -> str:
 		f"{'Metric':30s} | {'Before':>10s} | {'After':>10s} | {'Delta':>10s} | Status",
 		"-" * 79,
 	]
+	for note in diff.get("notes", []):
+		lines.append(f"NOTE: {note}")
 	for item in diff["kpis"]:
 		unit = item["unit"]
 		b_str = f"{item['before']}{unit}"
