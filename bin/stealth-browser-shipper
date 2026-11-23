@@ -1,0 +1,517 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+# 	"psycopg[binary]>=3.2",
+# ]
+# ///
+"""Ship stealth-browser-audit session/call records into Antigravity_Postgres for Grafana.
+
+Reuses bin/stealth-browser-audit as the single parsing/classification source of truth.
+Incremental via file-stat watermarks (AGY) and time_updated watermarks (OpenCode);
+idempotent per-session upserts; writes shipper_heartbeats every pass.
+"""
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import socket
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+import psycopg
+
+SERVER = "stealth-browser"
+SHIPPER_NAME = "stealth-browser-audit"
+PARSER_VERSION = 1
+
+AUDIT_SCRIPT = Path(__file__).resolve().parent / "stealth-browser-audit"
+STATE_DIR = Path.home() / ".local" / "share" / "stealth-browser"
+DEFAULT_STATE_FILE = STATE_DIR / "audit-shipper-state.json"
+BRAIN_DIR = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+OPENCODE_DIR = Path.home() / ".local" / "share" / "opencode"
+
+REDACTED = "[REDACTED]"
+RE_PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)
+RE_AUTH_HEADER = re.compile(r"(?i)\bAuthorization:\s*(?:Bearer\s+|Basic\s+)?[^\s'\"]+")
+RE_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-\._~\+/=]+")
+RE_OPENAI_KEY = re.compile(r"\b(sk-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,})\b")
+RE_SLACK_TOKEN = re.compile(r"\bxox[bpa]-[0-9A-Za-z_-]{10,}\b")
+RE_GOOGLE_KEY = re.compile(r"\bAIza[0-9A-Za-z-_]{30,45}\b")
+RE_GITHUB_TOKEN = re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,})\b")
+RE_AWS_KEY = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+RE_JWT = re.compile(r"\bey[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\b")
+RE_URL_CREDS = re.compile(r"(://[^:/\s'\"]+):([^@/\s'\"]+)@")
+RE_GENERIC_SECRET = re.compile(
+	r"(?i)([\"']?[:_A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|auth[_-]?token)"
+	r"[:_A-Za-z0-9_-]*[\"']?\s*[:=]\s*)([\"']?)([^\s\"'>;&]+)([\"']?)"
+)
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS mcp_audit_sessions (
+	server TEXT NOT NULL DEFAULT 'stealth-browser',
+	source TEXT NOT NULL,
+	session_id TEXT NOT NULL,
+	short_id TEXT NOT NULL,
+	title TEXT NOT NULL DEFAULT '',
+	workspace TEXT NOT NULL DEFAULT '',
+	is_subagent BOOLEAN NOT NULL DEFAULT FALSE,
+	first_call_at TIMESTAMPTZ NOT NULL,
+	last_call_at TIMESTAMPTZ NOT NULL,
+	total_calls INT NOT NULL DEFAULT 0,
+	total_errors INT NOT NULL DEFAULT 0,
+	total_soft_outcomes INT NOT NULL DEFAULT 0,
+	evaluate_js_calls INT NOT NULL DEFAULT 0,
+	mcp_timeouts_3m INT NOT NULL DEFAULT 0,
+	slow_calls INT NOT NULL DEFAULT 0,
+	validation_errors INT NOT NULL DEFAULT 0,
+	schema_reads INT NOT NULL DEFAULT 0,
+	schema_read_chars BIGINT NOT NULL DEFAULT 0,
+	output_chars BIGINT NOT NULL DEFAULT 0,
+	input_chars BIGINT NOT NULL DEFAULT 0,
+	agy_output_overflows INT NOT NULL DEFAULT 0,
+	snapshot_calls INT NOT NULL DEFAULT 0,
+	snapshot_chars BIGINT NOT NULL DEFAULT 0,
+	snapshot_rows INT NOT NULL DEFAULT 0,
+	screenshot_calls INT NOT NULL DEFAULT 0,
+	screenshot_followed_by_read INT NOT NULL DEFAULT 0,
+	error_then_retry INT NOT NULL DEFAULT 0,
+	is_auth_session BOOLEAN NOT NULL DEFAULT FALSE,
+	domains TEXT[] NOT NULL DEFAULT '{}',
+	parser_version INT NOT NULL DEFAULT 1,
+	synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	PRIMARY KEY (server, source, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_sessions_last_call
+	ON mcp_audit_sessions(server, last_call_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_sessions_source_time
+	ON mcp_audit_sessions(server, source, last_call_at DESC);
+
+CREATE TABLE IF NOT EXISTS mcp_audit_calls (
+	server TEXT NOT NULL DEFAULT 'stealth-browser',
+	source TEXT NOT NULL,
+	session_id TEXT NOT NULL,
+	call_seq INT NOT NULL,
+	called_at TIMESTAMPTZ,
+	tool TEXT NOT NULL,
+	outcome TEXT NOT NULL DEFAULT '',
+	is_error BOOLEAN NOT NULL DEFAULT FALSE,
+	is_soft BOOLEAN NOT NULL DEFAULT FALSE,
+	error_detail TEXT NOT NULL DEFAULT '',
+	js_intent TEXT NOT NULL DEFAULT '',
+	domain TEXT NOT NULL DEFAULT '',
+	output_chars INT NOT NULL DEFAULT 0,
+	input_chars INT NOT NULL DEFAULT 0,
+	is_overflow BOOLEAN NOT NULL DEFAULT FALSE,
+	snapshot_rows INT NOT NULL DEFAULT 0,
+	duration_s DOUBLE PRECISION,
+	is_approval_wait BOOLEAN NOT NULL DEFAULT FALSE,
+	nested BOOLEAN NOT NULL DEFAULT FALSE,
+	args_preview TEXT NOT NULL DEFAULT '',
+	error_preview TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (server, source, session_id, call_seq),
+	FOREIGN KEY (server, source, session_id)
+		REFERENCES mcp_audit_sessions(server, source, session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_calls_time ON mcp_audit_calls(called_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_calls_server_source_time
+	ON mcp_audit_calls(server, source, called_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_audit_calls_tool_time
+	ON mcp_audit_calls(server, tool, called_at DESC);
+"""
+
+UPSERT_SESSION_SQL = """
+INSERT INTO mcp_audit_sessions (
+	server, source, session_id, short_id, title, is_subagent,
+	first_call_at, last_call_at, total_calls, total_errors, total_soft_outcomes,
+	evaluate_js_calls, mcp_timeouts_3m, slow_calls, validation_errors,
+	schema_reads, schema_read_chars, output_chars, input_chars,
+	agy_output_overflows, snapshot_calls, snapshot_chars, snapshot_rows,
+	screenshot_calls, screenshot_followed_by_read, error_then_retry,
+	is_auth_session, domains, parser_version, synced_at
+) VALUES (
+	%s, %s, %s, %s, %s, %s,
+	%s, %s, %s, %s, %s,
+	%s, %s, %s, %s,
+	%s, %s, %s, %s,
+	%s, %s, %s, %s,
+	%s, %s, %s,
+	%s, %s, %s, NOW()
+)
+ON CONFLICT (server, source, session_id) DO UPDATE SET
+	short_id = EXCLUDED.short_id,
+	title = EXCLUDED.title,
+	is_subagent = EXCLUDED.is_subagent,
+	first_call_at = EXCLUDED.first_call_at,
+	last_call_at = EXCLUDED.last_call_at,
+	total_calls = EXCLUDED.total_calls,
+	total_errors = EXCLUDED.total_errors,
+	total_soft_outcomes = EXCLUDED.total_soft_outcomes,
+	evaluate_js_calls = EXCLUDED.evaluate_js_calls,
+	mcp_timeouts_3m = EXCLUDED.mcp_timeouts_3m,
+	slow_calls = EXCLUDED.slow_calls,
+	validation_errors = EXCLUDED.validation_errors,
+	schema_reads = EXCLUDED.schema_reads,
+	schema_read_chars = EXCLUDED.schema_read_chars,
+	output_chars = EXCLUDED.output_chars,
+	input_chars = EXCLUDED.input_chars,
+	agy_output_overflows = EXCLUDED.agy_output_overflows,
+	snapshot_calls = EXCLUDED.snapshot_calls,
+	snapshot_chars = EXCLUDED.snapshot_chars,
+	snapshot_rows = EXCLUDED.snapshot_rows,
+	screenshot_calls = EXCLUDED.screenshot_calls,
+	screenshot_followed_by_read = EXCLUDED.screenshot_followed_by_read,
+	error_then_retry = EXCLUDED.error_then_retry,
+	is_auth_session = EXCLUDED.is_auth_session,
+	domains = EXCLUDED.domains,
+	parser_version = EXCLUDED.parser_version,
+	synced_at = NOW();
+"""
+
+UPSERT_CALL_SQL = """
+INSERT INTO mcp_audit_calls (
+	server, source, session_id, call_seq, called_at, tool, outcome,
+	is_error, is_soft, error_detail, js_intent, domain,
+	output_chars, input_chars, is_overflow, snapshot_rows, duration_s,
+	is_approval_wait, nested, args_preview, error_preview
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+HEARTBEAT_OK_SQL = """
+INSERT INTO shipper_heartbeats (
+	shipper_name, host, last_seen_at, last_ok_at,
+	consecutive_errors, last_error, rows_synced_last_pass
+) VALUES (%s, %s, NOW(), NOW(), 0, '', %s)
+ON CONFLICT (shipper_name) DO UPDATE SET
+	host = EXCLUDED.host,
+	last_seen_at = NOW(),
+	last_ok_at = NOW(),
+	consecutive_errors = 0,
+	last_error = '',
+	rows_synced_last_pass = EXCLUDED.rows_synced_last_pass;
+"""
+
+HEARTBEAT_ERR_SQL = """
+INSERT INTO shipper_heartbeats (
+	shipper_name, host, last_seen_at, last_ok_at,
+	consecutive_errors, last_error, rows_synced_last_pass
+) VALUES (%s, %s, NOW(), NULL, 1, %s, %s)
+ON CONFLICT (shipper_name) DO UPDATE SET
+	host = EXCLUDED.host,
+	last_seen_at = NOW(),
+	consecutive_errors = shipper_heartbeats.consecutive_errors + 1,
+	last_error = EXCLUDED.last_error,
+	rows_synced_last_pass = EXCLUDED.rows_synced_last_pass;
+"""
+
+
+def redact(text: str) -> str:
+	if not text:
+		return text
+	s = RE_PEM.sub(REDACTED, text)
+	s = RE_AUTH_HEADER.sub("Authorization: [REDACTED]", s)
+	s = RE_BEARER.sub("Bearer [REDACTED]", s)
+	s = RE_OPENAI_KEY.sub(REDACTED, s)
+	s = RE_SLACK_TOKEN.sub(REDACTED, s)
+	s = RE_GOOGLE_KEY.sub(REDACTED, s)
+	s = RE_GITHUB_TOKEN.sub(REDACTED, s)
+	s = RE_AWS_KEY.sub(REDACTED, s)
+	s = RE_JWT.sub(REDACTED, s)
+	s = RE_URL_CREDS.sub(r"\1:[REDACTED]@", s)
+	s = RE_GENERIC_SECRET.sub(r"\1\2[REDACTED]\4", s)
+	return s
+
+
+def load_audit_module():
+	loader = importlib.machinery.SourceFileLoader("stealth_browser_audit", str(AUDIT_SCRIPT))
+	spec = importlib.util.spec_from_loader("stealth_browser_audit", loader)
+	module = importlib.util.module_from_spec(spec)
+	loader.exec_module(module)
+	return module
+
+
+def load_state(state_file: Path) -> dict[str, Any]:
+	try:
+		return json.loads(state_file.read_text())
+	except (OSError, ValueError):
+		return {"parser_version": 0, "agy": {}, "opencode": {}}
+
+
+def save_state(state_file: Path, state: dict[str, Any]) -> None:
+	state_file.parent.mkdir(parents=True, exist_ok=True)
+	tmp = state_file.with_suffix(".tmp")
+	tmp.write_text(json.dumps(state, indent=1))
+	tmp.replace(state_file)
+
+
+def dirty_agy_sessions(state: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+	import glob as globmod
+	seen: dict[str, Any] = {}
+	dirty: list[str] = []
+	log_glob = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript.jsonl")
+	full_glob = str(BRAIN_DIR / "*" / ".system_generated" / "logs" / "transcript_full.jsonl")
+	compact = {Path(p).parts[-4]: p for p in sorted(globmod.glob(log_glob))}
+	full = {Path(p).parts[-4]: p for p in globmod.glob(full_glob)}
+	prev = state.get("agy", {})
+	for cid in sorted(set(compact) | set(full)):
+		path = Path(full.get(cid) or compact[cid])
+		try:
+			st = path.stat()
+		except OSError:
+			continue
+		entry = {"mtime_ns": st.st_mtime_ns, "size": st.st_size}
+		seen[cid] = entry
+		if prev.get(cid) != entry:
+			dirty.append(cid)
+	return dirty, seen
+
+
+def dirty_opencode_sessions(state: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+	dirty: list[str] = []
+	seen: dict[str, Any] = {}
+	prev = state.get("opencode", {})
+	if not OPENCODE_DIR.exists():
+		return dirty, seen
+	for db_path in sorted(OPENCODE_DIR.glob("opencode*.db")):
+		if not db_path.is_file():
+			continue
+		try:
+			conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+		except sqlite3.Error:
+			continue
+		try:
+			max_updated = conn.execute("SELECT MAX(time_updated) FROM session_v2").fetchone()[0]
+		except sqlite3.Error:
+			conn.close()
+			continue
+		key = db_path.name
+		seen[key] = {"max_time_updated_ms": max_updated or 0}
+		if prev.get(key) != seen[key] or max_updated is None:
+			try:
+				for (sidv,) in conn.execute("SELECT id FROM session_v2"):
+					dirty.append(str(sidv))
+			except sqlite3.Error:
+				pass
+		conn.close()
+	return dirty, seen
+
+
+def resolve_db_url(cli_db: Optional[str]) -> str:
+	if cli_db:
+		return cli_db
+	if os.environ.get("ANTIGRAVITY_PG_URL"):
+		return os.environ["ANTIGRAVITY_PG_URL"]
+	out = subprocess.run(
+		["security", "find-generic-password", "-s", "antigravity-telemetry-pg-url", "-w"],
+		capture_output=True, text=True,
+	)
+	if out.returncode == 0 and out.stdout.strip():
+		return out.stdout.strip()
+	print("Error: PostgreSQL connection string required via --db, ANTIGRAVITY_PG_URL, or macOS Keychain (antigravity-telemetry-pg-url)", file=sys.stderr)
+	raise SystemExit(2)
+
+
+def session_row(server: str, sess: dict[str, Any], calls: list[dict[str, Any]], audit: Any) -> tuple:
+	first = sess.get("first_call_at")
+	last = sess.get("last_call_at")
+	if first is None:
+		date = sess.get("date") or ""
+		if not date:
+			return ()
+		first = last = datetime.datetime.fromisoformat(date).replace(tzinfo=datetime.timezone.utc)
+	if last is None:
+		last = first
+
+	soft = sum(1 for c in calls if c["is_soft"])
+	timeouts_3m = sum(1 for c in calls if c["outcome"] == "mcp_timeout_3m")
+	slow = sum(
+		1 for c in calls
+		if c["duration_s"] is not None and c["duration_s"] >= 20.0
+		and not c["is_approval_wait"] and c["outcome"] != "mcp_timeout_3m"
+	)
+	validation = sum(1 for c in calls if c["outcome"] == "validation_error")
+	retry = sum(
+		1 for a, b in zip(calls, calls[1:])
+		if a["is_error"] and b["tool"] == a["tool"]
+	)
+	screenshot_followed = 0
+	tools = dict(sess.get("top_tools", []))
+	title = str(sess.get("title", ""))
+	title_l = title.lower()
+	is_auth = any(k in title_l for k in audit.AUTH_KEYWORDS)
+
+	return (
+		server,
+		sess["source"],
+		sess["sid"],
+		sess["sid"][:12],
+		redact(title)[:200],
+		bool(sess.get("is_subagent")),
+		first,
+		last,
+		sess["calls"],
+		sess["errors"],
+		soft,
+		tools.get("evaluate_js", 0),
+		timeouts_3m,
+		slow,
+		validation,
+		sess.get("schema_reads", 0),
+		sess.get("schema_chars", 0),
+		sess.get("chars", 0),
+		sess.get("input_chars", 0),
+		sess.get("overflows", 0),
+		sess.get("snapshot_calls", 0),
+		sess.get("snapshot_chars", 0),
+		sess.get("snapshot_rows", 0),
+		tools.get("screenshot", 0),
+		screenshot_followed,
+		retry,
+		is_auth,
+		list(sess.get("domains", [])),
+		PARSER_VERSION,
+	)
+
+
+def call_row(server: str, sess: dict[str, Any], rec: dict[str, Any]) -> tuple:
+	return (
+		server,
+		rec["source"],
+		rec["session_id"],
+		rec["call_seq"],
+		rec["called_at"],
+		rec["tool"],
+		rec["outcome"],
+		rec["is_error"],
+		rec["is_soft"],
+		rec["error_detail"],
+		rec["js_intent"],
+		rec["domain"],
+		rec["output_chars"],
+		rec["input_chars"],
+		rec["is_overflow"],
+		rec["snapshot_rows"],
+		rec["duration_s"],
+		rec["is_approval_wait"],
+		rec["nested"],
+		redact(rec["args_preview"])[:140],
+		redact(rec["error_preview"])[:220],
+	)
+
+
+def sync(conn: Optional[psycopg.Connection], server: str, sessions: list[dict[str, Any]], records: list[dict[str, Any]], dry_run: bool, audit: Any) -> int:
+	by_session: dict[tuple[str, str], list[dict[str, Any]]] = {}
+	for rec in records:
+		by_session.setdefault((rec["source"], rec["session_id"]), []).append(rec)
+
+	synced_calls = 0
+	synced_sessions = 0
+	for sess in sessions:
+		key = (sess["source"], sess["sid"])
+		row = session_row(server, sess, by_session.get(key, []), audit)
+		if not row:
+			continue
+		calls = sorted(by_session.get(key, []), key=lambda r: r["call_seq"])
+		if dry_run:
+			print(f"[dry-run] would upsert session {sess['source']}/{sess['sid'][:12]} calls={sess['calls']}")
+			synced_calls += len(calls)
+			synced_sessions += 1
+			continue
+		with conn.transaction():
+			conn.execute(UPSERT_SESSION_SQL, row)
+			conn.execute(
+				"DELETE FROM mcp_audit_calls WHERE server = %s AND source = %s AND session_id = %s",
+				(server, sess["source"], sess["sid"]),
+			)
+			if calls:
+				cur = conn.cursor()
+				with conn.pipeline():
+					cur.executemany(
+						UPSERT_CALL_SQL,
+						[call_row(server, sess, rec) for rec in calls],
+					)
+		synced_calls += len(calls)
+		synced_sessions += 1
+	print(f"Synced {synced_sessions} sessions, {synced_calls} calls" + (" (dry-run)" if dry_run else ""))
+	return synced_calls
+
+
+def main() -> int:
+	parser = argparse.ArgumentParser(description=__doc__)
+	parser.add_argument("--once", action="store_true", help="Run one sync pass and exit (default; used by launchd)")
+	parser.add_argument("--full", action="store_true", help="Ignore watermarks and re-ship all sessions")
+	parser.add_argument("--dry-run", action="store_true", help="Collect and report without writing to Postgres")
+	parser.add_argument("--db", default=None, help="Postgres connection string (default: ANTIGRAVITY_PG_URL or Keychain)")
+	parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE), help=f"Watermark state file (default: {DEFAULT_STATE_FILE})")
+	args = parser.parse_args()
+
+	audit = load_audit_module()
+	state_file = Path(args.state_file).expanduser()
+	state = load_state(state_file)
+	force_full = args.full or state.get("parser_version") != PARSER_VERSION
+
+	agy_dirty, agy_seen = dirty_agy_sessions(state)
+	oc_dirty, oc_seen = dirty_opencode_sessions(state)
+
+	if force_full:
+		includes: list[str] = []
+	else:
+		includes = agy_dirty + oc_dirty
+
+	print(f"Dirty sessions: agy={len(agy_dirty)} opencode={len(oc_dirty)} (full={force_full})")
+
+	collector = audit.AuditCollector(
+		since=None, includes=includes, excludes=[], slow_threshold=20.0, max_samples=3,
+	)
+	collector.collect_agy()
+	collector.collect_opencode()
+
+	if not args.dry_run:
+		if force_full:
+			state = {"parser_version": PARSER_VERSION, "agy": {}, "opencode": {}}
+		state["parser_version"] = PARSER_VERSION
+		state["agy"] = agy_seen
+		state["opencode"] = oc_seen
+
+	db_url = None if args.dry_run else resolve_db_url(args.db)
+	sync_err: Optional[Exception] = None
+	synced_calls = 0
+	try:
+		if args.dry_run:
+			synced_calls = sync(None, SERVER, collector.sessions, collector.call_records, dry_run=True, audit=audit)
+		else:
+			with psycopg.connect(db_url, autocommit=True) as conn:
+				conn.execute(SCHEMA_SQL)
+				synced_calls = sync(conn, SERVER, collector.sessions, collector.call_records, dry_run=False, audit=audit)
+				conn.execute(HEARTBEAT_OK_SQL, (SHIPPER_NAME, socket.gethostname(), synced_calls))
+				conn.commit()
+	except Exception as exc:
+		sync_err = exc
+		if not args.dry_run:
+			try:
+				with psycopg.connect(db_url) as conn:
+					conn.execute(
+						HEARTBEAT_ERR_SQL,
+						(SHIPPER_NAME, socket.gethostname(), str(exc)[:500], synced_calls),
+					)
+					conn.commit()
+			except Exception:
+				pass
+		print(f"Error: {exc}", file=sys.stderr)
+		return 1
+
+	save_state(state_file, state)
+	return 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())

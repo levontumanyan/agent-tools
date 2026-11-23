@@ -86,6 +86,7 @@ NESTED_SHELL_RE = re.compile(
 )
 JSONRPC_TOOLS_CALL_RE = re.compile(r'"method"\s*:\s*"tools/call"')
 JSONRPC_TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([a-zA-Z0-9_]+)"')
+SNAPSHOT_ROW_RE = re.compile(r"\|\s*e?\d+\s*\|")
 AGY_OVERFLOW_RE = re.compile(
 	r"(?:output was large and was saved to:|full output in a file at)\s*(file://\S+)",
 	re.IGNORECASE,
@@ -532,6 +533,7 @@ class AuditCollector:
 		self.max_samples = max_samples
 
 		self.sessions: list[dict[str, Any]] = []
+		self.call_records: list[dict[str, Any]] = []
 		self.by_source = collections.Counter()
 		self.sessions_by_source = collections.Counter()
 		self.tool_counts = collections.Counter()
@@ -588,6 +590,8 @@ class AuditCollector:
 		nested: bool = False,
 		output_chars: Optional[int] = None,
 		classify_body: Optional[str] = None,
+		called_at: Optional[datetime.datetime] = None,
+		overflow: bool = False,
 	) -> None:
 		self.by_source[source] += 1
 		self.tool_counts[tool] += 1
@@ -600,6 +604,20 @@ class AuditCollector:
 		sess_state["chars"] += chars
 		sess_state["input_chars"] += input_chars
 		sess_state["tools"][tool] += 1
+		for key, default in (
+			("first_call_at", None), ("last_call_at", None),
+			("snapshot_calls", 0), ("snapshot_chars", 0), ("snapshot_rows", 0),
+			("last_js_intent", ""),
+		):
+			sess_state.setdefault(key, default)
+		if called_at is not None:
+			if sess_state["first_call_at"] is None:
+				sess_state["first_call_at"] = called_at
+			sess_state["last_call_at"] = called_at
+		if tool == "snapshot":
+			sess_state["snapshot_calls"] += 1
+			sess_state["snapshot_chars"] += chars
+			sess_state["snapshot_rows"] += len(SNAPSHOT_ROW_RE.findall(body))
 
 		if sess_state["prev_tool"] == tool:
 			self.consecutive_same_tool[tool] += 1
@@ -629,6 +647,7 @@ class AuditCollector:
 		if tool == "evaluate_js" and (not nested or raw_args):
 			expr = str(raw_args.get("expression") or raw_args.get("script") or (raw_args.get("code") if nested else "") or "")
 			intent, flags = classify_js_intent(expr)
+			sess_state["last_js_intent"] = intent
 			self.js_intents[intent] += 1
 			for fl in flags:
 				self.js_flags[fl] += 1
@@ -694,6 +713,7 @@ class AuditCollector:
 				"args": json.dumps(raw_args)[:100],
 			})
 
+		error_reason = ""
 		if outcome in SOFT_OUTCOMES:
 			self.soft_counts[outcome] += 1
 			self.tool_soft[tool][outcome] += 1
@@ -715,6 +735,7 @@ class AuditCollector:
 				self.validation_errors[sig] += 1
 			if tool == "click":
 				reason = classify_click_reason(outcome, snip)
+				error_reason = reason
 				self.click_reasons[reason] += 1
 				if len(self.click_samples) < max(self.max_samples, 5):
 					self.click_samples.append({
@@ -725,6 +746,7 @@ class AuditCollector:
 					})
 			elif tool == "status":
 				reason = classify_status_reason(outcome, snip)
+				error_reason = reason
 				self.status_reasons[reason] += 1
 				if len(self.status_samples) < max(self.max_samples, 5):
 					self.status_samples.append({
@@ -734,7 +756,33 @@ class AuditCollector:
 					})
 			elif tool == "navigate":
 				reason = classify_navigate_reason(outcome, snip)
+				error_reason = reason
 				self.navigate_reasons[reason] += 1
+
+		self.call_records.append({
+			"source": source,
+			"session_id": sid,
+			"call_seq": sess_state["calls"] - 1,
+			"called_at": called_at,
+			"tool": tool,
+			"outcome": outcome or "",
+			"is_error": bool(outcome and outcome not in SOFT_OUTCOMES),
+			"is_soft": outcome in SOFT_OUTCOMES,
+			"error_detail": error_reason,
+			"js_intent": sess_state.get("last_js_intent", "") if tool == "evaluate_js" else "",
+			"domain": extract_domain(raw_args.get("url")) or "",
+			"output_chars": chars,
+			"input_chars": input_chars,
+			"is_overflow": overflow,
+			"snapshot_rows": len(SNAPSHOT_ROW_RE.findall(body)) if tool == "snapshot" else 0,
+			"duration_s": duration_s,
+			"is_approval_wait": bool(
+				duration_s is not None and outcome != "mcp_timeout_3m" and duration_s > 180.0
+			),
+			"nested": nested,
+			"args_preview": json.dumps(raw_args)[:140] if raw_args else "",
+			"error_preview": snip[:220].replace("\n", " ") if outcome else "",
+		})
 
 		sess_state["prev_tool"] = tool
 		sess_state["prev_errored"] = is_hard_error
@@ -766,6 +814,12 @@ class AuditCollector:
 			"shared_execute_outputs": sess_state["shared_execute_outputs"],
 			"domains": sorted(sess_state["domains"])[:5],
 			"top_tools": sess_state["tools"].most_common(4),
+			"first_call_at": sess_state.get("first_call_at"),
+			"last_call_at": sess_state.get("last_call_at"),
+			"snapshot_calls": sess_state.get("snapshot_calls", 0),
+			"snapshot_chars": sess_state.get("snapshot_chars", 0),
+			"snapshot_rows": sess_state.get("snapshot_rows", 0),
+			"is_subagent": any(b["sid"] == sid for b in self.browser_subagents),
 		})
 
 	def collect_agy(self) -> None:
@@ -835,6 +889,12 @@ class AuditCollector:
 				"prev_tool": None,
 				"prev_errored": False,
 				"prev_was_screenshot": False,
+				"first_call_at": None,
+				"last_call_at": None,
+				"snapshot_calls": 0,
+				"snapshot_chars": 0,
+				"snapshot_rows": 0,
+				"last_js_intent": "",
 			}
 			file_dt = datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=datetime.timezone.utc)
 			title = titles.get(cid, "")
@@ -916,6 +976,8 @@ class AuditCollector:
 						explicit_error=False,
 						duration_s=duration_s,
 						sess_state=sess_state,
+						called_at=call_dt,
+						overflow=overflowed,
 					)
 
 			self._finalize_session("agy", cid, title, sess_state, raw.lower())
@@ -1003,6 +1065,7 @@ class AuditCollector:
 				nested=True,
 				output_chars=last_share if is_last else share,
 				classify_body=call_classify_body,
+				called_at=start_dt,
 			)
 
 	def collect_opencode(self) -> None:
@@ -1053,6 +1116,12 @@ class AuditCollector:
 							"prev_tool": None,
 							"prev_errored": False,
 							"prev_was_screenshot": False,
+							"first_call_at": None,
+							"last_call_at": None,
+							"snapshot_calls": 0,
+							"snapshot_chars": 0,
+							"snapshot_rows": 0,
+							"last_js_intent": "",
 						}
 					return per_session[sid]
 
@@ -1124,6 +1193,7 @@ class AuditCollector:
 						explicit_error=explicit_err,
 						duration_s=duration_s,
 						sess_state=sess_state,
+						called_at=start_dt,
 					)
 
 				if "session_message" in tables:
