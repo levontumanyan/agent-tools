@@ -11,7 +11,7 @@ Every tab opened in `stealth-browser` receives a monotonic stable ID (`t1`, `t2`
 1. Open an owned tab and record its `tab_id`:
    - `new_tab(url="https://portal.example.com", block_media=True)` -> returns `... (tab_id=t4)`.
 2. Pin every subsequent call to that stable ID (`tab="t4"`):
-   - `snapshot(tab="t4")`, `extract(container_selector=..., fields={...}, tab="t4")`, `state(tab="t4")`, `batch(actions=[...], tab="t4")`, `fetch(url="/api/data", tab="t4")`, `get_content(tab="t4")`.
+   - `snapshot(tab="t4")` (optional `filter=...`, `viewport_only=True`), `extract(container_selector=..., fields={...}, tab="t4")`, `state(tab="t4")`, `batch(actions=[...], tab="t4")`, `fetch(url="/api/data", tab="t4")`, `get_content(tab="t4")` (optional `filter=...`, `offset=...`).
 3. Hand off interactive login, 2FA, or CAPTCHA cleanly when needed:
    - `wait_for_human(reason="Approve 2FA prompt", url_contains="/dashboard", tab="t4")` switches headless Chromium to headed mode (with Apple Passwords enabled), sends a macOS notification, and resumes automatically once the condition matches.
 4. Clean up the owned tab before returning a concise summary to the parent:
@@ -19,8 +19,9 @@ Every tab opened in `stealth-browser` receives a monotonic stable ID (`t1`, `t2`
 
 ## Subagent Brief Template
 
-Give the browser subagent:
+Launch via `invoke_subagent` with `Model: "flash"` for routine navigation, portal checks, form fills, and scraping (reserving `Model: "inherit"` for complex reasoning). Give the browser subagent:
 - Target URL and exact fields or files to extract.
+- Instruction to read `~/.gemini/antigravity-cli/mcp/stealth-browser/instructions.md` once instead of individual tool `.json` schemas.
 - Instruction to call `new_tab(...)`, pin all calls to the returned `tab_id`, and avoid touching other open tabs.
 - Instruction to call `wait_for_human(...)` instead of guessing if a login, 2FA, or CAPTCHA gate appears.
 - Output schema (compact JSON or bullet summary) so raw DOM/HTML stays out of the parent context.
