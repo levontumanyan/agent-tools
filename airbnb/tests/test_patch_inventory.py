@@ -40,9 +40,9 @@ def test_price_hash_seed_is_valid_sha256():
 	int(pyairbnb.price.PERSISTED_QUERY_HASH, 16)
 
 
-def test_details_patch_is_applied():
-	"""details.get must be the authenticated local variant (cookie + enhanced parsing)."""
-	assert pyairbnb.details.get.__name__ == "_authenticated_details_get"
+def test_details_run_pure_upstream():
+	"""No local details patch: upstream (>=2.2.9, PR #75) owns the cookie-injection path."""
+	assert pyairbnb.details.get.__module__ == "pyairbnb.details"
 
 
 def test_reviews_run_pure_upstream():
@@ -53,6 +53,6 @@ def test_reviews_run_pure_upstream():
 
 
 def test_upstream_floor_is_respected():
-	"""Upstream must be new enough to carry PRs #70-#74 (price, reviews, api key, details fallbacks)."""
+	"""Upstream must be new enough to carry PRs #70-#75 (price, reviews, api key, details fallbacks, cookies)."""
 	major, minor, patch = (int(x) for x in version("pyairbnb").split("."))
-	assert (major, minor, patch) >= (2, 2, 8)
+	assert (major, minor, patch) >= (2, 2, 9)

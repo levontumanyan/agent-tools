@@ -242,7 +242,6 @@ def _get_session():
 	return _thread_local.session
 
 
-_orig_details_get = pyairbnb.details.get
 ACTIVE_COOKIES_DICT = {}
 
 
@@ -264,42 +263,8 @@ else:
 		AIRBNB_COOKIE = "; ".join([f"{k}={v}" for k, v in brave_cookies.items()])
 
 
-def _authenticated_details_get(room_url, language, proxy_url, timeout=None, **kwargs):
-
-	headers = {
-		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-		"Accept-Language": language,
-		"Cache-Control": "no-cache",
-		"Pragma": "no-cache",
-		"Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-		"Sec-Ch-Ua-Mobile": "?0",
-		"Sec-Ch-Ua-Platform": '"Windows"',
-		"Sec-Fetch-Dest": "document",
-		"Sec-Fetch-Mode": "navigate",
-		"Sec-Fetch-Site": "none",
-		"Sec-Fetch-User": "?1",
-		"Upgrade-Insecure-Requests": "1",
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	}
-	if AIRBNB_COOKIE:
-		headers["Cookie"] = AIRBNB_COOKIE
-	proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
-	session = _get_session()
-	req_kwargs = {"headers": headers, "proxies": proxies}
-	if timeout is not None:
-		req_kwargs["timeout"] = timeout
-	response = session.get(room_url, **req_kwargs)
-	response.raise_for_status()
-	data_formatted, price_dependency_input = parse.parse_body_details_wrapper(
-		response.text
-	)
-	# Title/description/amenities fallbacks are upstream since pyairbnb 2.2.8 (PR #74).
-	cookies = response.cookies
-	return data_formatted, price_dependency_input, cookies
-
-
-pyairbnb.details.get = _authenticated_details_get
-
+# details.get: no local patch needed — upstream pyairbnb >= 2.2.9 (PR #75) sends session
+# cookies via its cookies kwarg with the same curl_cffi chrome impersonation.
 
 def get_listing_details(
 	listing_id,
@@ -343,6 +308,7 @@ def get_listing_details(
 					room_id=listing_id,
 					domain="www.airbnb.ca",
 					currency=currency,
+					cookies=ACTIVE_COOKIES_DICT or None,
 				)
 
 				if details:
