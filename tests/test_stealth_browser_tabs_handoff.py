@@ -108,6 +108,7 @@ def _make_session(pages: list[FakePage], headless: bool = False):
 	mgr._browser = FakeBrowser(connected=True)
 	mgr._context = ctx
 	mgr.headless = headless
+	mgr._detect_cdp_headless = lambda: None
 	if pages:
 		mgr.set_active_page(pages[0])
 	return mgr, ctx

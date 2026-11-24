@@ -3,6 +3,7 @@
 
 import asyncio
 import http.server
+import json
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import urllib.request
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -426,6 +428,27 @@ async def run_suite(script_path: str, suite: str, cdp_port: int):
 						# Closed tab_id gives clear error
 						gc_dead = await call("get_content", {"tab": m_t1.group(1)})
 						check("closed tab_id returns clear error", "not found" in gc_dead.lower() or "closed" in gc_dead.lower(), gc_dead)
+
+					env2 = env.copy()
+					env2["STEALTH_BROWSER_HEADLESS"] = "false"
+					server_params2 = StdioServerParameters(
+						command="uv",
+						args=["run", "--script", script_path],
+						env=env2,
+					)
+					async with stdio_client(server_params2) as (read2, write2):
+						async with ClientSession(read2, write2) as sess2:
+							await sess2.initialize()
+							st_attached = extract_text(await sess2.call_tool("status", {}))
+							check("second MCP attaching to headless CDP detects Headless", "Mode: Headless" in st_attached, st_attached)
+
+							sh_res = extract_text(await sess2.call_tool("set_headless", {"headless": False}))
+							check("set_headless(False) restarts into Headed mode even with open tabs", "restarted successfully in Headed mode" in sh_res, sh_res)
+
+							with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2.0) as resp:
+								ver_data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+							ua_after = ver_data.get("User-Agent", "")
+							check("live CDP /json/version confirms non-headless after switch", "HeadlessChrome" not in ua_after and "Chrome/" in ua_after, ua_after)
 
 					# wait_for_human (already satisfied condition so it returns immediately without waiting!)
 					# Use current tab in headed=false -> note: wait_for_human switches headless->headed unless already headed,

@@ -178,7 +178,7 @@ FakePlaywrightTimeoutError.__name__ = "TimeoutError"
 def test_fastmcp_instructions_cheatsheet(sb):
 	instructions = sb.mcp.instructions
 	lines = [line for line in instructions.splitlines() if line.strip()]
-	assert 10 <= len(lines) <= 18
+	assert 10 <= len(lines) <= 20
 	assert "Stay headless by default" in instructions
 	assert "set_headless(headless=False)" in instructions
 	for token in (
@@ -938,3 +938,72 @@ def test_evaluate_js_and_batch_respect_main_world_flag(sb, monkeypatch):
 		assert page.evaluate_calls[3][2] is False
 
 	asyncio.run(scenario())
+
+
+def test_detect_cdp_headless_uses_ps_ww_and_version_check(sb, monkeypatch):
+	ps_cmds = []
+
+	class FakeResp:
+		def __init__(self, payload):
+			self._payload = payload
+		def __enter__(self):
+			return self
+		def __exit__(self, *args):
+			return False
+		def read(self):
+			return self._payload
+
+	def fake_urlopen_headless(url, timeout=0.5):
+		return FakeResp(b'{"Browser":"Chrome/156.0","User-Agent":"Mozilla/5.0 HeadlessChrome/156.0"}')
+
+	monkeypatch.setattr(sb.urllib.request, "urlopen", fake_urlopen_headless)
+	assert sb.session._detect_cdp_headless() is True
+
+	def fake_urlopen_custom_ua(url, timeout=0.5):
+		return FakeResp(b'{"Browser":"Chrome/156.0","User-Agent":"Mozilla/5.0 Chrome/156.0"}')
+
+	def fake_run(cmd, **kwargs):
+		ps_cmds.append(cmd)
+		res = MagicMock()
+		if cmd[0] == "lsof":
+			res.stdout = "84978\n"
+		else:
+			res.stdout = "/Applications/Chromium.app/Contents/MacOS/Chromium " + ("--flag=1 " * 40) + "--headless=new\n"
+		return res
+
+	monkeypatch.setattr(sb.urllib.request, "urlopen", fake_urlopen_custom_ua)
+	monkeypatch.setattr(sb.subprocess, "run", fake_run)
+	assert sb.session._detect_cdp_headless() is True
+	assert any(cmd[:3] == ["ps", "-ww", "-o"] for cmd in ps_cmds)
+
+
+def test_set_headless_resyncs_live_cdp_mode_before_short_circuit(sb, monkeypatch):
+	async def scenario():
+		open_page = FakePage(url="https://secure.royalbank.com/signin")
+		sb.session.headless = False
+		sb.session._context = MagicMock()
+		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[open_page]))
+		monkeypatch.setattr(sb.session, "_detect_cdp_headless", lambda: True)
+		restarted = []
+
+		async def fake_restart(headless=None, url=None):
+			restarted.append(headless)
+			sb.session.headless = bool(headless)
+			return "Browser restarted successfully in Headed mode"
+
+		monkeypatch.setattr(sb, "restart_browser", fake_restart)
+		out = await sb.set_headless(headless=False)
+		assert restarted == [False]
+		assert "Headed mode" in out
+
+		monkeypatch.setattr(sb.session, "_detect_cdp_headless", lambda: False)
+		refused = await sb.set_headless(headless=True)
+		assert "Refusing to restart browser" in refused
+		assert restarted == [False]
+
+		forced = await sb.set_headless(headless=True, force=True)
+		assert restarted == [False, True]
+		assert forced
+
+	asyncio.run(scenario())
+
