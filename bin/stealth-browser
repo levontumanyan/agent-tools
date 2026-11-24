@@ -83,7 +83,7 @@ STEALTH_BROWSER_CHEATSHEET = (
 	"- batch(actions=[{action:'click'|'fill'|'type'|'select'|'press'|'wait_for'|'sleep'|'evaluate', selector, ref, text, value, key, state, ms, force, expression, main_world, timeout_ms}], tab=-1)\n"
 	"- evaluate_js(expression='', tab=-1, timeout_ms=15000, script='', max_length=8000, main_world=False)\n"
 	"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000, save_path='', max_length=8000)\n"
-	"- state(framework='auto', selector='', tab=-1, max_length=8000) | set_media(enable_media=True, tab=-1)\n"
+	"- state(framework='auto', selector='', tab=-1, max_length=8000) | set_media(enable_media=True, tab=-1) | set_animations(enabled=False, persist=True)\n"
 	"- downloads(limit=20, include_dir=False) | network_requests(url_filter='', resource_type='', content_type='', status_min=0, limit=30, clear=False, tab=-1, max_length=8000) | console_logs(level='', limit=50, clear=False, tab=-1, max_length=8000)\n"
 	"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None, click_selector=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
 )
@@ -405,6 +405,63 @@ def _save_persisted_headless(headless: Optional[bool]) -> None:
 	except Exception:
 		pass
 
+
+ANIMATIONS_STATE_FILE = os.path.join(CACHE_DIR, f"animations-{CDP_PORT}.json")
+_ANIMATIONS_STYLE_ATTR = "data-stealth-browser-animations"
+_ANIMATIONS_KILL_CSS = (
+	"*, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; "
+	"transition-duration: 0.001s !important; transition-delay: 0s !important; scroll-behavior: auto !important; }"
+)
+_ANIMATIONS_INJECT_JS = """(css) => {
+	let style = document.querySelector('style[' + %(attr)s + ']');
+	if (!style) {
+		style = document.createElement('style');
+		style.setAttribute(%(attr)s, '1');
+		(document.head || document.documentElement).appendChild(style);
+	}
+	style.textContent = css;
+}""" % {"attr": json.dumps(_ANIMATIONS_STYLE_ATTR)}
+_ANIMATIONS_INIT_SCRIPT = """(() => {
+	const css = %(css)s;
+	const inject = () => {
+		if (!document.documentElement) return;
+		const style = document.createElement('style');
+		style.setAttribute(%(attr)s, 'init');
+		style.textContent = css;
+		(document.head || document.documentElement).appendChild(style);
+	};
+	if (document.documentElement) inject();
+	else document.addEventListener('DOMContentLoaded', inject, { once: true });
+})();""" % {"css": json.dumps(_ANIMATIONS_KILL_CSS), "attr": json.dumps(_ANIMATIONS_STYLE_ATTR)}
+
+
+def _load_persisted_animations() -> Optional[bool]:
+	"""Return persisted animation-freeze preference, or None when never set."""
+	try:
+		if os.path.exists(ANIMATIONS_STATE_FILE):
+			with open(ANIMATIONS_STATE_FILE, "r", encoding="utf-8") as f:
+				data = json.load(f)
+			if isinstance(data.get("animations"), bool):
+				return data["animations"]
+	except Exception:
+		pass
+	return None
+
+
+def _save_persisted_animations(enabled: Optional[bool]) -> None:
+	"""Persist animation-freeze state for crash recovery, or remove state file when None."""
+	try:
+		if enabled is None:
+			if os.path.exists(ANIMATIONS_STATE_FILE):
+				os.unlink(ANIMATIONS_STATE_FILE)
+			return
+		os.makedirs(CACHE_DIR, exist_ok=True)
+		with open(ANIMATIONS_STATE_FILE, "w", encoding="utf-8") as f:
+			json.dump({"animations": bool(enabled)}, f)
+	except Exception:
+		pass
+
+
 _adblock_engine: Optional[Engine] = None
 _adblock_initialized: bool = False
 _adblock_load_task: Optional[asyncio.Task] = None
@@ -602,6 +659,7 @@ class BrowserSessionManager:
 	def __init__(self, cdp_url: str):
 		self.cdp_url = cdp_url
 		self.headless: bool = _load_persisted_headless()
+		self.animations: Optional[bool] = _load_persisted_animations()
 		self._playwright = None
 		self._browser: Optional[Browser] = None
 		self._context: Optional[BrowserContext] = None
@@ -891,11 +949,22 @@ class BrowserSessionManager:
 	async def _ensure_interceptor(self, context: BrowserContext):
 		_schedule_adblock_warmup()
 		await self._configure_native_downloads(context)
+		await self._ensure_animation_init_script(context)
 		if getattr(context, "_interceptor_attached", False):
 			return
 		setattr(context, "_interceptor_attached", True)
 		try:
 			await asyncio.wait_for(context.route("**/*", _network_route_handler), timeout=CDP_OP_TIMEOUT_S)
+		except Exception:
+			pass
+
+	async def _ensure_animation_init_script(self, context: BrowserContext) -> None:
+		"""Install the kill-stylesheet init script on a context when animations are frozen."""
+		if self.animations is not False or context is None or getattr(context, "_animations_init_script", False):
+			return
+		setattr(context, "_animations_init_script", True)
+		try:
+			await asyncio.wait_for(context.add_init_script(_ANIMATIONS_INIT_SCRIPT), timeout=CDP_OP_TIMEOUT_S)
 		except Exception:
 			pass
 
@@ -1008,6 +1077,7 @@ class BrowserSessionManager:
 			else:
 				page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
 
+			await _apply_animations_to_page(page)
 			self.set_active_page(page)
 			return page
 		except Exception as exc:
@@ -1022,6 +1092,7 @@ class BrowserSessionManager:
 					page = pages[-1]
 				else:
 					page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+				await _apply_animations_to_page(page)
 				self.set_active_page(page)
 				return page
 			raise
@@ -1076,6 +1147,43 @@ class BrowserSessionManager:
 
 
 session = BrowserSessionManager(CDP_URL)
+
+
+async def _apply_animations_to_page(page: Page) -> None:
+	"""Apply the live reduced-motion emulation and freeze stylesheet to one page when a preference is set."""
+	enabled = session.animations
+	if enabled is None or page is None:
+		return
+	try:
+		if page.is_closed():
+			return
+	except Exception:
+		return
+	motion = "no-preference" if enabled else "reduce"
+	if getattr(page, "_animations_motion", None) != motion:
+		try:
+			await asyncio.wait_for(page.emulate_media(reduced_motion=motion), timeout=CDP_OP_TIMEOUT_S)
+			setattr(page, "_animations_motion", motion)
+		except Exception:
+			pass
+	if not enabled:
+		try:
+			await asyncio.wait_for(page.evaluate(_ANIMATIONS_INJECT_JS, _ANIMATIONS_KILL_CSS), timeout=CDP_OP_TIMEOUT_S)
+		except Exception:
+			pass
+	if not getattr(page, "_animations_nav_hook", False):
+		setattr(page, "_animations_nav_hook", True)
+		page.on("domcontentloaded", lambda _=None, p=page: _schedule_animations_on_page(p))
+
+
+def _schedule_animations_on_page(page: Page) -> None:
+	"""Schedule the per-page animation hook from sync page-listener code paths."""
+	if session.animations is None or page is None:
+		return
+	try:
+		asyncio.get_running_loop().create_task(_apply_animations_to_page(page))
+	except RuntimeError:
+		pass
 
 
 class KeepAliveManager:
@@ -1297,6 +1405,7 @@ async def navigate(
 		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
 		if new_tab:
 			page = await asyncio.wait_for(context.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+			await _apply_animations_to_page(page)
 			session.set_active_page(page)
 		else:
 			page = await session.resolve_page(tab)
@@ -1542,6 +1651,32 @@ async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str
 		return f"Media loading is now {state_str} on tab [{target_idx}] ({page.url})"
 	except Exception as exc:
 		return f"Error updating media state: {exc}"
+
+
+@mcp.tool()
+@_with_tool_deadline
+async def set_animations(enabled: bool = False, persist: bool = True, tab: Union[int, str] = -1) -> str:
+	"""Freeze CSS animations/transitions via reduced-motion emulation + a kill-stylesheet; re-enabling fully applies only after restart_browser() because init scripts cannot be removed."""
+	try:
+		page = await session.resolve_page(tab)
+		session.animations = bool(enabled)
+		if persist:
+			_save_persisted_animations(bool(enabled))
+		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
+		if not enabled:
+			await session._ensure_animation_init_script(context)
+		await _apply_animations_to_page(page)
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
+		for other in pages:
+			if other is not page:
+				await _apply_animations_to_page(other)
+		state = "ENABLED (reduced-motion reverted on live pages)" if enabled else "DISABLED (animations frozen)"
+		return (
+			f"Animations {state}. Dynamic emulation applied to {len(pages)} open tab(s); "
+			"structural init script applies to future tabs. Re-enabling fully applies after restart_browser()."
+		)
+	except Exception as exc:
+		return f"Error updating animation state: {exc}"
 
 
 _BATCH_EVAL_MAX_CHARS = 2000
@@ -3571,6 +3706,7 @@ telemetry_tracker = TelemetryTracker()
 def _attach_page_trackers(page: Page) -> None:
 	download_tracker.attach(page)
 	telemetry_tracker.attach(page)
+	_schedule_animations_on_page(page)
 
 
 @mcp.tool()
@@ -4265,6 +4401,7 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 			continue
 		try:
 			new_page = await asyncio.wait_for(ctx.new_page(), timeout=NEW_PAGE_TIMEOUT_S)
+			await _apply_animations_to_page(new_page)
 			await asyncio.wait_for(
 				new_page.goto(extra_url, timeout=10000, wait_until="domcontentloaded"),
 				timeout=12.0,

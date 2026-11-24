@@ -88,7 +88,7 @@ def test_instructions_cover_all_registered_tools_and_key_params(sb):
 		assert token in instr, f"Missing '{token}' in instructions"
 
 	total_schema_bytes = sum(len(json.dumps(t.model_dump())) for t in tools)
-	assert total_schema_bytes < 24000, f"Schemas still bloated: {total_schema_bytes}B"
+	assert total_schema_bytes < 25000, f"Schemas still bloated: {total_schema_bytes}B"
 
 
 def test_snapshot_compact_cap_and_total_matched(sb, monkeypatch):
