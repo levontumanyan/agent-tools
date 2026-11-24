@@ -9,7 +9,6 @@ from urllib.parse import urlencode
 import pyairbnb
 import pyairbnb.api
 import pyairbnb.details
-import pyairbnb.parse as parse
 import pyairbnb.price
 import pyairbnb.reviews
 import pyairbnb.search
@@ -265,6 +264,7 @@ else:
 
 # details.get: no local patch needed — upstream pyairbnb >= 2.2.9 (PR #75) sends session
 # cookies via its cookies kwarg with the same curl_cffi chrome impersonation.
+
 
 def get_listing_details(
 	listing_id,

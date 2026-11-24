@@ -46,9 +46,27 @@ airbnb --location "Miraflores, Peru" --min_price 20 --max_price 30
 # Long stay search with dates and rating filters
 airbnb --location "San Borja, Lima, Peru" --check_in 2026-10-10 --check_out 2026-11-07 --min_price 700 --max_price 1600 --limit 15
 
+# Whole-stay budget cap (Airbnb applies weekly/monthly discounts before filtering)
+airbnb --location "Arequipa, Peru" --check_in 2026-11-11 --check_out 2026-12-09 --price_unit total --max_price 1200
+
+# Per-night cap, auto-scaled to the stay length
+airbnb --location "Arequipa, Peru" --check_in 2026-11-11 --check_out 2026-12-09 --price_unit nightly --max_price 45
+
 # Multi-city market survey
 airbnb --survey --cities "Lima, Peru;Santiago, Chile" --check_in 2026-10-10 --check_out 2026-11-07
 ```
+
+# Price Filter Semantics
+
+Airbnb's search API filters on the **whole-stay total** (weekly/monthly discounts and fees included), not the raw nightly rate. The tool sends your price range along with `priceFilterNumNights = <actual nights>`, so Airbnb compares each listing's discounted total for your exact dates against it.
+
+`--price_unit` controls how your `--min_price`/`--max_price` are interpreted:
+
+- `total` — passed straight through as a whole-stay budget (discounts applied by Airbnb).
+- `nightly` — multiplied by the stay length before sending (use for a per-night cap).
+- `auto` (default) — nightly if the stay is > 7 nights and `max_price <= 500`, else total.
+
+Use `total` whenever you have a fixed trip budget; use `nightly` to cap the rate regardless of stay length.
 
 # Architecture Overview
 

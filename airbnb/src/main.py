@@ -26,6 +26,16 @@ from utils import (
 )
 
 
+def resolve_price_filters(min_price, max_price, num_nights, price_unit="auto"):
+	if price_unit == "nightly":
+		return min_price * num_nights, max_price * num_nights, "nightly"
+	if price_unit == "total":
+		return min_price, max_price, "total"
+	if num_nights > 7 and max_price <= 500:
+		return min_price * num_nights, max_price * num_nights, "nightly"
+	return min_price, max_price, "total"
+
+
 def run_survey(args, defaults, search_amenities, logger):
 	delimiter = ";" if ";" in args.cities else ","
 	raw_cities = [c.strip() for c in args.cities.split(delimiter) if c.strip()]
@@ -216,6 +226,13 @@ def main():
 	)
 	parser.add_argument("--min_price", type=int, default=0, help="Minimum price")
 	parser.add_argument("--max_price", type=int, default=500, help="Maximum price")
+	parser.add_argument(
+		"--price_unit",
+		type=str,
+		choices=["auto", "nightly", "total"],
+		default="auto",
+		help="Unit of min_price/max_price: 'total' = whole-stay budget (Airbnb applies weekly/monthly discounts before filtering), 'nightly' = per-night rate scaled by stay length, 'auto' = nightly if stay > 7 nights and max_price <= 500, else total. Default: auto",
+	)
 	parser.add_argument(
 		"--check_in",
 		type=str,
@@ -716,17 +733,16 @@ def main():
 	d2 = datetime.strptime(args.check_out, "%Y-%m-%d")
 	num_nights = max(1, (d2 - d1).days)
 
-	# If max_price is small (e.g. <= 500) and stay is longer than 7 nights,
-	# it represents a nightly rate, so scale to total stay price for Airbnb's API filter
-	if num_nights > 7 and args.max_price <= 500:
-		api_min_price = args.min_price * num_nights
-		api_max_price = args.max_price * num_nights
+	# Airbnb's price_max filter compares whole-stay totals (discounts and fees
+	# included; pyairbnb sends priceFilterNumNights = actual nights), so nightly
+	# caps must be multiplied by the stay length before hitting the API.
+	api_min_price, api_max_price, price_unit_used = resolve_price_filters(
+		args.min_price, args.max_price, num_nights, args.price_unit
+	)
+	if price_unit_used == "nightly":
 		logger.info(
-			f"Detected nightly rate range ({args.min_price}-{args.max_price}/night). Scaling to total reservation price for {num_nights} nights: {api_min_price}-{api_max_price} {args.currency}"
+			f"Nightly range ({args.min_price}-{args.max_price}/night) scaled to {num_nights}-night totals for Airbnb's price filter: {api_min_price}-{api_max_price} {args.currency}"
 		)
-	else:
-		api_min_price = args.min_price
-		api_max_price = args.max_price
 
 	logger.info(
 		f"--- Searching in {args.location} (Price: {api_min_price}-{api_max_price} {args.currency}) ---"
