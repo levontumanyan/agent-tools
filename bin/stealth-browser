@@ -46,29 +46,48 @@ try:
 except Exception:
 	pass
 
+STEALTH_BROWSER_CHEATSHEET = (
+	"Stay headless by default. Use wait_for_human() for interactive login/2FA/CAPTCHA (switches headed & polls); only call set_headless(headless=False) when asked.\n"
+	"Use this cheat-sheet instead of reading individual tool schemas; prefer snapshot(filter=...)/extract()/batch() over evaluate_js(). tab=-1 targets active tab (or index / stable 'tN').\n"
+	"Always call wait_for_human() (not set_headless churn) whenever a flow hits login/2FA/CAPTCHA/MFA.\n"
+	"- status() | new_tab(url='about:blank', block_media=None) | switch_tab(tab=0) | close_tab(tab=-1)\n"
+	"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
+	"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
+	"- wait_for_human(reason='...', url_contains='', url_not_contains='', selector='', timeout_s=180, poll_interval_s=1.5, notify=True, tab=-1)\n"
+	"- snapshot(selector='body', max_elements=80, tab=-1, include_shadow=True, include_iframes=True, include_hrefs=False, filter='', viewport_only=False, max_length=8000)\n"
+	"- get_content(selector='body', max_length=4000, interactive_only=False, clean=True, tab=-1, offset=0, filter='')\n"
+	"- extract(container_selector, fields={k:'text:.sel'|'@attr .sel'|'html:.sel'}, limit=20, include_shadow=True, include_iframes=True, tab=-1, max_length=8000)\n"
+	"- click(selector='', ref='', text='', force=False, tab=-1, timeout_ms=5000)\n"
+	"- type(selector='', text='', clear_first=True, press_enter=False, tab=-1, timeout_ms=5000, ref='')\n"
+	"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1, full_page=False, selector='', ref='', annotate=False)\n"
+	"- batch(actions=[{action:'click'|'fill'|'type'|'select'|'press'|'wait_for'|'sleep'|'evaluate', selector, ref, text, value, key, state, ms, force, expression, main_world, timeout_ms}], tab=-1)\n"
+	"- evaluate_js(expression='', tab=-1, timeout_ms=15000, script='', max_length=8000, main_world=False)\n"
+	"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000, save_path='', max_length=8000)\n"
+	"- state(framework='auto', selector='', tab=-1, max_length=8000) | set_media(enable_media=True, tab=-1)\n"
+	"- downloads(limit=20, include_dir=False) | network_requests(url_filter='', resource_type='', content_type='', status_min=0, limit=30, clear=False, tab=-1, max_length=8000) | console_logs(level='', limit=50, clear=False, tab=-1, max_length=8000)\n"
+	"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None, click_selector=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
+)
+
 mcp = FastMCP(
 	"stealth-browser",
-	instructions=(
-		"Stay headless by default. Use wait_for_human() for interactive login/2FA/CAPTCHA (switches headed & polls); only call set_headless(headless=False) when asked.\n"
-		"Use this cheat-sheet instead of reading individual tool schemas; prefer snapshot(filter=...)/extract()/batch() over evaluate_js(). tab=-1 targets active tab (or index / stable 'tN').\n"
-		"- status() | new_tab(url='about:blank', block_media=None) | switch_tab(tab=0) | close_tab(tab=-1)\n"
-		"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
-		"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
-		"- wait_for_human(reason='...', url_contains='', url_not_contains='', selector='', timeout_s=180, poll_interval_s=1.5, notify=True, tab=-1)\n"
-		"- snapshot(selector='body', max_elements=80, tab=-1, include_shadow=True, include_iframes=True, include_hrefs=False, filter='', viewport_only=False, max_length=8000)\n"
-		"- get_content(selector='body', max_length=4000, interactive_only=False, clean=True, tab=-1, offset=0, filter='')\n"
-		"- extract(container_selector, fields={k:'text:.sel'|'@attr .sel'|'html:.sel'}, limit=20, include_shadow=True, include_iframes=True, tab=-1, max_length=8000)\n"
-		"- click(selector='', ref='', text='', force=False, tab=-1, timeout_ms=5000)\n"
-		"- type(selector='', text='', clear_first=True, press_enter=False, tab=-1, timeout_ms=5000, ref='')\n"
-		"- press_key(key, tab=-1) | scroll(direction='down', amount=600, tab=-1) | screenshot(save_path='', tab=-1, full_page=False, selector='', ref='', annotate=False)\n"
-		"- batch(actions=[{action:'click'|'fill'|'type'|'select'|'press'|'wait_for'|'sleep'|'evaluate', selector, ref, text, value, key, state, ms, force, expression, main_world, timeout_ms}], tab=-1)\n"
-		"- evaluate_js(expression='', tab=-1, timeout_ms=15000, script='', max_length=8000, main_world=False)\n"
-		"- fetch(url, method='GET', headers=None, body=None, response_type='auto', tab=-1, timeout_ms=15000, save_path='', max_length=8000)\n"
-		"- state(framework='auto', selector='', tab=-1, max_length=8000) | set_media(enable_media=True, tab=-1)\n"
-		"- downloads(limit=20, include_dir=False) | network_requests(url_filter='', resource_type='', content_type='', status_min=0, limit=30, clear=False, tab=-1, max_length=8000) | console_logs(level='', limit=50, clear=False, tab=-1, max_length=8000)\n"
-		"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
-	),
+	instructions=STEALTH_BROWSER_CHEATSHEET,
 )
+
+
+@mcp.resource("instructions://cheatsheet")
+def stealth_browser_cheatsheet() -> str:
+	"""Curated cheat-sheet for stealth-browser tools (use instead of reading raw schema JSON)."""
+	return STEALTH_BROWSER_CHEATSHEET
+
+
+# Persist cheat-sheet to a well-known path so clients that ignore MCP instructions can read it in one call.
+_CHEATSHEET_FILE = os.path.expanduser("~/.cache/stealth-browser/cheatsheet.txt")
+try:
+	os.makedirs(os.path.dirname(_CHEATSHEET_FILE), exist_ok=True)
+	with open(_CHEATSHEET_FILE, "w", encoding="utf-8") as _f:
+		_f.write(STEALTH_BROWSER_CHEATSHEET)
+except Exception:
+	pass
 
 CDP_PORT = int(os.environ.get("STEALTH_BROWSER_CDP_PORT", os.environ.get("CDP_PORT", "9222")))
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
@@ -602,6 +621,18 @@ class BrowserSessionManager:
 
 	def _detect_cdp_headless(self) -> Optional[bool]:
 		"""Detect whether the Chromium instance listening on CDP_PORT is running headless."""
+		version_detected: Optional[bool] = None
+		try:
+			with urllib.request.urlopen(f"{self.cdp_url}/json/version", timeout=0.5) as resp:
+				data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+			ua = data.get("User-Agent", "")
+			browser_str = data.get("Browser", "")
+			if ua or browser_str:
+				version_detected = "HeadlessChrome" in ua or "HeadlessChrome" in browser_str
+				if version_detected:
+					return True
+		except Exception:
+			pass
 		try:
 			pid_res = subprocess.run(
 				["lsof", "-nP", f"-iTCP:{CDP_PORT}", "-sTCP:LISTEN", "-t"],
@@ -612,7 +643,7 @@ class BrowserSessionManager:
 			pids = [p.strip() for p in pid_res.stdout.splitlines() if p.strip()]
 			if pids:
 				ps_res = subprocess.run(
-					["ps", "-o", "args=", "-p", pids[0]],
+					["ps", "-ww", "-o", "args=", "-p", pids[0]],
 					capture_output=True,
 					text=True,
 					timeout=1.5,
@@ -622,16 +653,7 @@ class BrowserSessionManager:
 					return "--headless" in args
 		except Exception:
 			pass
-		try:
-			with urllib.request.urlopen(f"{self.cdp_url}/json/version", timeout=0.5) as resp:
-				data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-			ua = data.get("User-Agent", "")
-			browser_str = data.get("Browser", "")
-			if ua or browser_str:
-				return "HeadlessChrome" in ua or "HeadlessChrome" in browser_str
-		except Exception:
-			pass
-		return None
+		return version_detected
 
 	async def _connect_cdp(self) -> Optional[BrowserContext]:
 		"""Attach to an already-running Chromium CDP endpoint and sync headless state."""
@@ -1053,12 +1075,14 @@ class KeepAliveManager:
 		min_seconds: int = 45,
 		max_seconds: int = 90,
 		ping_url: Optional[str] = None,
+		click_selector: Optional[str] = None,
 	):
 		await self.stop(page)
 		self._configs[page] = {
 			"min_seconds": min_seconds,
 			"max_seconds": max_seconds,
 			"ping_url": ping_url,
+			"click_selector": click_selector,
 			"started_at": datetime.datetime.now().isoformat(),
 			"last_ping": None,
 		}
@@ -1073,42 +1097,45 @@ class KeepAliveManager:
 
 					session._touch_activity()
 
-					js_keep_alive = """async (pingUrl) => {
+					keep_working_js = """() => {
 						const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 						const keepWorking = buttons.find(b => {
 							const t = (b.innerText || '').toLowerCase();
 							return t.includes('keep working') || t.includes('continue session') || t.includes('stay signed in') || t.includes('extend session');
 						});
-						let clicked = false;
-						if (keepWorking) {
-							try { keepWorking.click(); clicked = true; } catch (e) {}
-						}
-
-						const x = Math.floor(Math.random() * 500) + 100;
-						const y = Math.floor(Math.random() * 400) + 100;
-						window.dispatchEvent(new MouseEvent('mousemove', { clientX: x, clientY: y, bubbles: true }));
-						window.dispatchEvent(new Event('scroll', { bubbles: true }));
-
-						let pingStatus = null;
-						if (pingUrl) {
-							try {
-								const res = await fetch(pingUrl);
-								pingStatus = res.status;
-							} catch (e) {
-								pingStatus = e.message;
-							}
-						}
-						return { clicked, pingStatus, x, y };
+						if (!keepWorking) return null;
+						const r = keepWorking.getBoundingClientRect();
+						return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (keepWorking.innerText || '').slice(0, 60) };
 					}"""
+					ping_result = {"modal_clicked": None, "selector_clicked": False, "error": None}
 					try:
-						res = await page.evaluate(js_keep_alive, ping_url)
-						if page in self._configs:
-							self._configs[page]["last_ping"] = {
-								"timestamp": datetime.datetime.now().isoformat(),
-								"details": res,
-							}
-					except Exception:
-						pass
+						if click_selector:
+							loc = page.locator(click_selector).first
+							if await loc.count() > 0 and await loc.is_visible():
+								await loc.click(timeout=5000)
+								ping_result["selector_clicked"] = True
+					except Exception as e:
+						ping_result["error"] = f"click_selector: {e}"
+					try:
+						viewport = page.viewport_size or {"width": 1280, "height": 720}
+						x = random.randint(100, max(101, viewport["width"] - 100))
+						y = random.randint(100, max(101, viewport["height"] - 100))
+						await page.mouse.move(x, y, steps=5)
+						await page.mouse.move(x + random.randint(-40, 40), y + random.randint(-40, 40), steps=5)
+						await page.mouse.wheel(0, random.choice([60, -60, 0]))
+						target = await page.evaluate(keep_working_js)
+						if target:
+							await page.mouse.click(target["x"], target["y"])
+							ping_result["modal_clicked"] = target["text"]
+						if ping_url:
+							await page.evaluate("async (u) => { try { return (await fetch(u)).status } catch (e) { return e.message } }", ping_url)
+					except Exception as e:
+						ping_result["error"] = f"input: {e}"
+					if page in self._configs:
+						self._configs[page]["last_ping"] = {
+							"timestamp": datetime.datetime.now().isoformat(),
+							"details": ping_result,
+						}
 			except asyncio.CancelledError:
 				pass
 			finally:
@@ -1167,8 +1194,9 @@ async def keep_alive(
 	min_seconds: int = 45,
 	max_seconds: int = 90,
 	ping_url: Optional[str] = None,
+	click_selector: Optional[str] = None,
 ) -> str:
-	"""Keep a tab session alive with jittered mouse/scroll activity, modal auto-dismissal, and optional heartbeat ping_url."""
+	"""Keep a tab session alive: trusted CDP mouse/wheel input, modal auto-click, optional click_selector and heartbeat ping_url."""
 	try:
 		page = await session.resolve_page(tab)
 		pages = await session.get_pages()
@@ -1183,11 +1211,13 @@ async def keep_alive(
 			min_seconds=min_seconds,
 			max_seconds=max_seconds,
 			ping_url=ping_url,
+			click_selector=click_selector,
 		)
 		ping_info = f", pinging '{ping_url}'" if ping_url else ""
+		click_info = f", real-clicking '{click_selector}'" if click_selector else ""
 		return (
 			f"Activated keep-alive on tab [{target_index}] ({page.url}): "
-			f"jitter interval {min_seconds}-{max_seconds}s, auto-dismiss modals enabled{ping_info}."
+			f"jitter interval {min_seconds}-{max_seconds}s, trusted mouse/wheel input, auto-dismiss modals enabled{click_info}{ping_info}."
 		)
 	except Exception as exc:
 		return f"Error managing keep-alive: {exc}"
@@ -1334,6 +1364,16 @@ async def wait_for_human(
 		initial_url = page.url or ""
 		tab_id = session.get_tab_id(page)
 		switched_to_headed = False
+
+		try:
+			detected_headless = await asyncio.wait_for(
+				asyncio.to_thread(session._detect_cdp_headless),
+				timeout=CDP_OP_TIMEOUT_S,
+			)
+			if detected_headless is not None:
+				session.headless = detected_headless
+		except Exception:
+			pass
 
 		if session.headless:
 			restart_res = await restart_browser(headless=False)
@@ -4164,12 +4204,22 @@ async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = 
 
 @mcp.tool()
 async def set_headless(headless: bool = True, force: bool = False) -> str:
-	"""Switch headless (default) vs headed mode; restarts Chromium on change (refuses if non-blank tabs exist unless force=True). Prefer wait_for_human() for login/2FA."""
+	"""Switch headless (default) vs headed mode; restarts Chromium on change (switching to headless refuses if non-blank tabs exist unless force=True). Prefer wait_for_human() for login/2FA."""
 	pages: list[Page] = []
 	try:
 		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 	except Exception:
 		pages = []
+
+	try:
+		detected_headless = await asyncio.wait_for(
+			asyncio.to_thread(session._detect_cdp_headless),
+			timeout=CDP_OP_TIMEOUT_S,
+		)
+		if detected_headless is not None:
+			session.headless = detected_headless
+	except Exception:
+		pass
 
 	if session.headless == headless and (session._context is not None or session._browser is not None):
 		mode_str = "Headless" if headless else "Headed"
@@ -4180,7 +4230,7 @@ async def set_headless(headless: bool = True, force: bool = False) -> str:
 		for idx, p in enumerate(pages)
 		if not p.is_closed() and p.url and p.url != "about:blank" and not p.url.startswith("chrome://")
 	]
-	if active_tabs and not force:
+	if headless and active_tabs and not force:
 		target_mode = "Headless" if headless else "Headed"
 		tab_list = "\n".join(f"\t[{idx}] {tab_url}" for idx, tab_url in active_tabs)
 		return (
