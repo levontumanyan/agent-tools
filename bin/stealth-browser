@@ -1177,7 +1177,7 @@ async def set_page_media_state(page: Page, block_media: bool):
 async def status() -> str:
 	"""Check connection status to Stealth Browser and list all open tabs."""
 	try:
-		pages = await session.get_pages()
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		active_page = session._active_page if (session._active_page is not None and not session._active_page.is_closed()) else None
 		mode_str = "Headless" if session.headless else "Headed"
 		lines = [f"Connected to browser session at {CDP_URL} (Mode: {mode_str})"]
@@ -1222,7 +1222,7 @@ async def keep_alive(
 	"""Keep a tab session alive: trusted CDP mouse/wheel input, modal auto-click, optional click_selector and heartbeat ping_url."""
 	try:
 		page = await session.resolve_page(tab)
-		pages = await session.get_pages()
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		target_index = pages.index(page) if page in pages else tab
 
 		if not enable:
@@ -1330,7 +1330,7 @@ async def new_tab(url: str = "about:blank", block_media: Optional[bool] = None) 
 	match = re.match(r"Navigated tab \[(\d+)\]", result)
 	if match:
 		try:
-			pages = await session.get_pages()
+			pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 			idx = int(match.group(1))
 			if 0 <= idx < len(pages):
 				page = pages[idx]
@@ -1403,7 +1403,7 @@ async def wait_for_human(
 			if isinstance(restart_res, str) and restart_res.startswith("Error"):
 				return f"Error switching to headed mode for human handoff: {restart_res}"
 			switched_to_headed = True
-			pages = await session.get_pages()
+			pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 			resolved_page = None
 			if initial_url and initial_url != "about:blank" and not initial_url.startswith("chrome://"):
 				for candidate in pages:
@@ -1498,7 +1498,7 @@ async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str
 	try:
 		page = await session.resolve_page(tab)
 		await set_page_media_state(page, block_media=not enable_media)
-		pages = await session.get_pages()
+		pages = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		target_idx = pages.index(page) if page in pages else -1
 		state_str = "ENABLED (images, charts, and media will load)" if enable_media else "BLOCKED (high-speed text-only mode)"
 		return f"Media loading is now {state_str} on tab [{target_idx}] ({page.url})"
