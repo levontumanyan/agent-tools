@@ -15,6 +15,7 @@ import collections
 import contextlib
 import datetime
 import fcntl
+import functools
 import hashlib
 import io
 import json
@@ -127,6 +128,38 @@ RESTART_BROWSER_TIMEOUT_S = 30.0
 GOTO_OUTER_BUFFER_S = 5.0
 DIALOG_ACTION_TIMEOUT_S = 3.0
 MAX_DIALOG_HISTORY = 50
+
+TOOL_TOTAL_TIMEOUT_S = 60.0
+
+
+def _with_tool_deadline(fn):
+	@functools.wraps(fn)
+	async def wrapper(*args, **kwargs):
+		try:
+			return await asyncio.wait_for(fn(*args, **kwargs), timeout=TOOL_TOTAL_TIMEOUT_S)
+		except asyncio.TimeoutError:
+			try:
+				probe_ok = await asyncio.wait_for(asyncio.to_thread(session._probe_cdp_ready), timeout=2.0)
+			except Exception:
+				probe_ok = False
+			try:
+				await asyncio.wait_for(session.close(), timeout=5.0)
+			except Exception:
+				pass
+			if not probe_ok:
+				try:
+					await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
+				except Exception:
+					pass
+				return (
+					f"Error {fn.__name__}: exceeded {int(TOOL_TOTAL_TIMEOUT_S)}s total; "
+					f"CDP transport wedged — browser force-restarted, retry the call."
+				)
+			return (
+				f"Error {fn.__name__}: exceeded {int(TOOL_TOTAL_TIMEOUT_S)}s total; "
+				f"browser still reachable — call restart_browser to recover."
+			)
+	return wrapper
 HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
 CHROMIUM_APP_BIN = "/Applications/Chromium.app/Contents/MacOS/Chromium"
 DEFAULT_BROWSER_EXECUTABLE = CHROMIUM_APP_BIN if os.path.exists(CHROMIUM_APP_BIN) else None
@@ -1174,6 +1207,7 @@ async def set_page_media_state(page: Page, block_media: bool):
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def status() -> str:
 	"""Check connection status to Stealth Browser and list all open tabs."""
 	try:
@@ -1211,6 +1245,7 @@ async def status() -> str:
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def keep_alive(
 	enable: bool = True,
 	tab: Union[int, str] = -1,
@@ -1247,6 +1282,7 @@ async def keep_alive(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def navigate(
 	url: str,
 	block_media: Optional[bool] = None,
@@ -1321,6 +1357,7 @@ async def navigate(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def new_tab(url: str = "about:blank", block_media: Optional[bool] = None) -> str:
 	"""Open a new browser tab and navigate to url (default 'about:blank'). Set block_media=True for high-speed text-only browsing."""
 	result = await navigate(url=url, block_media=block_media, new_tab=True)
@@ -1493,6 +1530,7 @@ async def wait_for_human(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str:
 	"""Toggle media loading (images, videos, web fonts) on a tab. enable_media=False blocks heavy media for fast text-only browsing."""
 	try:
@@ -2261,6 +2299,7 @@ def _format_snapshot_row(el: dict, fallback_idx: int, include_hrefs: bool = Fals
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def snapshot(
 	selector: str = "body",
 	max_elements: int = 80,
@@ -2340,6 +2379,7 @@ async def snapshot(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def batch(actions: list[dict], tab: Union[int, str] = -1) -> str:
 	"""Run sequential actions in one turn. Valid actions: click, fill, type, select, press, wait_for, sleep, evaluate (fields: selector, ref, text, value, key, state, ms, force, expression, main_world, timeout_ms)."""
 	t0 = time.perf_counter()
@@ -2541,6 +2581,7 @@ def _filter_content_lines(text: str, pattern: str) -> Optional[str]:
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def get_content(
 	selector: str = "body",
 	max_length: int = 4000,
@@ -2639,6 +2680,7 @@ def _normalize_extract_fields(fields) -> Optional[dict[str, dict[str, str]]]:
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def extract(
 	container_selector: str,
 	fields: dict[str, Union[str, dict]],
@@ -2693,6 +2735,7 @@ async def extract(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def click(
 	selector: str = "",
 	ref: str = "",
@@ -2737,6 +2780,7 @@ async def click(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def type(
 	selector: str = "",
 	text: str = "",
@@ -2779,6 +2823,7 @@ async def type(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def press_key(key: str, tab: Union[int, str] = -1) -> str:
 	"""Press a keyboard key (e.g., 'Enter', 'Tab', 'Escape')."""
 	try:
@@ -2793,6 +2838,7 @@ async def press_key(key: str, tab: Union[int, str] = -1) -> str:
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def scroll(direction: str = "down", amount: int = 600, tab: Union[int, str] = -1) -> str:
 	"""Scroll up or down by amount pixels."""
 	try:
@@ -2805,6 +2851,7 @@ async def scroll(direction: str = "down", amount: int = 600, tab: Union[int, str
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def screenshot(
 	save_path: str = "",
 	tab: Union[int, str] = -1,
@@ -2857,6 +2904,7 @@ async def screenshot(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def fetch(
 	url: str,
 	method: str = "GET",
@@ -3526,6 +3574,7 @@ def _attach_page_trackers(page: Page) -> None:
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def downloads(limit: int = 20, include_dir: bool = False) -> str:
 	"""List tracked browser downloads (and recent DOWNLOADS_DIR files when include_dir=True)."""
 	try:
@@ -3569,6 +3618,7 @@ async def downloads(limit: int = 20, include_dir: bool = False) -> str:
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def network_requests(
 	url_filter: str = "",
 	resource_type: str = "",
@@ -3623,6 +3673,7 @@ async def network_requests(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def console_logs(
 	level: str = "",
 	limit: int = 50,
@@ -3661,6 +3712,7 @@ async def console_logs(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def state(
 	framework: str = "auto",
 	selector: str = "",
@@ -3885,6 +3937,7 @@ async def state(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def evaluate_js(
 	expression: str = "",
 	tab: Union[int, str] = -1,
@@ -3916,6 +3969,7 @@ async def evaluate_js(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def wait_for(
 	selector: str = "",
 	text: str = "",
@@ -4006,6 +4060,7 @@ async def wait_for(
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
 	"""Switch focus to an open tab by numeric index or stable tab id like 't2' (see status). Accepts 'tab' or legacy alias 'index'."""
 	target = tab if tab is not None else index
@@ -4037,6 +4092,7 @@ async def switch_tab(tab: Union[int, str, None] = None, index: Optional[int] = N
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = None) -> str:
 	"""Close a tab by numeric index or stable tab id like 't2' (-1 closes active tab, -99 or closing last tab terminates the browser window). Accepts 'tab' or legacy alias 'index'."""
 	target = tab if tab is not None else (index if index is not None else -1)
@@ -4075,7 +4131,18 @@ async def close_tab(tab: Union[int, str, None] = None, index: Optional[int] = No
 		try:
 			await asyncio.wait_for(page.close(), timeout=PAGE_CLOSE_TIMEOUT_S)
 		except asyncio.TimeoutError:
-			return f"Error closing tab [{target_index}]: Timed out after {int(PAGE_CLOSE_TIMEOUT_S * 1000)}ms (renderer unresponsive)"
+			probe_ok = await asyncio.wait_for(asyncio.to_thread(session._probe_cdp_ready), timeout=2.0)
+			if probe_ok:
+				return f"Error closing tab [{target_index}]: Timed out after {int(PAGE_CLOSE_TIMEOUT_S * 1000)}ms (renderer unresponsive; browser still reachable, try restart_browser)"
+			try:
+				await asyncio.wait_for(session.close(), timeout=5.0)
+			except Exception:
+				pass
+			try:
+				await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
+			except Exception:
+				pass
+			return f"Error closing tab [{target_index}]: renderer unresponsive and CDP endpoint dead — wedged browser force-restarted; the next call relaunches it, reopen the tab and re-navigate."
 
 		remaining = await asyncio.wait_for(session.get_pages(), timeout=CDP_OP_TIMEOUT_S)
 		if page == session._active_page:
@@ -4110,6 +4177,7 @@ def _force_kill_browser_processes():
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def close_browser(force_kill: bool = True) -> str:
 	"""Completely close the browser window, terminate all browser and renderer processes, and release all resources."""
 	try:
@@ -4212,6 +4280,7 @@ async def _restart_browser_inner(headless: Optional[bool] = None, url: Optional[
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = None) -> str:
 	"""Restart Chromium cleanly, preserving non-blank tabs unless url overrides tab [0]. headless=None keeps current mode."""
 	try:
@@ -4226,6 +4295,7 @@ async def restart_browser(headless: Optional[bool] = None, url: Optional[str] = 
 
 
 @mcp.tool()
+@_with_tool_deadline
 async def set_headless(headless: bool = True, force: bool = False) -> str:
 	"""Switch headless (default) vs headed mode; restarts Chromium on change (switching to headless refuses if non-blank tabs exist unless force=True). Prefer wait_for_human() for login/2FA."""
 	pages: list[Page] = []

@@ -502,7 +502,10 @@ def test_close_tab_timeout_and_param_aliases(sb, monkeypatch):
 		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[p0, p1]))
 
 		res_timeout = await sb.close_tab(tab=1)
-		assert "Error closing tab [1]: Timed out" in res_timeout
+		assert "Error closing tab [1]: renderer unresponsive" in res_timeout
+		assert "force-restarted" in res_timeout
+		monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: None)
+		monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
 
 		p1.close_impl = None
 		get_pages_mock = AsyncMock(side_effect=[[p0, p1], [p0], [p0, p1], [p0]])
@@ -1007,3 +1010,89 @@ def test_set_headless_resyncs_live_cdp_mode_before_short_circuit(sb, monkeypatch
 
 	asyncio.run(scenario())
 
+
+
+def test_with_tool_deadline_returns_result_when_fast(sb, monkeypatch):
+	killed = []
+	monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: killed.append(True))
+
+	@sb._with_tool_deadline
+	async def fast_tool():
+		return "all good"
+
+	assert asyncio.run(fast_tool()) == "all good"
+	assert killed == []
+
+
+def test_with_tool_deadline_bounds_wedge_and_force_kills(sb, monkeypatch):
+	killed = []
+	monkeypatch.setattr(sb, "TOOL_TOTAL_TIMEOUT_S", 0.05)
+	monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: killed.append(True))
+	monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
+	monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: False)
+
+	@sb._with_tool_deadline
+	async def wedged_tool():
+		await asyncio.sleep(30)
+
+	out = asyncio.run(wedged_tool())
+	assert "exceeded" in out and "force-restarted" in out
+	assert killed == [True]
+
+
+def test_with_tool_deadline_spares_live_browser_on_deadline_expiry(sb, monkeypatch):
+	killed = []
+	monkeypatch.setattr(sb, "TOOL_TOTAL_TIMEOUT_S", 0.05)
+	monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: killed.append(True))
+	monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
+	monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: True)
+
+	@sb._with_tool_deadline
+	async def slow_but_alive_tool():
+		await asyncio.sleep(30)
+
+	out = asyncio.run(slow_but_alive_tool())
+	assert "exceeded" in out and "restart_browser" in out
+	assert killed == []
+
+
+def test_with_tool_deadline_wraps_all_registered_tools_except_wait_for_human(sb):
+	tools = sb.mcp._tool_manager._tools
+	assert len(tools) >= 26
+	assert "wait_for_human" in tools
+	for name, tool in tools.items():
+		if name == "wait_for_human":
+			continue
+		assert getattr(tool.fn, "__wrapped__", None) is not None, f"tool {name} lacks total deadline"
+
+
+def test_close_tab_escalates_only_when_cdp_endpoint_dead(sb, monkeypatch):
+	async def scenario():
+		dead_page = FakePage(url="https://example.com/slow")
+		dead_page.closed = False
+		async def slow_close(**kwargs):
+			await asyncio.sleep(30)
+		dead_page.close = slow_close
+		sb.session._active_page = None
+		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[dead_page]))
+		monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: False)
+		killed = []
+		monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: killed.append(True))
+		monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
+
+		out = await sb.close_tab(tab=0)
+		assert "force-restarted" in out
+		assert killed == [True]
+
+		alive_page = FakePage(url="https://example.com/slow2")
+		async def slow_close2(**kwargs):
+			await asyncio.sleep(30)
+		alive_page.close = slow_close2
+		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[alive_page]))
+		monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: True)
+
+		out = await sb.close_tab(tab=0)
+		assert "renderer unresponsive" in out and "force-restarted" not in out
+		assert killed == [True]
+
+	asyncio.run(scenario())

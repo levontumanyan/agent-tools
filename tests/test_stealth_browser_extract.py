@@ -211,12 +211,15 @@ def test_extract_tool_evaluate_failure_and_timeout(monkeypatch):
 		"rows": [{"_index": 0, "t": "ok"}],
 	}
 	monkeypatch.setattr(sb.asyncio, "wait_for", _fake_wait_for_timeout)
+	monkeypatch.setattr(sb, "TOOL_TOTAL_TIMEOUT_S", 10**9)
 
 	out_timeout = _run(sb.extract(container_selector=".card", fields={"t": "text"}))
 	assert "Timed out after 15000ms" in out_timeout
 
 
 async def _fake_wait_for_timeout(coro, timeout=None):
+	if timeout is not None and timeout > 1e6:
+		return await coro
 	await coro
 	raise asyncio.TimeoutError()
 
