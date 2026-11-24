@@ -31,6 +31,7 @@ KNOWN_TOOLS = (
 	"navigate",
 	"new_tab",
 	"set_media",
+	"set_animations",
 	"snapshot",
 	"batch",
 	"get_content",
@@ -74,6 +75,7 @@ VALIDATION_RE = re.compile(
 	r"validation error for\s+(\S+)\s*\n\s*([^\n]+)",
 	re.IGNORECASE,
 )
+INVALID_ARGS_TOOL_RE = re.compile(r'invalid arguments for tool \\?"([^"\\]+)\\?"', re.IGNORECASE)
 URL_HOST_RE = re.compile(r"https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
 STEALTH_OPENCODE_RE = re.compile(
 	r"^(?:mcp__)?stealth[-_]browser(?:__|:|_|\.)([a-z0-9_]+)$",
@@ -251,9 +253,28 @@ def load_agy_titles() -> dict[str, str]:
 	return titles
 
 
+def harness_validation_tool(body: str) -> Optional[str]:
+	"""Return the tool named by a harness-side `Invalid arguments for tool "<name>"` payload, if any.
+
+	Search is bounded to the head window like every other classify_outcome heuristic, so a body
+	that merely quotes an invalid-args payload deep inside is not reclassified on the quote.
+	"""
+	m = INVALID_ARGS_TOOL_RE.search(body[:350])
+	if not m:
+		return None
+	named = m.group(1).strip()
+	nested = STEALTH_OPENCODE_RE.match(named)
+	return (nested.group(1) if nested else named).lower()
+
+
 def classify_outcome(tool: str, body: str, explicit_error: bool = False) -> Optional[str]:
 	if not body:
 		return "other_error" if explicit_error else None
+	named = harness_validation_tool(body)
+	if named is not None:
+		# Harness-side schema errors (e.g. a malformed opencode execute call) get attached to the
+		# nearest browser tool call; only count them when they name a stealth-browser tool.
+		return "validation_error" if named in KNOWN_TOOLS else None
 	bl = body.lower()
 	head = bl[:350]
 
