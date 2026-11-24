@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import base64
 import collections
-import datetime
+import contextlibimport datetime
 import fcntl
 import hashlib
 import io
@@ -46,6 +46,7 @@ try:
 except Exception:
 	pass
 
+@contextlib.asynccontextmanager
 async def _lifespan(_app):
 	loop = asyncio.get_running_loop()
 
