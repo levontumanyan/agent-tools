@@ -142,11 +142,11 @@ def _with_tool_deadline(fn):
 				probe_ok = await asyncio.wait_for(asyncio.to_thread(session._probe_cdp_ready), timeout=2.0)
 			except Exception:
 				probe_ok = False
-			try:
-				await asyncio.wait_for(session.close(), timeout=5.0)
-			except Exception:
-				pass
 			if not probe_ok:
+				try:
+					await asyncio.wait_for(session.close(), timeout=5.0)
+				except Exception:
+					pass
 				try:
 					await asyncio.wait_for(asyncio.to_thread(_force_kill_browser_processes), timeout=10.0)
 				except Exception:
@@ -157,7 +157,7 @@ def _with_tool_deadline(fn):
 				)
 			return (
 				f"Error {fn.__name__}: exceeded {int(TOOL_TOTAL_TIMEOUT_S)}s total; "
-				f"browser still reachable — call restart_browser to recover."
+				f"browser still reachable — safe to retry; call restart_browser only if calls keep stalling."
 			)
 	return wrapper
 HEADLESS = os.environ.get("STEALTH_BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
@@ -1291,7 +1291,7 @@ async def navigate(
 	timeout_ms: int = 30000,
 	wait_until: str = "domcontentloaded",
 ) -> str:
-	"""Navigate a tab to url. block_media=True blocks images/fonts/video (None preserves state); wait_until: 'domcontentloaded'|'commit'|'load'|'networkidle'."""
+	"""Navigate a tab to url. block_media=True blocks images/fonts/video (None preserves state); wait_until: 'domcontentloaded'|'commit'|'load'|'networkidle'. Clamped to 60s tool cap."""
 	t0 = time.perf_counter()
 	try:
 		context = await asyncio.wait_for(session.get_context(), timeout=GET_CONTEXT_TIMEOUT_S)
@@ -3978,7 +3978,7 @@ async def wait_for(
 	timeout_ms: int = 15000,
 	tab: Union[int, str] = -1,
 ) -> str:
-	"""Wait for a CSS selector state, visible page text substring, URL substring, or combination."""
+	"""Wait for a CSS selector state, visible page text substring, URL substring, or combination. Clamped to 60s cap."""
 	if not selector and not text and not url_contains:
 		return "Error in wait_for: specify at least one of 'selector', 'text', or 'url_contains'."
 	valid_states = {"attached", "detached", "hidden", "visible"}
@@ -3986,6 +3986,7 @@ async def wait_for(
 		return f"Error in wait_for: invalid state '{state}'. Expected one of: {', '.join(sorted(valid_states))}."
 	if timeout_ms <= 0:
 		return f"Error in wait_for: timeout_ms must be > 0 (got {timeout_ms})."
+	timeout_ms = min(timeout_ms, int((TOOL_TOTAL_TIMEOUT_S - 10.0) * 1000))
 
 	t0 = time.perf_counter()
 	deadline = time.monotonic() + (timeout_ms / 1000.0)

@@ -1026,9 +1026,10 @@ def test_with_tool_deadline_returns_result_when_fast(sb, monkeypatch):
 
 def test_with_tool_deadline_bounds_wedge_and_force_kills(sb, monkeypatch):
 	killed = []
+	session_close = AsyncMock(return_value=None)
 	monkeypatch.setattr(sb, "TOOL_TOTAL_TIMEOUT_S", 0.05)
 	monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: killed.append(True))
-	monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
+	monkeypatch.setattr(sb.session, "close", session_close)
 	monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: False)
 
 	@sb._with_tool_deadline
@@ -1038,13 +1039,15 @@ def test_with_tool_deadline_bounds_wedge_and_force_kills(sb, monkeypatch):
 	out = asyncio.run(wedged_tool())
 	assert "exceeded" in out and "force-restarted" in out
 	assert killed == [True]
+	assert session_close.await_count == 1
 
 
 def test_with_tool_deadline_spares_live_browser_on_deadline_expiry(sb, monkeypatch):
 	killed = []
+	session_close = AsyncMock(return_value=None)
 	monkeypatch.setattr(sb, "TOOL_TOTAL_TIMEOUT_S", 0.05)
 	monkeypatch.setattr(sb, "_force_kill_browser_processes", lambda: killed.append(True))
-	monkeypatch.setattr(sb.session, "close", AsyncMock(return_value=None))
+	monkeypatch.setattr(sb.session, "close", session_close)
 	monkeypatch.setattr(sb.session, "_probe_cdp_ready", lambda: True)
 
 	@sb._with_tool_deadline
@@ -1054,6 +1057,7 @@ def test_with_tool_deadline_spares_live_browser_on_deadline_expiry(sb, monkeypat
 	out = asyncio.run(slow_but_alive_tool())
 	assert "exceeded" in out and "restart_browser" in out
 	assert killed == []
+	assert session_close.await_count == 0
 
 
 def test_with_tool_deadline_wraps_all_registered_tools_except_wait_for_human(sb):
