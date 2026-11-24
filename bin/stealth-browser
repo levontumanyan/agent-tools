@@ -72,6 +72,7 @@ STEALTH_BROWSER_CHEATSHEET = (
 	"Use this cheat-sheet instead of reading individual tool schemas; prefer snapshot(filter=...)/extract()/batch() over evaluate_js(). tab=-1 targets active tab (or index / stable 'tN').\n"
 	"Always call wait_for_human() (not set_headless churn) whenever a flow hits login/2FA/CAPTCHA/MFA.\n"
 	"- status() | new_tab(url='about:blank', block_media=None) | switch_tab(tab=0) | close_tab(tab=-1)\n"
+	"  For tab URLs/titles: call status() — it lists every open tab's title and URL in one call; do NOT evaluate_js location.href/document.title.\n"
 	"- navigate(url, block_media=None, new_tab=False, tab=-1, timeout_ms=30000, wait_until='domcontentloaded')\n"
 	"- wait_for(selector='', text='', url_contains='', state='visible', timeout_ms=15000, tab=-1)\n"
 	"- wait_for_human(reason='...', url_contains='', url_not_contains='', selector='', timeout_s=180, poll_interval_s=1.5, notify=True, tab=-1)\n"

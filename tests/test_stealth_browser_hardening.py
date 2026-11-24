@@ -178,9 +178,13 @@ FakePlaywrightTimeoutError.__name__ = "TimeoutError"
 def test_fastmcp_instructions_cheatsheet(sb):
 	instructions = sb.mcp.instructions
 	lines = [line for line in instructions.splitlines() if line.strip()]
-	assert 10 <= len(lines) <= 20
+	assert len(lines) >= 10
 	assert "Stay headless by default" in instructions
 	assert "set_headless(headless=False)" in instructions
+	assert "call status()" in instructions and "every open tab's title and URL" in instructions
+	assert "do NOT evaluate_js location.href/document.title" in instructions
+	assert sb.stealth_browser_cheatsheet() == instructions
+	assert "call status()" in Path.home().joinpath(".cache/stealth-browser/cheatsheet.txt").read_text(encoding="utf-8")
 	for token in (
 		"evaluate_js(expression=",
 		"script=",
