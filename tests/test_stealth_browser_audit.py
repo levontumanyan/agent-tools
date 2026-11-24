@@ -70,6 +70,53 @@ class TestClassifyOutcome:
 		assert sba.classify_outcome("click", sba.unwrap_result_json(wrapped)) == "click_error"
 
 
+class TestHarnessValidationMisattribution:
+	# Exact payload shape from issue #25 (session ses_df1bea730ffe2Lg6eDmbcRbHzC):
+	# a malformed opencode execute call's schema error attached to the nearest browser tool call.
+	EXECUTE_SCHEMA_ERROR = (
+		"{'type': 'tool.execution', 'message': 'Invalid arguments for tool \"execute\":\n"
+		"- code: Missing key\n\nArguments provided:\n{\n"
+		"  \"command\": \"await tools[\\\"stealth-browser\\\"].new_tab(\\\"https://example.com\\\")\"\n}"
+		"'}"
+	)
+
+	def test_execute_schema_error_skipped(self):
+		assert sba.classify_outcome("wait_for_human", self.EXECUTE_SCHEMA_ERROR, explicit_error=True) is None
+		assert sba.classify_outcome("wait_for_human", self.EXECUTE_SCHEMA_ERROR) is None
+
+	def test_other_harness_tool_schema_error_skipped(self):
+		for named in ("shell", "read", "execute", "session_opencode"):
+			body = f'Invalid arguments for tool "{named}": - code: Missing key'
+			assert sba.classify_outcome("wait_for_human", body, explicit_error=True) is None, named
+
+	def test_browser_tool_schema_error_counted_as_validation(self):
+		body = 'Invalid arguments for tool "stealth-browser_new_tab": - root: Expected object'
+		assert sba.classify_outcome("new_tab", body, explicit_error=True) == "validation_error"
+		body = 'Invalid arguments for tool "click": - selector: Missing key'
+		assert sba.classify_outcome("click", body, explicit_error=True) == "validation_error"
+
+	def test_escaped_quote_variant_matched(self):
+		body = '[object Object] || "fail2:Error: Invalid arguments for tool \\"stealth-browser_type\\":\n- selector: Missing key"'
+		assert sba.classify_outcome("type", body, explicit_error=True) == "validation_error"
+		body = 'Invalid arguments for tool \\"execute\\": - code: Missing key'
+		assert sba.classify_outcome("wait_for_human", body, explicit_error=True) is None
+
+	def test_nested_execute_schema_error_not_attributed_to_wait_for_human(self):
+		c = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2)
+		sess = make_sess_state()
+		item = make_execute_item(
+			"c8",
+			[("wait_for_human", "completed", {})],
+			TestHarnessValidationMisattribution.EXECUTE_SCHEMA_ERROR,
+			status="error",
+			error=TestHarnessValidationMisattribution.EXECUTE_SCHEMA_ERROR,
+		)
+		c._record_nested_calls("s1", "t", "execute", 'await tools["stealth-browser"].wait_for_human({});', item, None, None, sess)
+		assert sum(c.tool_errors["wait_for_human"].values()) == 0
+		assert sess["errors"] == 0
+		assert c.call_records[-1]["is_error"] is False
+
+
 class TestParseValidationSignature:
 	def test_wrapped_json_validation_error(self):
 		wrapped = '{"result":"1 validation error for navigateArgs\\nurl\\n  Field required [type=missing]"}'
