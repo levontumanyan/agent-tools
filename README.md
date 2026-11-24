@@ -1,15 +1,14 @@
 # agent-tools
 
-Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **iPhone Call Recordings & Diarization**, **Apple Pay**, **Microsoft Outlook**, **Yahoo Mail**, **Airbnb search & scoring**, **Antigravity session recovery & telemetry**, **stealth browser automation**, and **automated reel & video downloading**.
+Single-file, zero-setup CLI tools and MCP servers that give AI coding agents (**Claude Code**, **Google Antigravity**, **Cursor**, **OpenAI Codex**) direct, local access to your digital life on macOS — **WhatsApp**, **iMessage**, **Apple Calendar & Reminders**, **iPhone Call Recordings & Diarization**, **Apple Pay**, **Microsoft Outlook**, **Yahoo Mail**, **Airbnb search & scoring**, **Antigravity session recovery & telemetry**, and **automated reel & video downloading**.
 
 Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` or compiled native helper) with auto-generated `--help`, zero global Python pollution, and instant startup.
 
 # Why agent-tools?
 
-- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `call-recordings`, `apple-pay`, `outlook`, `yahoo`, `download-video`, `airbnb`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas. Stateful browser sessions use `stealth-browser`.
+- **CLI-First + Selective MCP**: Simple data lookups (`whatsapp`, `imessage`, `cal-event`, `call-recordings`, `apple-pay`, `outlook`, `yahoo`, `download-video`, `airbnb`) run as fast, stateless CLI commands that don't bloat your agent's context window with dozens of MCP tool schemas.
 - **100% Local & Private**: Reads directly from local macOS SQLite databases (`ChatStorage.sqlite`, `chat.db`, `NoteStore.sqlite`, Wallet passes) and native `EventKit` APIs — no third-party cloud relays.
 - **Zero Dependency Hell**: Powered by `uv` inline script metadata (`#!/usr/bin/env -S uv run --script`). Clone once, add `bin/` to `$PATH`, and every tool manages its own isolated environment automatically.
-- **macOS Browser Hang Prevention**: `stealth-browser` avoids macOS Chromium/Brave IPC freezes by attaching over CDP or launching an isolated Patchright stealth Chromium profile with automatic idle driver teardown.
 
 # Included Tools
 
@@ -22,13 +21,14 @@ Every tool in `bin/` is a self-contained executable (PEP 723 `uv run --script` o
 | [`outlook`](bin/outlook) | CLI | Microsoft Graph API | Read, search, draft, and send Outlook emails from the terminal. |
 | [`yahoo`](bin/yahoo) | CLI | IMAP / SMTP (SSL) | Read, search, draft, and send Yahoo emails from the terminal. |
 | [`apple-pay`](bin/apple-pay) | CLI | Local macOS Wallet SQLite | Query, filter, and audit local Apple Pay card transactions on macOS. |
-| [`stealth-browser`](bin/stealth-browser) | MCP Server | Patchright + CDP | Navigate, click, type, scroll, evaluate JS, capture screenshots, and manage tabs in standalone stealth Chromium or via CDP. |
 | [`agy-sessions`](bin/agy-sessions) | CLI | macOS iTerm2 + Antigravity CLI | Snapshot, inspect, test, auto-restore, and gracefully cull stale (>6h) `agy` sessions in iTerm2 while keeping tabs open. |
 | [`opencode-sessions`](bin/opencode-sessions) | CLI | Any terminal (macOS) | Inspect and gracefully cull idle (>2h) `opencode` TUI sessions; terminal-agnostic, writes recap + resume command into the tab. |
 | [`antigravity-shipper`](src/antigravity-shipper) | Daemon / CLI | Local `~/.gemini` transcripts + PostgreSQL | Zero-overhead, incremental telemetry shipper that tails Antigravity CLI agent sessions, redacts secrets, and syncs tool calls & metrics to PostgreSQL. |
 | [`airbnb`](airbnb/) | CLI | Airbnb API + Climate/Sentiment Engine | Search, score, and benchmark listings against nomad criteria (Wi-Fi, kitchen, climate/heating, noise, discounts). |
 | [`download-video`](bin/download-video) | CLI | yt-dlp + gallery-dl + Apple Vision OCR | Download Instagram reels/stories and YouTube videos/shorts to Google Drive, transcode to WhatsApp-native H.264/AAC MP4, extract frame OCR/hashtags, and embed metadata. |
 | [`wifi-check`](src/wifi-check.swift) | CLI | macOS `CoreWLAN` + `networkQuality` | Comprehensive Wi-Fi link health, VPN stealth audit (home IP/ISP match from config), traceroute hop latency map, and network capacity benchmark. |
+
+> `stealth-browser` (stealth browser automation MCP) now lives in its own repo: [levontumanyan/stealth-browser-mcp](https://github.com/levontumanyan/stealth-browser-mcp).
 
 # Quickstart
 
@@ -57,52 +57,11 @@ outlook --help
 yahoo --help
 apple-pay --help
 download-video --help
-stealth-browser --help
 agy-sessions --help
 antigravity-shipper --help
 airbnb --help
 wifi-check --help
 ```
-
-# Stealth Browser MCP (`stealth-browser`)
-
-Launching a second browser binary alongside an active one on macOS can corrupt shared IPC rendezvous ports, freezing tab creation and IPC in your main browser.
-
-`stealth-browser` avoids this completely:
-
-1. **CDP First**: Attempts to attach to an existing browser session over `http://127.0.0.1:9222` (`STEALTH_BROWSER_CDP_PORT`).
-2. **Standalone Stealth Fallback**: Falls back to launching a dedicated Patchright stealth Chromium instance (`~/.agent-chromium-profile`) with native stealth masking and isolated profile.
-3. **Clean Lifecycle & Idle Watchdog**: Automatically shuts down the background Patchright Node driver after 5 minutes of inactivity (`STEALTH_BROWSER_IDLE_TIMEOUT=300`) and guarantees immediate subprocess teardown on `SIGTERM`, `SIGHUP`, or `stdin` EOF.
-
-## MCP Configuration (`mcp_config.json`)
-
-Add to your agent's MCP configuration (`~/.gemini/config/mcp_config.json`, `~/.claude.json`, or `.cursor/mcp.json`):
-
-```json
-{
-	"mcpServers": {
-		"stealth-browser": {
-			"command": "uv",
-			"args": [
-				"run",
-				"--script",
-				"/Users/your-username/repos/agent-tools/bin/stealth-browser"
-			]
-		}
-	}
-}
-```
-
-## Available MCP Tools
-
-- `status`: Check connection status and list all open tabs with indices.
-- `navigate`: Navigate the active tab or open a new tab (`new_tab=True`).
-- `get_content`: Extract visible text from `body` or any CSS/XPath selector.
-- `click` / `type` / `press_key` / `scroll`: Interact with page elements.
-- `screenshot`: Capture a viewport screenshot for multimodal agent inspection.
-- `evaluate_js`: Execute JavaScript in the active page context.
-- `switch_tab` / `new_tab` / `close_tab`: Full multi-tab management (closing the last tab automatically closes the browser).
-- `close_browser`: Completely close the browser window, terminate the browser process, and release all resources.
 
 # Microsoft Outlook Setup (Azure App Registration)
 
@@ -258,8 +217,8 @@ Paste the rules from [`AGENTS.md`](AGENTS.md) into your global agent instruction
 Reusable agent workflows built around this repo's CLIs and MCPs live in [`skills/`](skills/), one directory per skill with a `SKILL.md`:
 
 - `airbnb-host-questions` — draft pre-booking questions for an Airbnb host, omitting anything the listing already confirms.
-- `stealth-browser-audit` — mine local agent transcripts for stealth-browser usage, errors, latency, and workarounds.
-- `stealth-browser-subagent` — delegate heavy browser flows to an isolated subagent so DOM output stays out of the parent context.
+
+Stealth-browser skills (`stealth-browser-audit`, `stealth-browser-subagent`) moved to [stealth-browser-mcp](https://github.com/levontumanyan/stealth-browser-mcp).
 
 Register the directory with your harness instead of copying files:
 
