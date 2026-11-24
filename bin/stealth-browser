@@ -46,6 +46,23 @@ try:
 except Exception:
 	pass
 
+async def _lifespan(_app):
+	loop = asyncio.get_running_loop()
+
+	def _on_task_exc(_loop, context):
+		try:
+			session._unhandled_task_exceptions["n"] += 1
+		except Exception:
+			pass
+		logging.error("UNHANDLED task exception: %r", context.get("exception"))
+
+	loop.set_exception_handler(_on_task_exc)
+	try:
+		session._unhandled_task_exceptions = {"n": 0}
+	except Exception:
+		pass
+	yield
+
 mcp = FastMCP(
 	"stealth-browser",
 	instructions=(
@@ -68,6 +85,7 @@ mcp = FastMCP(
 		"- downloads(limit=20, include_dir=False) | network_requests(url_filter='', resource_type='', content_type='', status_min=0, limit=30, clear=False, tab=-1, max_length=8000) | console_logs(level='', limit=50, clear=False, tab=-1, max_length=8000)\n"
 		"- keep_alive(enable=True, tab=-1, min_seconds=45, max_seconds=90, ping_url=None) | set_headless(headless=True, force=False) | restart_browser(headless=None, url=None) | close_browser(force_kill=True)"
 	),
+	lifespan=_lifespan,
 )
 
 CDP_PORT = int(os.environ.get("STEALTH_BROWSER_CDP_PORT", os.environ.get("CDP_PORT", "9222")))
