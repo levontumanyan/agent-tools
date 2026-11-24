@@ -26,14 +26,14 @@ from utils import (
 )
 
 
-def resolve_price_filters(min_price, max_price, num_nights, price_unit="auto"):
-	if price_unit == "nightly":
-		return min_price * num_nights, max_price * num_nights, "nightly"
-	if price_unit == "total":
-		return min_price, max_price, "total"
-	if num_nights > 7 and max_price <= 500:
-		return min_price * num_nights, max_price * num_nights, "nightly"
-	return min_price, max_price, "total"
+def resolve_price_filters(min_nightly, max_nightly, min_total, max_total, num_nights):
+	if min_nightly is not None or max_nightly is not None:
+		return (
+			(min_nightly or 0) * num_nights,
+			(max_nightly or 0) * num_nights,
+			"nightly",
+		)
+	return min_total or 0, max_total or 0, "total"
 
 
 def run_survey(args, defaults, search_amenities, logger):
@@ -224,14 +224,41 @@ def main():
 		default="Montreal",
 		help="Location name (e.g., 'Montreal', 'New York')",
 	)
-	parser.add_argument("--min_price", type=int, default=0, help="Minimum price")
-	parser.add_argument("--max_price", type=int, default=500, help="Maximum price")
 	parser.add_argument(
-		"--price_unit",
-		type=str,
-		choices=["auto", "nightly", "total"],
-		default="auto",
-		help="Unit of min_price/max_price: 'total' = whole-stay budget (Airbnb applies weekly/monthly discounts before filtering), 'nightly' = per-night rate scaled by stay length, 'auto' = nightly if stay > 7 nights and max_price <= 500, else total. Default: auto",
+		"--min_nightly",
+		type=int,
+		default=None,
+		help="Minimum price per night (CAD); scaled by stay length for Airbnb's whole-stay filter",
+	)
+	parser.add_argument(
+		"--max_nightly",
+		type=int,
+		default=None,
+		help="Maximum price per night (CAD); scaled by stay length for Airbnb's whole-stay filter",
+	)
+	parser.add_argument(
+		"--min_total",
+		type=int,
+		default=None,
+		help="Minimum whole-stay total (CAD); sent as-is (Airbnb applies weekly/monthly discounts before filtering)",
+	)
+	parser.add_argument(
+		"--max_total",
+		type=int,
+		default=None,
+		help="Maximum whole-stay total (CAD); sent as-is (Airbnb applies weekly/monthly discounts before filtering)",
+	)
+	parser.add_argument(
+		"--min_price",
+		type=int,
+		default=None,
+		help="(Deprecated: alias for --min_nightly)",
+	)
+	parser.add_argument(
+		"--max_price",
+		type=int,
+		default=None,
+		help="(Deprecated: alias for --max_nightly)",
 	)
 	parser.add_argument(
 		"--check_in",
@@ -362,6 +389,25 @@ def main():
 	)
 
 	args = parser.parse_args()
+
+	nightly_set = any(
+		v is not None
+		for v in (args.min_nightly, args.max_nightly, args.min_price, args.max_price)
+	)
+	total_set = args.min_total is not None or args.max_total is not None
+	if nightly_set and total_set:
+		parser.error(
+			"nightly flags (--min_nightly/--max_nightly, incl. deprecated --min_price/--max_price) and total flags (--min_total/--max_total) are mutually exclusive"
+		)
+
+	if args.min_price is not None or args.max_price is not None:
+		sys.stderr.write(
+			"Warning: --min_price/--max_price are deprecated nightly-rate aliases; use --min_nightly/--max_nightly, or --min_total/--max_total for a whole-stay budget.\n"
+		)
+		if args.min_nightly is None:
+			args.min_nightly = args.min_price
+		if args.max_nightly is None:
+			args.max_nightly = args.max_price
 
 	# Criteria guardrail (airbnb/AGENTS.md + travel/criteria.md): all prices must
 	# be evaluated in CAD on airbnb.ca so totals match the listing pages the user
@@ -737,11 +783,11 @@ def main():
 	# included; pyairbnb sends priceFilterNumNights = actual nights), so nightly
 	# caps must be multiplied by the stay length before hitting the API.
 	api_min_price, api_max_price, price_unit_used = resolve_price_filters(
-		args.min_price, args.max_price, num_nights, args.price_unit
+		args.min_nightly, args.max_nightly, args.min_total, args.max_total, num_nights
 	)
-	if price_unit_used == "nightly":
+	if price_unit_used == "nightly" and (api_min_price or api_max_price):
 		logger.info(
-			f"Nightly range ({args.min_price}-{args.max_price}/night) scaled to {num_nights}-night totals for Airbnb's price filter: {api_min_price}-{api_max_price} {args.currency}"
+			f"Nightly range ({args.min_nightly or 0}-{args.max_nightly or 0}/night) scaled to {num_nights}-night totals for Airbnb's price filter: {api_min_price}-{api_max_price} {args.currency}"
 		)
 
 	logger.info(
