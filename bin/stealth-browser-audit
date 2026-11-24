@@ -1418,7 +1418,14 @@ class AuditCollector:
 			"session_match": self._compute_session_match(),
 			"headless_switches": self.headless_switches,
 			"consecutive_same_tool": dict(self.consecutive_same_tool.most_common()),
-			"sessions": sorted(self.sessions, key=lambda x: x["calls"], reverse=True),
+			"sessions": [
+				{
+					**s,
+					"first_call_at": s["first_call_at"].isoformat() if isinstance(s.get("first_call_at"), datetime.datetime) else s.get("first_call_at"),
+					"last_call_at": s["last_call_at"].isoformat() if isinstance(s.get("last_call_at"), datetime.datetime) else s.get("last_call_at"),
+				}
+				for s in sorted(self.sessions, key=lambda x: x["calls"], reverse=True)
+			],
 		}
 
 
@@ -1838,7 +1845,7 @@ def main() -> int:
 
 	if args.json:
 		payload = {"snapshot": snapshot, "diff": diff_data} if diff_data is not None else snapshot
-		print(json.dumps(payload, indent=2))
+		print(json.dumps(payload, indent=2, default=str))
 	else:
 		print(format_report(snapshot, top_n=args.top, max_samples=args.samples, diff=diff_data))
 
