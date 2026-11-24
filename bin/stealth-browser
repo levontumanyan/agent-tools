@@ -12,7 +12,8 @@ import argparse
 import asyncio
 import base64
 import collections
-import contextlibimport datetime
+import contextlib
+import datetime
 import fcntl
 import hashlib
 import io
@@ -1192,6 +1193,9 @@ async def status() -> str:
 				title = "(Unresponsive / Busy)"
 			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
 		dialog_lines = []
+		unhandled = getattr(session, "_unhandled_task_exceptions", None)
+		if unhandled is not None and unhandled.get("n"):
+			lines.append(f"Unhandled task exceptions since start: {unhandled['n']}")
 		for p, tab_id in list(session._page_to_id.items()):
 			history = getattr(p, "_dialog_history", None)
 			if not history:
