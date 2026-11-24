@@ -445,6 +445,69 @@ def test_navigate_service_worker_recovery(sb, monkeypatch):
 	asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+	("input_url", "expected"),
+	[
+		("example.com", "https://example.com"),
+		("example.com:8080/path", "https://example.com:8080/path"),
+		("localhost:3000", "https://localhost:3000"),
+		("https://example.com", "https://example.com"),
+		("HTTP://example.com", "HTTP://example.com"),
+		("file:///tmp/fixture.html", "file:///tmp/fixture.html"),
+		("about:blank", "about:blank"),
+		("data:text/html,<h1>hi</h1>", "data:text/html,<h1>hi</h1>"),
+		("blob:https://example.com/uuid", "blob:https://example.com/uuid"),
+		("chrome://settings", "chrome://settings"),
+		("view-source:https://example.com", "view-source:https://example.com"),
+	],
+)
+def test_navigate_preserves_explicit_url_schemes(sb, monkeypatch, input_url, expected):
+	async def scenario():
+		goto_urls = []
+		page = FakePage()
+
+		async def capture_goto(url, **kwargs):
+			goto_urls.append(url)
+			resp = MagicMock()
+			resp.status = 200
+			return resp
+
+		page.goto_impl = capture_goto
+		monkeypatch.setattr(sb.session, "get_context", AsyncMock(return_value=MagicMock()))
+		monkeypatch.setattr(sb.session, "resolve_page", AsyncMock(return_value=page))
+		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[page]))
+
+		res = await sb.navigate(url=input_url)
+		assert goto_urls == [expected]
+		assert "Navigation error" not in res
+
+	asyncio.run(scenario())
+
+
+def test_new_tab_preserves_file_scheme(sb, monkeypatch):
+	async def scenario():
+		goto_urls = []
+		page = FakePage()
+
+		async def capture_goto(url, **kwargs):
+			goto_urls.append(url)
+			resp = MagicMock()
+			resp.status = 200
+			return resp
+
+		page.goto_impl = capture_goto
+		context = MagicMock()
+		context.new_page = AsyncMock(return_value=page)
+		monkeypatch.setattr(sb.session, "get_context", AsyncMock(return_value=context))
+		monkeypatch.setattr(sb.session, "get_pages", AsyncMock(return_value=[page]))
+
+		res = await sb.new_tab(url="file:///tmp/fixture.html")
+		assert goto_urls == ["file:///tmp/fixture.html"]
+		assert "Navigation error" not in res
+
+	asyncio.run(scenario())
+
+
 def test_close_browser_bounds_hung_cdp_and_force_kills_in_thread(sb, monkeypatch):
 	monkeypatch.setattr(sb, "BROWSER_CLOSE_TIMEOUT_S", 0.05)
 	monkeypatch.setattr(sb, "PLAYWRIGHT_STOP_TIMEOUT_S", 0.05)
