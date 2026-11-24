@@ -46,6 +46,23 @@ try:
 except Exception:
 	pass
 
+async def _lifespan(_app):
+	loop = asyncio.get_running_loop()
+
+	def _on_task_exc(_loop, context):
+		try:
+			session._unhandled_task_exceptions["n"] += 1
+		except Exception:
+			pass
+		logging.error("UNHANDLED task exception: %r", context.get("exception"))
+
+	loop.set_exception_handler(_on_task_exc)
+	try:
+		session._unhandled_task_exceptions = {"n": 0}
+	except Exception:
+		pass
+	yield
+
 STEALTH_BROWSER_CHEATSHEET = (
 	"Stay headless by default. Use wait_for_human() for interactive login/2FA/CAPTCHA (switches headed & polls); only call set_headless(headless=False) when asked.\n"
 	"Use this cheat-sheet instead of reading individual tool schemas; prefer snapshot(filter=...)/extract()/batch() over evaluate_js(). tab=-1 targets active tab (or index / stable 'tN').\n"
@@ -71,6 +88,7 @@ STEALTH_BROWSER_CHEATSHEET = (
 mcp = FastMCP(
 	"stealth-browser",
 	instructions=STEALTH_BROWSER_CHEATSHEET,
+	lifespan=_lifespan,
 )
 
 
