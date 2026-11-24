@@ -253,6 +253,19 @@ wifi-check --scan
 
 Paste the rules from [`AGENTS.md`](AGENTS.md) into your global agent instructions so your AI assistant automatically knows how and when to invoke each tool.
 
+# Agent Skills (`skills/`)
+
+Reusable agent workflows built around this repo's CLIs and MCPs live in [`skills/`](skills/), one directory per skill with a `SKILL.md`:
+
+- `airbnb-host-questions` — draft pre-booking questions for an Airbnb host, omitting anything the listing already confirms.
+- `stealth-browser-audit` — mine local agent transcripts for stealth-browser usage, errors, latency, and workarounds.
+- `stealth-browser-subagent` — delegate heavy browser flows to an isolated subagent so DOM output stays out of the parent context.
+
+Register the directory with your harness instead of copying files:
+
+- **OpenCode**: add `"~/repos/agent-tools/skills"` to the `skills` array in your `opencode.jsonc` (or symlink it into `~/.agents/skills/`).
+- **Google Antigravity (`agy`)**: add `{ "path": "~/repos/agent-tools/skills" }` to the `entries` of `~/.gemini/config/skills.json`.
+
 # Permissions
 
 Grant your terminal or IDE the following under **System Settings > Privacy & Security**:
