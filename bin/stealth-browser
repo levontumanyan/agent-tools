@@ -407,7 +407,7 @@ def _save_persisted_headless(headless: Optional[bool]) -> None:
 
 
 ANIMATIONS_STATE_FILE = os.path.join(CACHE_DIR, f"animations-{CDP_PORT}.json")
-_ANIMATIONS_STYLE_ATTR = "data-stealth-browser-animations"
+_ANIMATIONS_STYLE_ATTR = "data-anim-pref"
 _ANIMATIONS_KILL_CSS = (
 	"*, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; "
 	"transition-duration: 0.001s !important; transition-delay: 0s !important; scroll-behavior: auto !important; }"
@@ -1324,16 +1324,20 @@ async def status() -> str:
 		mode_str = "Headless" if session.headless else "Headed"
 		lines = [f"Connected to browser session at {CDP_URL} (Mode: {mode_str})"]
 		lines.append(f"Total open tabs: {len(pages)}")
+		if session.animations is not None:
+			anim_state = "FROZEN" if session.animations is False else "ENABLED"
+			lines.append(f"Animations: {anim_state}")
 		for idx, page in enumerate(pages):
 			tab_id = session.get_tab_id(page)
 			active_marker = " (ACTIVE in this session)" if page == active_page else ""
 			media_status = " [TEXT-ONLY/MEDIA BLOCKED]" if getattr(page, "_media_blocked", False) else ""
+			animations_status = " [ANIMATIONS FROZEN]" if getattr(page, "_animations_motion", None) == "reduce" else ""
 			keep_alive_status = " [KEEP-ALIVE ACTIVE]" if keep_alive_mgr.is_active(page) else ""
 			try:
 				title = await asyncio.wait_for(page.title(), timeout=2.0)
 			except Exception:
 				title = "(Unresponsive / Busy)"
-			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{keep_alive_status}{active_marker}")
+			lines.append(f"\t[{idx} | {tab_id}] {title} - {page.url}{media_status}{animations_status}{keep_alive_status}{active_marker}")
 		dialog_lines = []
 		unhandled = getattr(session, "_unhandled_task_exceptions", None)
 		if unhandled is not None and unhandled.get("n"):
@@ -1656,7 +1660,7 @@ async def set_media(enable_media: bool = True, tab: Union[int, str] = -1) -> str
 @mcp.tool()
 @_with_tool_deadline
 async def set_animations(enabled: bool = False, persist: bool = True, tab: Union[int, str] = -1) -> str:
-	"""Freeze CSS animations/transitions via reduced-motion emulation + a kill-stylesheet; re-enabling fully applies only after restart_browser() because init scripts cannot be removed."""
+	"""Freeze CSS animations/transitions via reduced-motion emulation + a kill-stylesheet; sites may serve reduced-motion content variants, and re-enabling fully applies only after restart_browser() because init scripts cannot be removed."""
 	try:
 		page = await session.resolve_page(tab)
 		session.animations = bool(enabled)
