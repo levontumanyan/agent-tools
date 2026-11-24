@@ -4,11 +4,12 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 import pyairbnb
 import pyairbnb.api
 import pyairbnb.details
+import pyairbnb.host
 import pyairbnb.price
 import pyairbnb.reviews
 import pyairbnb.search
@@ -411,6 +412,99 @@ def batch_get_listing_details(
 			except Exception as e:
 				logger.error(f"Failed to fetch {lid} in batch: {e}")
 	return results
+
+
+def resolve_host(host_input):
+	"""
+	Resolve a numeric host ID or Airbnb URL (/h/..., /users/..., /rooms/...)
+	into {"host_id": str, "host_name": str | None, "resolved_room_id": str | None}.
+	"""
+	raw = str(host_input or "").strip()
+	if not raw:
+		return None
+
+	if raw.isdigit():
+		return {"host_id": raw, "host_name": None, "resolved_room_id": None}
+
+	def _from_room_id(rid):
+		details = get_listing_details(str(rid))
+		if not details:
+			return None
+		host = details.get("host") or {}
+		hid = str(host.get("id") or "").strip()
+		if not hid:
+			return None
+		return {
+			"host_id": hid,
+			"host_name": host.get("name") or None,
+			"resolved_room_id": str(rid),
+		}
+
+	m_room = re.search(r"/rooms/(\d{6,})", raw)
+	if m_room:
+		return _from_room_id(m_room.group(1))
+
+	m_user = re.search(r"/users/(?:show|profile)/(\d{4,})", raw)
+	if m_user:
+		return {
+			"host_id": m_user.group(1),
+			"host_name": None,
+			"resolved_room_id": None,
+		}
+
+	url = (
+		raw
+		if raw.startswith(("http://", "https://"))
+		else f"https://www.airbnb.ca/{raw.lstrip('/')}"
+	)
+	session = _get_session()
+	current_url = url
+	for _ in range(5):
+		try:
+			resp = session.get(current_url, allow_redirects=False, timeout=15)
+		except Exception as e:
+			logger.error(f"Error resolving host URL {current_url}: {e}")
+			return None
+
+		location = resp.headers.get("location") or resp.headers.get("Location")
+		if 300 <= getattr(resp, "status_code", 0) < 400 and location:
+			next_url = urljoin(current_url, location)
+			if "/login" in next_url:
+				logger.warning(
+					f"Host URL {current_url} redirected to login ({next_url}); cannot resolve host ID from login wall."
+				)
+				return None
+			m_loc_room = re.search(r"/rooms/(\d{6,})", next_url)
+			if m_loc_room:
+				return _from_room_id(m_loc_room.group(1))
+			m_loc_user = re.search(r"/users/(?:show|profile)/(\d{4,})", next_url)
+			if m_loc_user:
+				return {
+					"host_id": m_loc_user.group(1),
+					"host_name": None,
+					"resolved_room_id": None,
+				}
+			current_url = next_url
+			continue
+
+		if getattr(resp, "status_code", 0) == 200:
+			m_body_room = re.search(r"/rooms/(\d{6,})", resp.text or "")
+			if m_body_room:
+				return _from_room_id(m_body_room.group(1))
+		break
+
+	return None
+
+
+def get_host_listings(host_id):
+	"""Fetch all listings owned by a numeric host ID via pyairbnb.host."""
+	try:
+		api_key = pyairbnb.api.get("")
+		listings = pyairbnb.host.get_listings_from_user(int(host_id), api_key, "")
+		return listings or []
+	except Exception as e:
+		logger.error(f"Error fetching listings for host {host_id}: {e}")
+		return []
 
 
 def search_listings(

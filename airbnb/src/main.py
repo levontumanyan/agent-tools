@@ -363,6 +363,12 @@ def main():
 		help="Inspect a single listing by room ID or Airbnb URL (e.g. '1207650713743808384' or 'https://www.airbnb.ca/rooms/1207650713743808384')",
 	)
 	parser.add_argument(
+		"--host",
+		type=str,
+		default=None,
+		help="Inspect a host by numeric host ID or Airbnb URL (/h/..., /users/..., /rooms/...), aggregating all listings and reviews",
+	)
+	parser.add_argument(
 		"--reviews",
 		action="store_true",
 		help="Display full guest reviews when inspecting a listing with --room",
@@ -435,6 +441,64 @@ def main():
 		from fetcher import set_session_cookie
 
 		set_session_cookie(args.cookie)
+
+	if args.host:
+		from fetcher import batch_get_listing_details, get_host_listings, resolve_host
+		from host_review import analyze_host_reviews, format_host_report
+
+		resolved = resolve_host(args.host)
+		if not resolved or not resolved.get("host_id"):
+			msg = f"Failed to resolve host from '{args.host}'"
+			logger.error(msg)
+			if args.json:
+				print(json.dumps({"error": msg}))
+			sys.exit(1)
+
+		host_id = resolved["host_id"]
+		host_name = resolved.get("host_name")
+		host_listings = get_host_listings(host_id)
+		if not host_listings:
+			msg = f"No listings found for host {host_id}"
+			logger.error(msg)
+			if args.json:
+				print(json.dumps({"error": msg, "host_id": host_id}))
+			sys.exit(1)
+
+		listing_ids = [str(item["id"]) for item in host_listings if item.get("id")]
+		adults_count = args.max_guests or 1
+		details_by_id = batch_get_listing_details(
+			listing_ids,
+			currency=args.currency,
+			check_in=args.check_in,
+			check_out=args.check_out,
+			adults=adults_count,
+		)
+
+		report = analyze_host_reviews(
+			host_id=host_id,
+			host_name=host_name,
+			host_listings_meta=host_listings,
+			details_by_id=details_by_id,
+			check_in=args.check_in,
+			check_out=args.check_out,
+			adults=adults_count,
+			currency=args.currency,
+		)
+
+		if args.json:
+			out_payload = dict(report)
+			if args.compact:
+				out_payload.pop("reviews", None)
+			print(json.dumps(out_payload, indent=2, ensure_ascii=False))
+		else:
+			print(
+				format_host_report(
+					report,
+					show_reviews=bool(args.reviews or args.search_reviews),
+					search_reviews=args.search_reviews,
+				)
+			)
+		return
 
 	if args.room:
 		from fetcher import get_listing_details

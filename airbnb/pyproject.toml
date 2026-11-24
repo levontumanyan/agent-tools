@@ -18,7 +18,7 @@ dependencies = [
 airbnb = "main:main"
 
 [tool.setuptools]
-py-modules = ["amenities", "auth", "climate", "config", "fetcher", "main", "reporter", "scorer", "utils"]
+py-modules = ["amenities", "auth", "climate", "config", "fetcher", "host_review", "main", "reporter", "scorer", "utils"]
 package-dir = {"" = "src"}
 
 [tool.ruff]
