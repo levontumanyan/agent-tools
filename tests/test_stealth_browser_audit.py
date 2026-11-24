@@ -2,6 +2,7 @@ import collections
 import importlib.machinery
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -101,6 +102,13 @@ class TestHarnessValidationMisattribution:
 		body = 'Invalid arguments for tool \\"execute\\": - code: Missing key'
 		assert sba.classify_outcome("wait_for_human", body, explicit_error=True) is None
 
+	def test_deeply_quoted_payload_not_matched(self):
+		# Search is bounded to the head window: a body that only quotes an invalid-args
+		# payload past the first 350 chars keeps its original classification.
+		body = "Error clicking element '#x': " + "pad " * 100 + 'Invalid arguments for tool "execute": - code: Missing key'
+		assert sba.harness_validation_tool(body) is None
+		assert sba.classify_outcome("click", body, explicit_error=True) == "click_error"
+
 	def test_nested_execute_schema_error_not_attributed_to_wait_for_human(self):
 		c = sba.AuditCollector(since=None, includes=[], excludes=[], slow_threshold=20.0, max_samples=2)
 		sess = make_sess_state()
@@ -158,8 +166,18 @@ class TestSilentParamMismatch:
 
 class TestKnownTools:
 	def test_new_tools_listed(self):
-		for tool in ("extract", "wait_for", "wait_for_human", "downloads", "network_requests", "console_logs"):
+		for tool in ("extract", "wait_for", "wait_for_human", "downloads", "network_requests", "console_logs", "set_animations"):
 			assert tool in sba.KNOWN_TOOLS
+
+	def test_known_tools_covers_every_server_tool(self):
+		# KNOWN_TOOLS is load-bearing for error visibility (classify_outcome skips harness
+		# validation errors naming non-KNOWN tools), so drift must fail tests, not hide errors.
+		server_src = (_SCRIPT_PATH.parent / "stealth-browser").read_text(encoding="utf-8")
+		server_tools = set(re.findall(r"@mcp\.tool\(\)\s*(?:@[^\n]*\s*)*async def ([a-z0-9_]+)", server_src))
+		assert server_tools, "no @mcp.tool() decorators found in bin/stealth-browser"
+		assert server_tools - set(sba.KNOWN_TOOLS) == set(), (
+			f"KNOWN_TOOLS is missing server tools: {sorted(server_tools - set(sba.KNOWN_TOOLS))}"
+		)
 
 
 class TestAgyOverflow:

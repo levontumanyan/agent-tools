@@ -31,6 +31,7 @@ KNOWN_TOOLS = (
 	"navigate",
 	"new_tab",
 	"set_media",
+	"set_animations",
 	"snapshot",
 	"batch",
 	"get_content",
@@ -253,8 +254,12 @@ def load_agy_titles() -> dict[str, str]:
 
 
 def harness_validation_tool(body: str) -> Optional[str]:
-	"""Return the tool named by a harness-side `Invalid arguments for tool "<name>"` payload, if any."""
-	m = INVALID_ARGS_TOOL_RE.search(body)
+	"""Return the tool named by a harness-side `Invalid arguments for tool "<name>"` payload, if any.
+
+	Search is bounded to the head window like every other classify_outcome heuristic, so a body
+	that merely quotes an invalid-args payload deep inside is not reclassified on the quote.
+	"""
+	m = INVALID_ARGS_TOOL_RE.search(body[:350])
 	if not m:
 		return None
 	named = m.group(1).strip()
