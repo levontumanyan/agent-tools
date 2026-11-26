@@ -4,6 +4,12 @@ from pathlib import Path
 
 # Base Paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+REPO_DIR = Path.home() / "repos" / "agent-tools" / "flights"
+if (
+	not (PROJECT_ROOT / "benchmarks.json").exists()
+	and (REPO_DIR / "benchmarks.json").exists()
+):
+	PROJECT_ROOT = REPO_DIR
 SRC_DIR = PROJECT_ROOT / "src"
 CACHE_DIR = PROJECT_ROOT / ".cache"
 FLIGHTS_CACHE_DIR = CACHE_DIR / "flights"
