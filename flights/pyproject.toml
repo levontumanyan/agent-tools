@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flights"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+	"fast-flights>=3.1.0",
+	"typing-extensions>=4.16.0",
+]
+
+[project.scripts]
+flights = "main:main"
+
+[tool.setuptools]
+py-modules = ["config", "fetcher", "main", "models", "reporter", "scorer", "utils"]
+packages = ["providers"]
+package-dir = {"" = "src"}
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.format]
+indent-style = "tab"
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["F", "E", "ISC", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-implicit-str-concat]
+allow-multiline = false
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[dependency-groups]
+dev = [
+	"pytest>=9.0.0",
+	"pytest-mock>=3.15.0",
+	"ruff>=0.15.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+pythonpath = ["src"]

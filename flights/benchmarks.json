@@ -1,0 +1,96 @@
+{
+	"metrics": {
+		"price_efficiency": {
+			"weight": 0.35,
+			"function": "price_to_market_min",
+			"params": {}
+		},
+		"duration_efficiency": {
+			"weight": 0.25,
+			"function": "duration_to_min",
+			"params": {}
+		},
+		"departure_convenience": {
+			"weight": 0.20,
+			"function": "time_of_day_score",
+			"params": {
+				"prime_start_hour": 8,
+				"prime_end_hour": 19,
+				"acceptable_start_hour": 6,
+				"acceptable_end_hour": 22
+			}
+		},
+		"airline_quality": {
+			"weight": 0.20,
+			"function": "airline_tier",
+			"params": {
+				"preferred_airlines": [
+					"Air Canada",
+					"Delta",
+					"Air France",
+					"KLM",
+					"Lufthansa",
+					"British Airways",
+					"Swiss",
+					"Emirates",
+					"Singapore Airlines",
+					"ANA",
+					"Japan Airlines"
+				],
+				"budget_airlines": [
+					"Flair Airlines",
+					"Spirit",
+					"Frontier",
+					"Ryanair",
+					"EasyJet",
+					"Wizz Air"
+				]
+			}
+		}
+	},
+	"penalties": [
+		{
+			"name": "Tight Layover (<75m)",
+			"condition": {
+				"field": "min_layover_minutes",
+				"operator": "<",
+				"value": 75,
+				"require_stops": true
+			},
+			"multiplier": 0.6
+		},
+		{
+			"name": "Grueling Layover (>4h)",
+			"condition": {
+				"field": "max_layover_minutes",
+				"operator": ">",
+				"value": 240
+			},
+			"multiplier": 0.7
+		},
+		{
+			"name": "Overnight Layover",
+			"condition": {
+				"field": "has_overnight_layover",
+				"operator": "==",
+				"value": true
+			},
+			"multiplier": 0.5
+		},
+		{
+			"name": "Multiple Stops (2+)",
+			"condition": {
+				"field": "stops",
+				"operator": ">=",
+				"value": 2
+			},
+			"multiplier": 0.65
+		}
+	],
+	"hard_filters": {
+		"max_stops": null,
+		"max_price": null,
+		"max_duration_minutes": null,
+		"min_layover_minutes": 40
+	}
+}
